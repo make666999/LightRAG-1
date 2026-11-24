@@ -15,20 +15,23 @@ Offline coverage for the OpenSearch slice of the bounded-scheduling API:
   a cheap exact ``_count``; fail-closed where the legacy lookup swallows.
 * ``list_source_conflicts_page`` / ``repair_source_conflict`` — operator
   conflict flow with a recompute-and-compare CAS.
-* strict point reads — three-state ``get_by_id_strict`` on both the KV and
-  doc-status classes.
+* strict point reads — three-state ``get_by_id_strict`` on doc-status (KV
+  strict point reads live in ``test_opensearch_strict_reads.py``).
 """
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from opensearchpy import AsyncOpenSearch
-from opensearchpy.exceptions import NotFoundError, TransportError
+pytest.importorskip(
+    "opensearchpy",
+    reason="opensearchpy is required for OpenSearch storage tests",
+)
 
-from lightrag.base import (
+from opensearchpy.exceptions import TransportError  # noqa: E402
+
+from lightrag.base import (  # noqa: E402
     CURSOR_END,
     CursorAfter,
     DocStatus,
@@ -37,117 +40,44 @@ from lightrag.base import (
     SourceConflictSummary,
     SourceUnique,
 )
-from lightrag.exceptions import (
+from lightrag.exceptions import (  # noqa: E402
     StorageControlPlaneError,
     StorageRecordNotFoundError,
 )
-from lightrag.kg.opensearch_impl import (
+from lightrag.kg.opensearch_impl import (  # noqa: E402
     ClientManager,
     OpenSearchDocStatusStorage,
     OpenSearchKVStorage,
 )
 
+from ._helpers import (  # noqa: E402
+    RejectingEmbedFunc,
+    default_global_config,
+    doc_missing_error as _doc_missing_error,
+    make_strict_client as _make_client,
+    missing_index_error as _missing_index_error,
+    patch_opensearch_locks,
+    transient_error as _transient_error,
+)
+
 pytestmark = pytest.mark.offline
 
 
-class _mock_lock:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return None
-
-
-def _missing_index_error() -> NotFoundError:
-    return NotFoundError(404, "index_not_found_exception", "no such index")
-
-
-def _doc_missing_error() -> NotFoundError:
-    # A document-level 404 (GET/update on an existing index): the error body
-    # never mentions index_not_found_exception.
-    return NotFoundError(404, "document_missing_exception", "no such document")
-
-
-def _transient_error() -> TransportError:
-    return TransportError(503, "search_phase_execution_exception", "shard failure")
-
-
 @pytest.fixture(autouse=True)
-def patch_data_init_lock():
-    with patch(
-        "lightrag.kg.opensearch_impl.get_data_init_lock", side_effect=_mock_lock
-    ):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def patch_namespace_lock():
-    cache: dict[tuple[str, str | None], asyncio.Lock] = {}
-
-    def factory(namespace, workspace=None, enable_logging=False):
-        key = (namespace, workspace or "")
-        lock = cache.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            cache[key] = lock
-        return lock
-
-    with patch("lightrag.kg.opensearch_impl.get_namespace_lock", side_effect=factory):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def patch_shard_doc_supported():
-    with patch("lightrag.kg.opensearch_impl._shard_doc_supported", True):
+def patch_locks():
+    with patch_opensearch_locks(patch_shard_doc=True):
         yield
 
 
 @pytest.fixture
 def global_config():
-    return {
-        "embedding_batch_num": 10,
-        "max_graph_nodes": 1000,
-        "vector_db_storage_cls_kwargs": {"cosine_better_than_threshold": 0.2},
-    }
-
-
-class _EmbedFunc:
-    embedding_dim = 8
-    max_token_size = 512
-    model_name = "mock-embed"
-
-    async def __call__(self, texts, **kwargs):
-        raise AssertionError("doc-status/kv scheduling paths must not embed")
-
-
-def _migrated_mapping(index: str, **_kwargs) -> dict:
-    """Mapping of an index that already carries the __mirrored_id tiebreaker, so
-    startup runs no legacy value backfill (see _ensure_scheduling_fields_mapping)."""
-    return {index: {"mappings": {"properties": {"__mirrored_id": {"type": "keyword"}}}}}
+    return default_global_config()
 
 
 def _make_legacy_client() -> AsyncMock:
     """Client for an index predating __mirrored_id: no mapping, so no values."""
     client = _make_client()
     client.indices.get_mapping = AsyncMock(return_value={})
-    return client
-
-
-def _make_client() -> AsyncMock:
-    client = AsyncMock(spec=AsyncOpenSearch)
-    client.indices = AsyncMock()
-    client.indices.exists = AsyncMock(return_value=True)
-    client.indices.create = AsyncMock()
-    client.indices.get_mapping = AsyncMock(side_effect=_migrated_mapping)
-    client.indices.put_mapping = AsyncMock()
-    client.get = AsyncMock(return_value={})
-    client.index = AsyncMock(return_value={})
-    client.update = AsyncMock(return_value={})
-    client.count = AsyncMock(return_value={"count": 0})
-    client.search = AsyncMock(return_value={"hits": {"hits": []}})
-    # query_params wraps the client methods in a SYNC wrapper, so spec'd
-    # children default to MagicMock — async ones must be set explicitly.
-    client.update_by_query = AsyncMock(return_value={"updated": 0, "failures": []})
     return client
 
 
@@ -178,19 +108,7 @@ async def _make_doc_status(global_config, client) -> OpenSearchDocStatusStorage:
         storage = OpenSearchDocStatusStorage(
             namespace="doc_status",
             global_config=global_config,
-            embedding_func=_EmbedFunc(),
-            workspace="schedws",
-        )
-        await storage.initialize()
-    return storage
-
-
-async def _make_kv(global_config, client) -> OpenSearchKVStorage:
-    with patch.object(ClientManager, "get_client", return_value=client):
-        storage = OpenSearchKVStorage(
-            namespace="full_docs",
-            global_config=global_config,
-            embedding_func=_EmbedFunc(),
+            embedding_func=RejectingEmbedFunc(),
             workspace="schedws",
         )
         await storage.initialize()
@@ -1057,68 +975,6 @@ async def test_repair_index_not_ready_raises(global_config):
             expected_candidate_fingerprint="x",
             dry_run=True,
         )
-
-
-# ---------------------------------------------------------------------------
-# KV get_by_id_strict: three-state contract
-# ---------------------------------------------------------------------------
-
-
-async def test_kv_strict_pending_delete_is_confirmed_absent(global_config):
-    client = _make_client()
-    storage = await _make_kv(global_config, client)
-    client.mget = AsyncMock()
-    await storage.upsert({"doc-1": {"content": "x"}})
-    await storage.delete(["doc-1"])
-    assert await storage.get_by_id_strict("doc-1") is None
-    client.mget.assert_not_awaited()
-
-
-async def test_kv_strict_pending_upsert_is_present(global_config):
-    client = _make_client()
-    storage = await _make_kv(global_config, client)
-    client.mget = AsyncMock()
-    await storage.upsert({"doc-1": {"content": "x"}})
-    doc = await storage.get_by_id_strict("doc-1")
-    assert doc["content"] == "x"
-    assert doc["_id"] == "doc-1"
-    client.mget.assert_not_awaited()
-
-
-async def test_kv_strict_index_not_ready_raises(global_config):
-    client = _make_client()
-    storage = await _make_kv(global_config, client)
-    storage._index_ready = False
-    with pytest.raises(StorageControlPlaneError):
-        await storage.get_by_id_strict("doc-1")
-    # The relaxed read keeps its best-effort miss behavior.
-    assert await storage.get_by_id("doc-1") is None
-
-
-async def test_kv_strict_transport_error_raises(global_config):
-    client = _make_client()
-    storage = await _make_kv(global_config, client)
-    client.mget = AsyncMock(side_effect=_transient_error())
-    with pytest.raises(TransportError):
-        await storage.get_by_id_strict("doc-1")
-
-
-async def test_kv_strict_missing_index_raises(global_config):
-    """get_by_id reads a missing index as a miss; the strict variant cannot
-    positively confirm absence there and must raise."""
-    client = _make_client()
-    storage = await _make_kv(global_config, client)
-    client.mget = AsyncMock(side_effect=_missing_index_error())
-    with pytest.raises(StorageControlPlaneError):
-        await storage.get_by_id_strict("doc-1")
-    assert storage._index_ready is False
-
-
-async def test_kv_strict_healthy_miss_is_none(global_config):
-    client = _make_client()
-    storage = await _make_kv(global_config, client)
-    client.mget = AsyncMock(return_value={"docs": [{"_id": "doc-1", "found": False}]})
-    assert await storage.get_by_id_strict("doc-1") is None
 
 
 # ---------------------------------------------------------------------------

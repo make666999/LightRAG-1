@@ -22,6 +22,7 @@ tests/kg/test_doc_status_strict_parse_branches.py — no live PostgreSQL):
 
 import datetime
 import json
+import logging
 
 import pytest
 
@@ -38,7 +39,8 @@ from lightrag.exceptions import (
     StorageControlPlaneError,
     StorageRecordNotFoundError,
 )
-from lightrag.kg.postgres_impl import PGDocStatusStorage, PGKVStorage
+from lightrag.kg.postgres_impl import PGDocStatusStorage, PGKVStorage, PostgreSQLDB
+from lightrag.utils import logger
 
 pytestmark = pytest.mark.offline
 
@@ -829,3 +831,108 @@ def test_scheduling_api_is_mandatory_no_flags():
     # Fully concrete → no abstract methods left → instantiable.
     assert not PGDocStatusStorage.__abstractmethods__
     assert not PGKVStorage.__abstractmethods__
+
+
+# ---------------------------------------------------------------------------
+# Scheduling-index migration ordering & catalog verification
+# ---------------------------------------------------------------------------
+
+
+class TestPgSchedulingIndexMigration:
+    _NEW = "idx_lightrag_doc_status_ws_status_created_nf_id"
+    _SUPERSEDED = "idx_lightrag_doc_status_ws_status_created_id"
+
+    class _IndexFakeDB:
+        _doc_status_index_exists = PostgreSQLDB._doc_status_index_exists
+
+        def __init__(self, *, existing: set[str] | None = None):
+            self.existing: set[str] = set(existing or ())
+            self.executed: list[str] = []
+            self.create_fails: Exception | None = None
+            self.create_is_a_lie = False
+
+        async def query(self, sql, params=None, multirows=False, **kwargs):
+            assert "pg_indexes" in sql, sql
+            assert params and len(params) == 1, params
+            return {"indexname": params[0]} if params[0] in self.existing else None
+
+        async def execute(self, sql, data=None, **kwargs):
+            self.executed.append(" ".join(sql.split()))
+            if sql.strip().upper().startswith("CREATE INDEX"):
+                if self.create_fails is not None:
+                    raise self.create_fails
+                if not self.create_is_a_lie:
+                    self.existing.add(TestPgSchedulingIndexMigration._NEW)
+            elif "DROP INDEX" in sql.upper():
+                self.existing.discard(TestPgSchedulingIndexMigration._SUPERSEDED)
+
+    @staticmethod
+    def _kinds(db) -> list[str]:
+        out = []
+        for sql in db.executed:
+            upper = sql.upper()
+            if upper.startswith("CREATE INDEX"):
+                out.append("create")
+            elif "DROP INDEX" in upper:
+                out.append("drop")
+        return out
+
+    @pytest.mark.asyncio
+    async def test_creates_then_drops_the_superseded_index_in_that_order(self):
+        db = self._IndexFakeDB(existing={self._SUPERSEDED})
+        await PostgreSQLDB._migrate_doc_status_add_scheduling_index(db)
+
+        assert self._kinds(db) == ["create", "drop"]
+        assert self._NEW in db.existing
+        assert self._SUPERSEDED not in db.existing
+        assert any("CREATED_AT NULLS FIRST" in sql.upper() for sql in db.executed)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_create_keeps_the_superseded_index(self, lightrag_caplog):
+        db = self._IndexFakeDB(existing={self._SUPERSEDED})
+        db.create_fails = RuntimeError("canceling statement due to lock timeout")
+
+        with lightrag_caplog.at_level(logging.WARNING, logger=logger.name):
+            await PostgreSQLDB._migrate_doc_status_add_scheduling_index(db)
+
+        assert "drop" not in self._kinds(db)
+        assert self._SUPERSEDED in db.existing
+        assert "is MISSING" in lightrag_caplog.text
+        assert "full scan" in lightrag_caplog.text
+        assert "NULLS FIRST" in lightrag_caplog.text
+
+    @pytest.mark.asyncio
+    async def test_the_drop_waits_on_the_catalog_not_on_the_absence_of_an_error(self):
+        db = self._IndexFakeDB(existing={self._SUPERSEDED})
+        db.create_is_a_lie = True
+
+        await PostgreSQLDB._migrate_doc_status_add_scheduling_index(db)
+
+        assert self._kinds(db) == ["create"]
+        assert self._SUPERSEDED in db.existing
+
+    @pytest.mark.asyncio
+    async def test_a_second_startup_creates_nothing_and_stays_idempotent(self):
+        db = self._IndexFakeDB(existing={self._NEW})
+        await PostgreSQLDB._migrate_doc_status_add_scheduling_index(db)
+
+        assert self._kinds(db) == ["drop"]
+        assert self._NEW in db.existing
+
+    @pytest.mark.asyncio
+    async def test_a_failed_verification_read_also_holds_the_drop_back(self):
+        db = self._IndexFakeDB(existing={self._SUPERSEDED})
+        calls = {"n": 0}
+        original = db.query
+
+        async def _second_read_fails(sql, params=None, multirows=False, **kwargs):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("connection reset")
+            return await original(sql, params, multirows=multirows, **kwargs)
+
+        db.query = _second_read_fails
+        await PostgreSQLDB._migrate_doc_status_add_scheduling_index(db)
+
+        assert "drop" not in self._kinds(db)
+        assert self._SUPERSEDED in db.existing

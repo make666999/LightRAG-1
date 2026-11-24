@@ -10,11 +10,18 @@ pytest.importorskip(
 
 from pymongo.errors import PyMongoError, BulkWriteError, DuplicateKeyError
 
+from lightrag import config_anchor as ca
+from lightrag import config_store as cs
+from lightrag.exceptions import ConfigurationStorageError, StorageNotInitializedError
 from lightrag.kg.mongo_impl import (
+    ClientManager,
     MongoDocStatusStorage,
     MongoGraphStorage,
+    MongoKVStorage,
     _canonical_edge_endpoints,
 )
+from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
+from lightrag.namespace import CONFIG_CONTAINER_TAG
 from lightrag.types import KnowledgeGraph
 
 pytestmark = pytest.mark.offline
@@ -1623,3 +1630,229 @@ class TestMongoLabelHelpersFailLoud:
         s.collection.count_documents = AsyncMock(return_value=0)
 
         assert await s.search_labels("alpha") == []
+
+
+# ---------------------------------------------------------------------------
+# ClientManager connection lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestClientManagerLifecycle:
+    """Verify ClientManager connection open/close behavior."""
+
+    def teardown_method(self):
+        ClientManager._instances = {"client": None, "db": None, "ref_count": 0}
+
+    @pytest.mark.asyncio
+    async def test_release_client_closes_connection_when_ref_count_zero(self):
+        mock_client = AsyncMock()
+        mock_db = MagicMock()
+        ClientManager._instances = {
+            "client": mock_client,
+            "db": mock_db,
+            "ref_count": 1,
+        }
+
+        await ClientManager.release_client(mock_db)
+
+        mock_client.close.assert_awaited_once()
+        assert ClientManager._instances["client"] is None
+        assert ClientManager._instances["db"] is None
+        assert ClientManager._instances["ref_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_release_client_keeps_connection_with_multiple_refs(self):
+        mock_client = AsyncMock()
+        mock_db = MagicMock()
+        ClientManager._instances = {
+            "client": mock_client,
+            "db": mock_db,
+            "ref_count": 3,
+        }
+
+        await ClientManager.release_client(mock_db)
+
+        mock_client.close.assert_not_awaited()
+        assert ClientManager._instances["ref_count"] == 2
+        assert ClientManager._instances["client"] is mock_client
+        assert ClientManager._instances["db"] is mock_db
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "target_factory",
+        [
+            pytest.param(MagicMock, id="wrong_db"),
+            pytest.param(lambda: None, id="none"),
+        ],
+    )
+    async def test_release_client_noop_for_untracked_db(self, target_factory):
+        mock_client = AsyncMock()
+        mock_db = MagicMock()
+        ClientManager._instances = {
+            "client": mock_client,
+            "db": mock_db,
+            "ref_count": 1,
+        }
+
+        await ClientManager.release_client(target_factory())
+
+        mock_client.close.assert_not_awaited()
+        assert ClientManager._instances["ref_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# MongoKVStorage config container, identity binding, and iter_rows
+# ---------------------------------------------------------------------------
+
+
+class TestMongoConfigContainer:
+    """``MongoKVStorage`` on the ``config`` namespace: fixed container and batch limits."""
+
+    @staticmethod
+    def _storage(namespace: str, workspace: str = "tenant") -> MongoKVStorage:
+        return MongoKVStorage(
+            namespace=namespace,
+            global_config={},
+            embedding_func=None,
+            workspace=workspace,
+        )
+
+    def test_the_config_container_has_the_same_positive_batch_limits_as_a_tenant(self):
+        config = self._storage("config")
+        tenant = self._storage("text_chunks")
+        assert (
+            isinstance(config._max_upsert_payload_bytes, int)
+            and config._max_upsert_payload_bytes > 0
+        )
+        assert (
+            isinstance(config._max_upsert_records_per_batch, int)
+            and config._max_upsert_records_per_batch > 0
+        )
+        assert (
+            config._max_upsert_payload_bytes,
+            config._max_upsert_records_per_batch,
+        ) == (
+            tenant._max_upsert_payload_bytes,
+            tenant._max_upsert_records_per_batch,
+        )
+
+    @pytest.mark.parametrize("workspace", ["tenant", ""])
+    def test_the_collection_is_fixed_whatever_the_caller_named(self, workspace):
+        storage = self._storage("config", workspace)
+        assert storage.workspace == CONFIG_CONTAINER_TAG
+        assert storage._collection_name == f"{CONFIG_CONTAINER_TAG}_config"
+
+    def test_mongodb_workspace_does_not_remap_the_container(self, monkeypatch):
+        monkeypatch.setenv("MONGODB_WORKSPACE", "prod")
+        assert (
+            self._storage("config")._collection_name == f"{CONFIG_CONTAINER_TAG}_config"
+        )
+        assert self._storage("text_chunks")._collection_name == "prod_text_chunks"
+
+
+class TestMongoConfigIdentity:
+    """Configuration container identity row on MongoKVStorage."""
+
+    CONTAINER = "MongoKVStorage (_lightrag_config)"
+
+    @pytest.fixture(autouse=True)
+    def _shared(self):
+        initialize_share_data(workers=1)
+        yield
+        finalize_share_data()
+
+    class _Collection:
+        def __init__(self, *, read_error=None):
+            self.docs: dict[str, dict] = {}
+            self.read_error = read_error
+            self.writes = 0
+
+        async def find_one(self, query):
+            if self.read_error is not None:
+                raise self.read_error
+            doc = self.docs.get(query["_id"])
+            return None if doc is None else dict(doc)
+
+        async def bulk_write(self, operations, ordered=True):
+            for op in operations:
+                self.writes += 1
+                key = op._filter["_id"]
+                doc = dict(self.docs.get(key) or op._doc.get("$setOnInsert", {}))
+                doc.update(op._doc["$set"])
+                self.docs[key] = doc
+
+    @staticmethod
+    def _storage(collection) -> MongoKVStorage:
+        storage = cs.create_configuration_storage(
+            MongoKVStorage, global_config={}, embedding_func=None
+        )
+        storage._data = collection
+        return storage
+
+    async def _bind(self, storage, tmp_path):
+        return await cs.bind_configuration_identity(
+            storage,
+            working_dir=str(tmp_path),
+            backend="MongoKVStorage",
+            container=self.CONTAINER,
+        )
+
+    async def test_the_identity_is_created_read_back_and_then_verified(self, tmp_path):
+        collection = self._Collection()
+        storage = self._storage(collection)
+        created = await self._bind(storage, tmp_path)
+        assert created.action == "created"
+        doc = collection.docs[cs.storage_identity_key()]
+        assert doc["value"] == {"uuid": created.storage_uuid}
+        assert "workspace" not in doc
+        assert ca.read_anchor(str(tmp_path)).backend == "MongoKVStorage"
+
+        writes = collection.writes
+        verified = await self._bind(storage, tmp_path)
+        assert verified.action == "verified"
+        assert verified.storage_uuid == created.storage_uuid
+        assert collection.writes == writes
+
+    async def test_a_read_failure_creates_neither_identity_nor_anchor(self, tmp_path):
+        collection = self._Collection(read_error=PyMongoError("connection refused"))
+        with pytest.raises(ConfigurationStorageError):
+            await self._bind(self._storage(collection), tmp_path)
+        assert collection.docs == {}
+        assert ca.read_anchor(str(tmp_path)) is None
+
+
+class TestMongoKVIterRows:
+    """``MongoKVStorage.iter_rows`` enumeration contract."""
+
+    @staticmethod
+    def _storage(docs):
+        storage = MongoKVStorage.__new__(MongoKVStorage)
+        storage.namespace = "config"
+        storage.workspace = "iterws"
+        storage.global_config = {}
+        collection = MagicMock()
+        collection.find = MagicMock(return_value=_AsyncCursor([dict(d) for d in docs]))
+        storage._data = collection
+        storage.db = MagicMock()
+        return storage, collection
+
+    async def test_rows_stream_through_a_bounded_cursor(self):
+        docs = [{"_id": f"k{i}", "value": {"n": i}} for i in range(5)]
+        storage, collection = self._storage(docs)
+
+        rows = [row async for row in storage.iter_rows(page_size=2)]
+
+        assert [r["_id"] for r in rows] == [f"k{i}" for i in range(5)]
+        assert all(r["create_time"] == 0 and r["update_time"] == 0 for r in rows)
+        collection.find.assert_called_once_with({}, batch_size=2)
+
+    async def test_an_empty_collection_yields_nothing(self):
+        storage, _ = self._storage([])
+        assert [row async for row in storage.iter_rows()] == []
+
+    async def test_an_uninitialized_storage_raises(self):
+        storage, _ = self._storage([])
+        storage._data = None
+        with pytest.raises(StorageNotInitializedError):
+            async for _ in storage.iter_rows():
+                pass

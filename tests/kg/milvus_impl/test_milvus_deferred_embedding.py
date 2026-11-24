@@ -1,7 +1,7 @@
 """Unit tests for MilvusVectorDBStorage's deferred-embedding flush pipeline.
 
 All tests use mocks — no running Milvus instance required.
-Mirrors the structure of tests/kg/opensearch_impl/test_opensearch_storage.py's
+Mirrors the structure of tests/kg/opensearch_impl/test_opensearch_vector.py's
 TestVectorStorageBatching to keep behaviour aligned across backends.
 """
 
