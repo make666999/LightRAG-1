@@ -3,50 +3,82 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 import pytest
 
 from tests.setup._helpers import (
     REPO_ROOT,
+    copy_repo_template,
     parse_lines,
-    run_bash,
-    run_bash_lines,
+    run_bash_process,
+    run_collect_bash,
+    run_setup_bash,
     write_text_lines,
 )
 
 pytestmark = pytest.mark.offline
 
 
+@pytest.mark.parametrize(
+    ("invocation", "stdin", "expected"),
+    [
+        ('prompt_until_valid "Port" "9621" validate_port', "invalid\n9622\n", "9622"),
+        (
+            'prompt_secret_until_valid "Key" validate_non_empty',
+            "\nvalid-key\n",
+            "valid-key",
+        ),
+        (
+            'prompt_secret_until_valid_with_default "Key" "" validate_non_empty',
+            "\nvalid-key\n",
+            "valid-key",
+        ),
+        ('prompt_required_secret "Key"', "\nvalid-key\n", "valid-key"),
+    ],
+)
+def test_retry_diagnostics_stay_out_of_captured_value(
+    invocation: str, stdin: str, expected: str
+) -> None:
+    """Validation messages must not become the wizard's captured configuration."""
+    prompts = (REPO_ROOT / "scripts/setup/lib/prompts.sh").as_posix()
+    validation = (REPO_ROOT / "scripts/setup/lib/validation.sh").as_posix()
+    result = run_bash_process(
+        f"""source "{prompts}"
+source "{validation}"
+value=$(printf '%s' {shlex.quote(stdin)} | {invocation})
+printf '%s' "$value"
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+    assert "Please try again." in result.stderr
+
+
 def test_collect_postgres_config_uses_fixed_bundled_port_and_compose_overrides() -> (
     None
 ):
     """Bundled PostgreSQL should use the fixed service port and compose overrides."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-confirm_default_yes() {{ return 0; }}
-prompt_with_default() {{
-  case "$1" in
-    "PostgreSQL host") printf 'localhost' ;;
-    "PostgreSQL user") printf 'lightrag' ;;
-    "PostgreSQL database") printf 'lightrag' ;;
-    *) printf '%s' "$2" ;;
-  esac
-}}
-prompt_secret_with_default() {{ printf '%s' "$2"; }}
-mask_sensitive_input() {{ printf 'supersecret'; }}
-
+    values = run_collect_bash(
+        """
 collect_postgres_config yes
-
-printf 'POSTGRES_HOST=%s\\n' "${{ENV_VALUES[POSTGRES_HOST]}}"
-printf 'POSTGRES_PORT=%s\\n' "${{ENV_VALUES[POSTGRES_PORT]}}"
-printf 'COMPOSE_POSTGRES_HOST=%s\\n' "${{COMPOSE_ENV_OVERRIDES[POSTGRES_HOST]}}"
-printf 'COMPOSE_POSTGRES_PORT=%s\\n' "${{COMPOSE_ENV_OVERRIDES[POSTGRES_PORT]}}"
-printf 'DOCKER_SERVICE=%s\\n' "${{DOCKER_SERVICES[0]}}\"
-""")
+printf 'COMPOSE_POSTGRES_HOST=%s\\n' "${COMPOSE_ENV_OVERRIDES[POSTGRES_HOST]}"
+printf 'COMPOSE_POSTGRES_PORT=%s\\n' "${COMPOSE_ENV_OVERRIDES[POSTGRES_PORT]}"
+printf 'DOCKER_SERVICE=%s\\n' "${DOCKER_SERVICES[0]}"
+""",
+        prompt_answers={
+            "PostgreSQL host": "localhost",
+            "PostgreSQL user": "lightrag",
+            "PostgreSQL database": "lightrag",
+        },
+        stubs="""
+confirm_default_yes() { return 0; }
+prompt_secret_with_default() { printf '%s' "$2"; }
+mask_sensitive_input() { printf 'supersecret'; }
+""",
+        print_env=("POSTGRES_HOST", "POSTGRES_PORT"),
+    )
     assert values["POSTGRES_HOST"] == "localhost"
     assert values["POSTGRES_PORT"] == "5432"
     assert values["COMPOSE_POSTGRES_HOST"] == "postgres"
@@ -54,188 +86,129 @@ printf 'DOCKER_SERVICE=%s\\n' "${{DOCKER_SERVICES[0]}}\"
     assert values["DOCKER_SERVICE"] == "postgres"
 
 
-def test_collect_postgres_config_prompts_with_host_defaults_for_empty_docker_credentials() -> (
-    None
-):
-    """Docker PostgreSQL should prompt for editable creds using the host-mode defaults."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-PROMPT_LOG_FILE="$(mktemp)"
-: > "$PROMPT_LOG_FILE"
-
-confirm_default_yes() {{ return 0; }}
-prompt_with_default() {{
-  printf '%s[%s]\\n' "$1" "$2" >> "$PROMPT_LOG_FILE"
-  case "$1" in
-    "PostgreSQL host") printf 'localhost' ;;
-    *) printf '%s' "$2" ;;
-  esac
-}}
-prompt_secret_with_default() {{
-  printf 'secret:%s[%s]\\n' "$1" "$2" >> "$PROMPT_LOG_FILE"
-  printf '%s' "$2"
-}}
-
-ORIGINAL_ENV_VALUES[POSTGRES_USER]=""
-ORIGINAL_ENV_VALUES[POSTGRES_PASSWORD]=""
-ORIGINAL_ENV_VALUES[POSTGRES_DATABASE]=""
-
-collect_postgres_config yes
-
-printf 'POSTGRES_USER=%s\\n' "${{ENV_VALUES[POSTGRES_USER]}}"
-printf 'POSTGRES_PASSWORD=%s\\n' "${{ENV_VALUES[POSTGRES_PASSWORD]}}"
-printf 'POSTGRES_DATABASE=%s\\n' "${{ENV_VALUES[POSTGRES_DATABASE]}}"
-printf 'PROMPT_LOG=%s\\n' "$(paste -sd '|' "$PROMPT_LOG_FILE")\"
-""")
-    assert values["POSTGRES_USER"] == "rag"
-    assert values["POSTGRES_PASSWORD"] == "rag"
-    assert values["POSTGRES_DATABASE"] == "lightrag"
-    assert (
-        values["PROMPT_LOG"]
-        == "PostgreSQL host[localhost]|PostgreSQL user[rag]|secret:PostgreSQL password: [rag]|PostgreSQL database[lightrag]"
+@pytest.mark.parametrize(
+    (
+        "collector_call",
+        "original_env",
+        "confirm_stub",
+        "prompt_answers",
+        "until_valid_answers",
+        "secret_answer",
+        "log_secret_prefix",
+        "expected_values",
+        "expected_prompt_log",
+    ),
+    [
+        (
+            "collect_postgres_config yes",
+            {"POSTGRES_USER": "", "POSTGRES_PASSWORD": "", "POSTGRES_DATABASE": ""},
+            "confirm_default_yes() { return 0; }",
+            {"PostgreSQL host": "localhost"},
+            {},
+            None,
+            True,
+            {
+                "POSTGRES_USER": "rag",
+                "POSTGRES_PASSWORD": "rag",
+                "POSTGRES_DATABASE": "lightrag",
+            },
+            "PostgreSQL host[localhost]|PostgreSQL user[rag]|secret:PostgreSQL password: [rag]|PostgreSQL database[lightrag]",
+        ),
+        (
+            "collect_postgres_config yes",
+            {
+                "POSTGRES_USER": "existing-user",
+                "POSTGRES_PASSWORD": "existing-password",
+                "POSTGRES_DATABASE": "existing-db",
+            },
+            "confirm_default_yes() { return 0; }",
+            {
+                "PostgreSQL host": "localhost",
+                "PostgreSQL user": "updated-user",
+                "PostgreSQL database": "updated-db",
+            },
+            {},
+            "updated-password",
+            False,
+            {
+                "POSTGRES_USER": "updated-user",
+                "POSTGRES_PASSWORD": "updated-password",
+                "POSTGRES_DATABASE": "updated-db",
+            },
+            "PostgreSQL host[localhost]|PostgreSQL user[existing-user]|PostgreSQL password: [existing-password]|PostgreSQL database[existing-db]",
+        ),
+        (
+            "collect_postgres_config no",
+            {"POSTGRES_USER": "", "POSTGRES_PASSWORD": ""},
+            "confirm_default_no() { return 1; }",
+            {
+                "PostgreSQL host": "db.internal",
+                "PostgreSQL user": "host-user",
+                "PostgreSQL database": "host-db",
+            },
+            {"PostgreSQL port": "6543"},
+            "host-password",
+            False,
+            {
+                "POSTGRES_HOST": "db.internal",
+                "POSTGRES_PORT": "6543",
+                "POSTGRES_USER": "host-user",
+                "POSTGRES_PASSWORD": "host-password",
+            },
+            "PostgreSQL host[localhost]|PostgreSQL port[5432]|PostgreSQL user[rag]|PostgreSQL password: [rag]|PostgreSQL database[lightrag]",
+        ),
+    ],
+    ids=["docker-empty-creds", "docker-existing-creds", "host-empty-creds"],
+)
+def test_collect_postgres_config_prompts_for_credentials(
+    collector_call: str,
+    original_env: dict[str, str],
+    confirm_stub: str,
+    prompt_answers: dict[str, str],
+    until_valid_answers: dict[str, str],
+    secret_answer: str | None,
+    log_secret_prefix: bool,
+    expected_values: dict[str, str],
+    expected_prompt_log: str,
+) -> None:
+    """PostgreSQL credential prompts should apply host/saved defaults across docker and host modes."""
+    values = run_collect_bash(
+        collector_call,
+        original_env_values=original_env,
+        stubs=confirm_stub,
+        prompt_answers=prompt_answers,
+        until_valid_answers=until_valid_answers,
+        secret_answer=secret_answer,
+        log_prompts=True,
+        log_defaults=True,
+        log_secret_prefix=log_secret_prefix,
+        print_env=tuple(expected_values),
     )
-
-
-def test_collect_postgres_config_prompts_for_existing_docker_credentials() -> None:
-    """Docker PostgreSQL should preserve editability when old `.env` creds already exist."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-PROMPT_LOG_FILE="$(mktemp)"
-: > "$PROMPT_LOG_FILE"
-
-confirm_default_yes() {{ return 0; }}
-prompt_with_default() {{
-  printf '%s[%s]\\n' "$1" "$2" >> "$PROMPT_LOG_FILE"
-  case "$1" in
-    "PostgreSQL host") printf 'localhost' ;;
-    "PostgreSQL user") printf 'updated-user' ;;
-    "PostgreSQL database") printf 'updated-db' ;;
-    *) printf '%s' "$2" ;;
-  esac
-}}
-prompt_secret_with_default() {{
-  printf '%s[%s]\\n' "$1" "$2" >> "$PROMPT_LOG_FILE"
-  printf 'updated-password'
-}}
-
-ORIGINAL_ENV_VALUES[POSTGRES_USER]="existing-user"
-ORIGINAL_ENV_VALUES[POSTGRES_PASSWORD]="existing-password"
-ORIGINAL_ENV_VALUES[POSTGRES_DATABASE]="existing-db"
-
-collect_postgres_config yes
-
-printf 'POSTGRES_USER=%s\\n' "${{ENV_VALUES[POSTGRES_USER]}}"
-printf 'POSTGRES_PASSWORD=%s\\n' "${{ENV_VALUES[POSTGRES_PASSWORD]}}"
-printf 'POSTGRES_DATABASE=%s\\n' "${{ENV_VALUES[POSTGRES_DATABASE]}}"
-printf 'PROMPT_LOG=%s\\n' "$(paste -sd '|' "$PROMPT_LOG_FILE")\"
-""")
-    assert values["POSTGRES_USER"] == "updated-user"
-    assert values["POSTGRES_PASSWORD"] == "updated-password"
-    assert values["POSTGRES_DATABASE"] == "updated-db"
-    assert (
-        values["PROMPT_LOG"]
-        == "PostgreSQL host[localhost]|PostgreSQL user[existing-user]|PostgreSQL password: [existing-password]|PostgreSQL database[existing-db]"
-    )
-
-
-def test_collect_postgres_config_still_prompts_for_host_credentials() -> None:
-    """Host PostgreSQL should keep prompting even when saved creds are empty."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-PROMPT_LOG_FILE="$(mktemp)"
-: > "$PROMPT_LOG_FILE"
-
-confirm_default_no() {{ return 1; }}
-prompt_with_default() {{
-  printf '%s[%s]\\n' "$1" "$2" >> "$PROMPT_LOG_FILE"
-  case "$1" in
-    "PostgreSQL host") printf 'db.internal' ;;
-    "PostgreSQL user") printf 'host-user' ;;
-    "PostgreSQL database") printf 'host-db' ;;
-    *) printf '%s' "$2" ;;
-  esac
-}}
-prompt_until_valid() {{
-  printf '%s[%s]\\n' "$1" "$2" >> "$PROMPT_LOG_FILE"
-  if [[ "$1" == "PostgreSQL port" ]]; then
-    printf '6543'
-  else
-    printf '%s' "$2"
-  fi
-}}
-prompt_secret_with_default() {{
-  printf '%s[%s]\\n' "$1" "$2" >> "$PROMPT_LOG_FILE"
-  printf 'host-password'
-}}
-
-ORIGINAL_ENV_VALUES[POSTGRES_USER]=""
-ORIGINAL_ENV_VALUES[POSTGRES_PASSWORD]=""
-
-collect_postgres_config no
-
-printf 'POSTGRES_HOST=%s\\n' "${{ENV_VALUES[POSTGRES_HOST]}}"
-printf 'POSTGRES_PORT=%s\\n' "${{ENV_VALUES[POSTGRES_PORT]}}"
-printf 'POSTGRES_USER=%s\\n' "${{ENV_VALUES[POSTGRES_USER]}}"
-printf 'POSTGRES_PASSWORD=%s\\n' "${{ENV_VALUES[POSTGRES_PASSWORD]}}"
-printf 'PROMPT_LOG=%s\\n' "$(paste -sd '|' "$PROMPT_LOG_FILE")\"
-""")
-    assert values["POSTGRES_HOST"] == "db.internal"
-    assert values["POSTGRES_PORT"] == "6543"
-    assert values["POSTGRES_USER"] == "host-user"
-    assert values["POSTGRES_PASSWORD"] == "host-password"
-    assert (
-        values["PROMPT_LOG"]
-        == "PostgreSQL host[localhost]|PostgreSQL port[5432]|PostgreSQL user[rag]|PostgreSQL password: [rag]|PostgreSQL database[lightrag]"
-    )
+    for key, expected in expected_values.items():
+        assert values[key] == expected
+    assert values["PROMPT_LOG"] == expected_prompt_log
 
 
 def test_collect_server_config_includes_summary_language_last() -> None:
     """Server config should prompt for summary language after the WebUI fields."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-PROMPT_LOG_FILE="$(mktemp)"
-: > "$PROMPT_LOG_FILE"
-
-prompt_with_default() {{
-  printf '%s\\n' "$1" >> "$PROMPT_LOG_FILE"
-  case "$1" in
-    "Server host") printf '127.0.0.1' ;;
-    "WebUI title") printf 'Custom KB' ;;
-    "WebUI description") printf 'Custom description' ;;
-    "Summary language") printf 'Chinese' ;;
-    *) printf '%s' "$2" ;;
-  esac
-}}
-prompt_until_valid() {{
-  printf '%s\\n' "$1" >> "$PROMPT_LOG_FILE"
-  if [[ "$1" == "Server port" ]]; then
-    printf '9630'
-  else
-    printf '%s' "$2"
-  fi
-}}
-
-collect_server_config
-
-printf 'HOST=%s\\n' "${{ENV_VALUES[HOST]}}"
-printf 'PORT=%s\\n' "${{ENV_VALUES[PORT]}}"
-printf 'WEBUI_TITLE=%s\\n' "${{ENV_VALUES[WEBUI_TITLE]}}"
-printf 'WEBUI_DESCRIPTION=%s\\n' "${{ENV_VALUES[WEBUI_DESCRIPTION]}}"
-printf 'SUMMARY_LANGUAGE=%s\\n' "${{ENV_VALUES[SUMMARY_LANGUAGE]}}"
-printf 'PROMPT_LOG=%s\\n' "$(paste -sd '|' "$PROMPT_LOG_FILE")\"
-""")
+    values = run_collect_bash(
+        "collect_server_config",
+        prompt_answers={
+            "Server host": "127.0.0.1",
+            "WebUI title": "Custom KB",
+            "WebUI description": "Custom description",
+            "Summary language": "Chinese",
+        },
+        until_valid_answers={"Server port": "9630"},
+        log_prompts=True,
+        print_env=(
+            "HOST",
+            "PORT",
+            "WEBUI_TITLE",
+            "WEBUI_DESCRIPTION",
+            "SUMMARY_LANGUAGE",
+        ),
+    )
     assert values["HOST"] == "127.0.0.1"
     assert values["PORT"] == "9630"
     assert values["WEBUI_TITLE"] == "Custom KB"
@@ -248,82 +221,76 @@ printf 'PROMPT_LOG=%s\\n' "$(paste -sd '|' "$PROMPT_LOG_FILE")\"
 
 
 @pytest.mark.parametrize(
-    ("setup_lines", "collector_call", "env_key", "expected_value"),
+    ("env_values", "collector_call", "env_key", "expected_value"),
     [
         (
-            [
-                'ENV_VALUES[POSTGRES_HOST]="db.example.com"',
-                'ENV_VALUES[POSTGRES_PORT]="6543"',
-            ],
+            {"POSTGRES_HOST": "db.example.com", "POSTGRES_PORT": "6543"},
             "collect_postgres_config yes",
             "POSTGRES_HOST",
             "localhost",
         ),
         (
-            [
-                'ENV_VALUES[POSTGRES_HOST]="db.example.com"',
-                'ENV_VALUES[POSTGRES_PORT]="6543"',
-            ],
+            {"POSTGRES_HOST": "db.example.com", "POSTGRES_PORT": "6543"},
             "collect_postgres_config yes",
             "POSTGRES_PORT",
             "5432",
         ),
         (
-            ['ENV_VALUES[NEO4J_URI]="neo4j+s://graph.example.com"'],
+            {"NEO4J_URI": "neo4j+s://graph.example.com"},
             "collect_neo4j_config yes",
             "NEO4J_URI",
             "neo4j://localhost:7687",
         ),
         (
-            ['ENV_VALUES[MONGO_URI]="mongodb://mongo.example.com:27018/"'],
+            {"MONGO_URI": "mongodb://mongo.example.com:27018/"},
             "collect_mongodb_config yes",
             "MONGO_URI",
             "mongodb://localhost:27017/?directConnection=true",
         ),
         (
-            ['ENV_VALUES[REDIS_URI]="redis://cache.example.com:6380/1"'],
+            {"REDIS_URI": "redis://cache.example.com:6380/1"},
             "collect_redis_config yes",
             "REDIS_URI",
             "redis://localhost:6379",
         ),
         (
-            ['ENV_VALUES[MILVUS_URI]="http://milvus.example.com:19530"'],
+            {"MILVUS_URI": "http://milvus.example.com:19530"},
             "collect_milvus_config yes",
             "MILVUS_URI",
             "http://localhost:19530",
         ),
         (
-            ['ENV_VALUES[QDRANT_URL]="http://qdrant.example.com:6333"'],
+            {"QDRANT_URL": "http://qdrant.example.com:6333"},
             "collect_qdrant_config yes",
             "QDRANT_URL",
             "http://localhost:6333",
         ),
         (
-            ['ENV_VALUES[MEMGRAPH_URI]="bolt://memgraph.example.com:7687"'],
+            {"MEMGRAPH_URI": "bolt://memgraph.example.com:7687"},
             "collect_memgraph_config yes",
             "MEMGRAPH_URI",
             "bolt://localhost:7687",
         ),
         (
-            ['ENV_VALUES[NEO4J_URI]="neo4j://localhost:7777"'],
+            {"NEO4J_URI": "neo4j://localhost:7777"},
             "collect_neo4j_config yes",
             "NEO4J_URI",
             "neo4j://localhost:7687",
         ),
         (
-            ['ENV_VALUES[MILVUS_URI]="http://localhost:29530"'],
+            {"MILVUS_URI": "http://localhost:29530"},
             "collect_milvus_config yes",
             "MILVUS_URI",
             "http://localhost:19530",
         ),
         (
-            ['ENV_VALUES[QDRANT_URL]="http://localhost:16333"'],
+            {"QDRANT_URL": "http://localhost:16333"},
             "collect_qdrant_config yes",
             "QDRANT_URL",
             "http://localhost:6333",
         ),
         (
-            ['ENV_VALUES[MEMGRAPH_URI]="bolt://localhost:17687"'],
+            {"MEMGRAPH_URI": "bolt://localhost:17687"},
             "collect_memgraph_config yes",
             "MEMGRAPH_URI",
             "bolt://localhost:7687",
@@ -345,36 +312,27 @@ printf 'PROMPT_LOG=%s\\n' "$(paste -sd '|' "$PROMPT_LOG_FILE")\"
     ],
 )
 def test_collect_local_service_configs_normalize_stale_values(
-    setup_lines: list[str], collector_call: str, env_key: str, expected_value: str
+    env_values: dict[str, str], collector_call: str, env_key: str, expected_value: str
 ) -> None:
     """Bundled services should normalize stale remote or localhost endpoints on rerun."""
-    setup_block = "\n".join(setup_lines)
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-{setup_block}
-
-confirm_default_yes() {{ return 0; }}
-prompt_choice() {{ printf '%s' "$2"; }}
-prompt_with_default() {{
-  case "$1" in
-    "PostgreSQL user") printf 'lightrag' ;;
-    "PostgreSQL database") printf 'lightrag' ;;
-    "Neo4j database") printf 'neo4j' ;;
-    "MongoDB database") printf 'LightRAG' ;;
-    "Milvus database name") printf 'lightrag' ;;
-    *) printf '%s' "$2" ;;
-  esac
-}}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_secret_with_default() {{ printf '%s' "$2"; }}
-
-{collector_call}
-
-printf '{env_key}=%s\\n' "${{ENV_VALUES[{env_key}]}}\"
-""")
+    values = run_collect_bash(
+        collector_call,
+        env_values=env_values,
+        prompt_answers={
+            "PostgreSQL user": "lightrag",
+            "PostgreSQL database": "lightrag",
+            "Neo4j database": "neo4j",
+            "MongoDB database": "LightRAG",
+            "Milvus database name": "lightrag",
+        },
+        until_valid_answers={},
+        stubs="""
+confirm_default_yes() { return 0; }
+prompt_choice() { printf '%s' "$2"; }
+prompt_secret_with_default() { printf '%s' "$2"; }
+""",
+        print_env=(env_key,),
+    )
     assert values[env_key] == expected_value
 
 
@@ -384,33 +342,20 @@ def test_collect_ssl_config_can_disable_loaded_ssl_values(tmp_path: Path) -> Non
     cert_path.write_text("cert", encoding="utf-8")
     key_path = tmp_path / "key.pem"
     key_path.write_text("key", encoding="utf-8")
-    env_file = tmp_path / ".env"
-    env_file.write_text(
-        "\n".join(["SSL=true", f"SSL_CERTFILE={cert_path}", f"SSL_KEYFILE={key_path}"])
-        + "\n",
-        encoding="utf-8",
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-confirm_default_yes() {{ return 1; }}
-
+    values = run_collect_bash(
+        """
 collect_ssl_config
-
-printf 'SSL_IS_SET=%s\\n' "${{ENV_VALUES[SSL]+set}}"
-printf 'SSL_CERTFILE_IS_SET=%s\\n' "${{ENV_VALUES[SSL_CERTFILE]+set}}"
-printf 'SSL_KEYFILE_IS_SET=%s\\n' "${{ENV_VALUES[SSL_KEYFILE]+set}}"
 printf 'SSL_CERT_SOURCE_PATH=%s\\n' "$SSL_CERT_SOURCE_PATH"
-printf 'SSL_KEY_SOURCE_PATH=%s\\n' "$SSL_KEY_SOURCE_PATH\"
-""")
-    values = parse_lines(output)
-    assert values["SSL_IS_SET"] == ""
-    assert values["SSL_CERTFILE_IS_SET"] == ""
-    assert values["SSL_KEYFILE_IS_SET"] == ""
+printf 'SSL_KEY_SOURCE_PATH=%s\\n' "$SSL_KEY_SOURCE_PATH"
+""",
+        tmp_path=tmp_path,
+        env_lines=["SSL=true", f"SSL_CERTFILE={cert_path}", f"SSL_KEYFILE={key_path}"],
+        stubs="confirm_default_yes() { return 1; }",
+        print_set=("SSL", "SSL_CERTFILE", "SSL_KEYFILE"),
+    )
+    assert values["SSL_SET"] == ""
+    assert values["SSL_CERTFILE_SET"] == ""
+    assert values["SSL_KEYFILE_SET"] == ""
     assert values["SSL_CERT_SOURCE_PATH"] == ""
     assert values["SSL_KEY_SOURCE_PATH"] == ""
 
@@ -446,33 +391,29 @@ def test_collect_provider_config_clears_stale_api_key_for_bedrock(
     tmp_path: Path, collector_name: str, binding_prefix: str, env_lines: list[str]
 ) -> None:
     """Switching a provider to Bedrock should remove stale API-key settings."""
-    write_text_lines(tmp_path / ".env", env_lines)
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-prompt_choice() {{ printf 'bedrock'; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_required_secret() {{ printf 'dummy-secret'; }}
-mask_sensitive_input() {{ printf ''; }}
-confirm_default_yes() {{ return 0; }}
-
+    values = run_collect_bash(
+        f"""
 {collector_name}
-
-printf 'BINDING=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING]}}"
-printf 'API_KEY_SET=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING_API_KEY]+set}}"
 if validate_sensitive_env_literals; then
   printf 'VALID=yes\\n'
 else
   printf 'VALID=no\\n'
 fi
-""")
-    values = parse_lines(output)
-    assert values["BINDING"] == "bedrock"
-    assert values["API_KEY_SET"] == ""
+""",
+        tmp_path=tmp_path,
+        env_lines=env_lines,
+        prompt_answers={},
+        stubs="""
+prompt_choice() { printf 'bedrock'; }
+prompt_required_secret() { printf 'dummy-secret'; }
+mask_sensitive_input() { printf ''; }
+confirm_default_yes() { return 0; }
+""",
+        print_env=(f"{binding_prefix}_BINDING",),
+        print_set=(f"{binding_prefix}_BINDING_API_KEY",),
+    )
+    assert values[f"{binding_prefix}_BINDING"] == "bedrock"
+    assert values[f"{binding_prefix}_BINDING_API_KEY_SET"] == ""
     assert values["VALID"] == "yes"
 
 
@@ -585,29 +526,23 @@ def test_collect_provider_config_uses_provider_specific_defaults(
     expected_api_key_set: str,
 ) -> None:
     """Fresh provider selection should pick provider-specific defaults."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-prompt_choice() {{ printf '{provider_choice}'; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-{secret_stub}
-
-{collector_name}
-
-printf 'BINDING=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING]}}"
-printf 'MODEL=%s\\n' "${{ENV_VALUES[{binding_prefix}_MODEL]}}"
-printf 'HOST=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING_HOST]}}"
-printf 'DIM=%s\\n' "${{ENV_VALUES[{binding_prefix}_DIM]:-}}"
-printf 'API_KEY_SET=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING_API_KEY]+set}}\"
-""")
-    values = parse_lines(output)
-    assert values["BINDING"] == expected_binding
-    assert values["MODEL"] == expected_model
-    assert values["HOST"] == expected_host
-    assert values["DIM"] == expected_dim
-    assert values["API_KEY_SET"] == expected_api_key_set
+    values = run_collect_bash(
+        collector_name,
+        prompt_answers={},
+        stubs=f"prompt_choice() {{ printf '{provider_choice}'; }}\n{secret_stub}",
+        print_env=(
+            f"{binding_prefix}_BINDING",
+            f"{binding_prefix}_MODEL",
+            f"{binding_prefix}_BINDING_HOST",
+            f"{binding_prefix}_DIM",
+        ),
+        print_set=(f"{binding_prefix}_BINDING_API_KEY",),
+    )
+    assert values[f"{binding_prefix}_BINDING"] == expected_binding
+    assert values[f"{binding_prefix}_MODEL"] == expected_model
+    assert values[f"{binding_prefix}_BINDING_HOST"] == expected_host
+    assert values[f"{binding_prefix}_DIM"] == expected_dim
+    assert values[f"{binding_prefix}_BINDING_API_KEY_SET"] == expected_api_key_set
 
 
 @pytest.mark.parametrize(
@@ -658,29 +593,25 @@ def test_collect_provider_config_preserves_explicit_host_on_rerun(
     expected_api_key: str,
 ) -> None:
     """Reruns should keep saved explicit provider hosts instead of swapping to sentinels."""
-    write_text_lines(tmp_path / ".env", env_lines)
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-prompt_choice() {{ printf '%s' "$2"; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-prompt_clearable_with_default() {{ printf ''; }}
-prompt_required_secret() {{ return 1; }}
-confirm_default_yes() {{ return 1; }}
-
-{collector_name}
-
-printf 'HOST=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING_HOST]}}"
-printf 'API_KEY=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING_API_KEY]:-}}\"
-""")
-    values = parse_lines(output)
-    assert values["HOST"] == expected_host
-    assert values["API_KEY"] == expected_api_key
+    values = run_collect_bash(
+        collector_name,
+        tmp_path=tmp_path,
+        env_lines=env_lines,
+        prompt_answers={},
+        stubs="""
+prompt_choice() { printf '%s' "$2"; }
+prompt_secret_until_valid_with_default() { printf '%s' "$2"; }
+prompt_clearable_with_default() { printf ''; }
+prompt_required_secret() { return 1; }
+confirm_default_yes() { return 1; }
+""",
+        print_env=(
+            f"{binding_prefix}_BINDING_HOST",
+            f"{binding_prefix}_BINDING_API_KEY",
+        ),
+    )
+    assert values[f"{binding_prefix}_BINDING_HOST"] == expected_host
+    assert values[f"{binding_prefix}_BINDING_API_KEY"] == expected_api_key
 
 
 @pytest.mark.parametrize(
@@ -705,10 +636,7 @@ printf 'API_KEY=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING_API_KEY]:-}}\"
                 "LLM_BINDING_HOST=http://localhost:11434/v1",
                 "LLM_BINDING_API_KEY=sk-local-test-key",
             ],
-            """
-prompt_with_default() { printf '%s' "$2"; }
-prompt_secret_until_valid_with_default() { printf '%s' "$2"; }
-""",
+            "prompt_secret_until_valid_with_default() { printf '%s' \"$2\"; }",
             "openai-ollama",
             "llama3.1:8b",
             "http://localhost:11434/v1",
@@ -724,7 +652,7 @@ prompt_secret_until_valid_with_default() { printf '%s' "$2"; }
                 "EMBEDDING_DIM=1024",
                 "EMBEDDING_BINDING_HOST=http://localhost:9600",
             ],
-            "prompt_with_default() { printf '%s' \"$2\"; }",
+            "",
             "lollms",
             "lollms_embedding_model",
             "http://localhost:9600",
@@ -747,39 +675,35 @@ def test_collect_provider_config_preserves_supported_binding_on_rerun(
     expected_api_key: str,
 ) -> None:
     """Reruns should preserve supported provider bindings and their saved settings."""
-    write_text_lines(tmp_path / ".env", env_lines)
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-{prompt_stubs}
-
-{collector_name}
-
-printf 'BINDING=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING]}}"
-printf 'MODEL=%s\\n' "${{ENV_VALUES[{binding_prefix}_MODEL]}}"
-printf 'HOST=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING_HOST]}}"
-printf 'DIM=%s\\n' "${{ENV_VALUES[{binding_prefix}_DIM]:-}}"
-printf 'API_KEY=%s\\n' "${{ENV_VALUES[{binding_prefix}_BINDING_API_KEY]:-}}\"
-""")
-    values = parse_lines(output)
-    assert values["BINDING"] == expected_binding
-    assert values["MODEL"] == expected_model
-    assert values["HOST"] == expected_host
-    assert values["DIM"] == expected_dim
-    assert values["API_KEY"] == expected_api_key
+    values = run_collect_bash(
+        collector_name,
+        tmp_path=tmp_path,
+        env_lines=env_lines,
+        prompt_answers={},
+        stubs=prompt_stubs,
+        print_env=(
+            f"{binding_prefix}_BINDING",
+            f"{binding_prefix}_MODEL",
+            f"{binding_prefix}_BINDING_HOST",
+            f"{binding_prefix}_DIM",
+            f"{binding_prefix}_BINDING_API_KEY",
+        ),
+    )
+    assert values[f"{binding_prefix}_BINDING"] == expected_binding
+    assert values[f"{binding_prefix}_MODEL"] == expected_model
+    assert values[f"{binding_prefix}_BINDING_HOST"] == expected_host
+    assert values[f"{binding_prefix}_DIM"] == expected_dim
+    assert values[f"{binding_prefix}_BINDING_API_KEY"] == expected_api_key
 
 
 def test_collect_embedding_config_forces_ollama_for_openai_ollama_llm(
     tmp_path: Path,
 ) -> None:
     """`openai-ollama` should not preserve a conflicting embedding provider."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    values = run_collect_bash(
+        "collect_embedding_config",
+        tmp_path=tmp_path,
+        env_lines=[
             "LLM_BINDING=openai-ollama",
             "EMBEDDING_BINDING=openai",
             "EMBEDDING_MODEL=text-embedding-3-large",
@@ -787,26 +711,16 @@ def test_collect_embedding_config_forces_ollama_for_openai_ollama_llm(
             "EMBEDDING_BINDING_HOST=https://api.openai.com/v1",
             "EMBEDDING_BINDING_API_KEY=local-key",
         ],
+        prompt_answers={},
+        stubs="prompt_secret_until_valid_with_default() { printf '%s' \"$2\"; }",
+        print_env=(
+            "EMBEDDING_BINDING",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_DIM",
+            "EMBEDDING_BINDING_HOST",
+        ),
+        print_set=("EMBEDDING_BINDING_API_KEY",),
     )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
-collect_embedding_config
-
-printf 'EMBEDDING_BINDING=%s\\n' "${{ENV_VALUES[EMBEDDING_BINDING]}}"
-printf 'EMBEDDING_MODEL=%s\\n' "${{ENV_VALUES[EMBEDDING_MODEL]}}"
-printf 'EMBEDDING_DIM=%s\\n' "${{ENV_VALUES[EMBEDDING_DIM]}}"
-printf 'EMBEDDING_BINDING_HOST=%s\\n' "${{ENV_VALUES[EMBEDDING_BINDING_HOST]}}"
-printf 'EMBEDDING_BINDING_API_KEY_SET=%s\\n' "${{ENV_VALUES[EMBEDDING_BINDING_API_KEY]+set}}\"
-""")
-    values = parse_lines(output)
     assert values["EMBEDDING_BINDING"] == "ollama"
     assert values["EMBEDDING_MODEL"] == "bge-m3:latest"
     assert values["EMBEDDING_DIM"] == "1024"
@@ -816,26 +730,23 @@ printf 'EMBEDDING_BINDING_API_KEY_SET=%s\\n' "${{ENV_VALUES[EMBEDDING_BINDING_AP
 
 def test_collect_llm_config_allows_bedrock_ambient_credential_chain() -> None:
     """Bedrock setup should allow IAM roles, AWS profiles, or SSO without saved keys."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-prompt_choice() {{ printf 'bedrock'; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_clearable_with_default() {{ printf ''; }}
-prompt_required_secret() {{ return 1; }}
-confirm_default_yes() {{ return 1; }}
-
-collect_llm_config
-
-printf 'LLM_BINDING=%s\\n' "${{ENV_VALUES[LLM_BINDING]}}"
-printf 'AWS_ACCESS_KEY_ID_SET=%s\\n' "${{ENV_VALUES[AWS_ACCESS_KEY_ID]+set}}"
-printf 'AWS_SECRET_ACCESS_KEY_SET=%s\\n' "${{ENV_VALUES[AWS_SECRET_ACCESS_KEY]+set}}"
-printf 'AWS_SESSION_TOKEN_SET=%s\\n' "${{ENV_VALUES[AWS_SESSION_TOKEN]+set}}"
-printf 'AWS_REGION_SET=%s\\n' "${{ENV_VALUES[AWS_REGION]+set}}\"
-""")
-    values = parse_lines(output)
+    values = run_collect_bash(
+        "collect_llm_config",
+        prompt_answers={},
+        stubs="""
+prompt_choice() { printf 'bedrock'; }
+prompt_clearable_with_default() { printf ''; }
+prompt_required_secret() { return 1; }
+confirm_default_yes() { return 1; }
+""",
+        print_env=("LLM_BINDING",),
+        print_set=(
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION",
+        ),
+    )
     assert values["LLM_BINDING"] == "bedrock"
     assert values["AWS_ACCESS_KEY_ID_SET"] == ""
     assert values["AWS_SECRET_ACCESS_KEY_SET"] == ""
@@ -843,100 +754,83 @@ printf 'AWS_REGION_SET=%s\\n' "${{ENV_VALUES[AWS_REGION]+set}}\"
     assert values["AWS_REGION_SET"] == ""
 
 
-def test_collect_llm_config_role_models_default_to_base_model_when_unset() -> None:
-    """KEYWORD/QUERY_LLM_MODEL must default to the freshly-chosen LLM_MODEL when absent."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-prompt_choice() {{ printf 'openai'; }}
-prompt_with_default() {{
-  case "$1" in
-    "LLM model") printf 'gpt-4o' ;;
-    *) printf '%s' "$2" ;;
-  esac
-}}
-prompt_secret_until_valid_with_default() {{ printf 'fake-key'; }}
-
-collect_llm_config
-
-printf 'LLM_MODEL=%s\\n' "${{ENV_VALUES[LLM_MODEL]}}"
-printf 'KEYWORD_LLM_MODEL=%s\\n' "${{ENV_VALUES[KEYWORD_LLM_MODEL]}}"
-printf 'QUERY_LLM_MODEL=%s\\n' "${{ENV_VALUES[QUERY_LLM_MODEL]}}\"
-""")
-    values = parse_lines(output)
-    assert values["LLM_MODEL"] == "gpt-4o"
-    assert values["KEYWORD_LLM_MODEL"] == "gpt-4o"
-    assert values["QUERY_LLM_MODEL"] == "gpt-4o"
-
-
-def test_collect_llm_config_role_models_reuse_existing_values(tmp_path: Path) -> None:
-    """KEYWORD/QUERY_LLM_MODEL values already in .env survive a base wizard rerun."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "LLM_BINDING=openai",
-            "LLM_MODEL=gpt-4o",
-            "LLM_BINDING_HOST=https://api.openai.com/v1",
-            "LLM_BINDING_API_KEY=existing-key",
-            "KEYWORD_LLM_MODEL=custom-keyword-model",
-            "QUERY_LLM_MODEL=custom-query-model",
-        ],
+@pytest.mark.parametrize(
+    (
+        "env_lines",
+        "prompt_answers",
+        "secret_stub",
+        "expected_keyword",
+        "expected_query",
+    ),
+    [
+        (
+            None,
+            {"LLM model": "gpt-4o"},
+            "prompt_secret_until_valid_with_default() { printf 'fake-key'; }",
+            "gpt-4o",
+            "gpt-4o",
+        ),
+        (
+            [
+                "LLM_BINDING=openai",
+                "LLM_MODEL=gpt-4o",
+                "LLM_BINDING_HOST=https://api.openai.com/v1",
+                "LLM_BINDING_API_KEY=existing-key",
+                "KEYWORD_LLM_MODEL=custom-keyword-model",
+                "QUERY_LLM_MODEL=custom-query-model",
+            ],
+            {},
+            "prompt_secret_until_valid_with_default() { printf '%s' \"$2\"; }",
+            "custom-keyword-model",
+            "custom-query-model",
+        ),
+    ],
+    ids=["default-to-base-model-when-unset", "reuse-existing-values"],
+)
+def test_collect_llm_config_role_models(
+    tmp_path: Path,
+    env_lines: list[str] | None,
+    prompt_answers: dict[str, str],
+    secret_stub: str,
+    expected_keyword: str,
+    expected_query: str,
+) -> None:
+    """KEYWORD/QUERY_LLM_MODEL default to LLM_MODEL when unset and survive reruns when set."""
+    values = run_collect_bash(
+        "collect_llm_config",
+        tmp_path=tmp_path if env_lines is not None else None,
+        env_lines=env_lines,
+        prompt_answers=prompt_answers,
+        stubs=f"prompt_choice() {{ printf 'openai'; }}\n{secret_stub}",
+        print_env=("LLM_MODEL", "KEYWORD_LLM_MODEL", "QUERY_LLM_MODEL"),
     )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-prompt_choice() {{ printf 'openai'; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
-collect_llm_config
-
-printf 'LLM_MODEL=%s\\n' "${{ENV_VALUES[LLM_MODEL]}}"
-printf 'KEYWORD_LLM_MODEL=%s\\n' "${{ENV_VALUES[KEYWORD_LLM_MODEL]}}"
-printf 'QUERY_LLM_MODEL=%s\\n' "${{ENV_VALUES[QUERY_LLM_MODEL]}}\"
-""")
-    values = parse_lines(output)
     assert values["LLM_MODEL"] == "gpt-4o"
-    assert values["KEYWORD_LLM_MODEL"] == "custom-keyword-model"
-    assert values["QUERY_LLM_MODEL"] == "custom-query-model"
+    assert values["KEYWORD_LLM_MODEL"] == expected_keyword
+    assert values["QUERY_LLM_MODEL"] == expected_query
 
 
 def test_collect_rerank_config_preserves_api_key_when_disabled(tmp_path: Path) -> None:
     """Disabling reranking should preserve credentials so they survive re-enable."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "RERANK_BINDING=cohere",
-            "RERANK_MODEL=rerank-v3.5",
-            "RERANK_BINDING_HOST=https://api.cohere.com/v1/rerank",
-            "RERANK_BINDING_API_KEY=test-api-key-literal",
-        ],
-    )
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-confirm_default_yes() {{ return 1; }}
-
+    values = run_collect_bash(
+        """
 collect_rerank_config
-
-printf 'RERANK_BINDING=%s\\n' "${{ENV_VALUES[RERANK_BINDING]}}"
-printf 'RERANK_BINDING_API_KEY_SET=%s\\n' "${{ENV_VALUES[RERANK_BINDING_API_KEY]+set}}"
 if validate_sensitive_env_literals; then
   printf 'VALID=yes\\n'
 else
   printf 'VALID=no\\n'
 fi
-""")
+""",
+        tmp_path=tmp_path,
+        env_lines=[
+            "RERANK_BINDING=cohere",
+            "RERANK_MODEL=rerank-v3.5",
+            "RERANK_BINDING_HOST=https://api.cohere.com/v1/rerank",
+            "RERANK_BINDING_API_KEY=test-api-key-literal",
+        ],
+        stubs="confirm_default_yes() { return 1; }",
+        print_env=("RERANK_BINDING",),
+        print_set=("RERANK_BINDING_API_KEY",),
+    )
     assert values["RERANK_BINDING"] == "null"
     assert values["RERANK_BINDING_API_KEY_SET"] == "set"
     assert values["VALID"] == "yes"
@@ -944,15 +838,13 @@ fi
 
 def test_collect_rerank_config_does_not_offer_vllm_provider_option() -> None:
     """The generic rerank provider prompt should only expose valid RERANK_BINDING values."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-ENV_VALUES[RERANK_BINDING]="cohere"
-
-confirm_default_no() {{ return 0; }}
-prompt_choice() {{
+    values = run_collect_bash(
+        "collect_rerank_config",
+        env_values={"RERANK_BINDING": "cohere"},
+        prompt_answers={},
+        stubs="""
+confirm_default_no() { return 0; }
+prompt_choice() {
   case "$1" in
     "Rerank provider")
       shift 2
@@ -964,52 +856,44 @@ prompt_choice() {{
       done
       printf 'cohere'
       ;;
-    *)
-      printf '%s' "$2"
-      ;;
+    *) printf '%s' "$2" ;;
   esac
-}}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf 'cohere-secret-123'; }}
-
-collect_rerank_config
-
-printf 'RERANK_BINDING=%s\\n' "${{ENV_VALUES[RERANK_BINDING]}}\"
-""")
-    values = parse_lines(output)
+}
+prompt_secret_until_valid_with_default() { printf 'cohere-secret-123'; }
+""",
+        print_env=("RERANK_BINDING",),
+    )
     assert values["RERANK_BINDING"] == "cohere"
 
 
 def test_collect_rerank_config_switching_from_vllm_clears_local_defaults() -> None:
     """Switching from local vLLM to hosted rerank should replace stale vLLM values with provider defaults."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]="vllm"
-ENV_VALUES[RERANK_BINDING]="cohere"
-ENV_VALUES[RERANK_MODEL]="BAAI/bge-reranker-v2-m3"
-ENV_VALUES[RERANK_BINDING_HOST]="http://localhost:8000/rerank"
-
-confirm_default_no() {{ return 0; }}
-prompt_choice() {{
+    values = run_collect_bash(
+        "collect_rerank_config",
+        env_values={
+            "LIGHTRAG_SETUP_RERANK_PROVIDER": "vllm",
+            "RERANK_BINDING": "cohere",
+            "RERANK_MODEL": "BAAI/bge-reranker-v2-m3",
+            "RERANK_BINDING_HOST": "http://localhost:8000/rerank",
+        },
+        prompt_answers={},
+        stubs="""
+confirm_default_no() { return 0; }
+prompt_choice() {
   case "$1" in
     "Rerank provider") printf 'cohere' ;;
     *) printf '%s' "$2" ;;
   esac
-}}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf 'cohere-secret-123'; }}
-
-collect_rerank_config
-
-printf 'RERANK_BINDING=%s\\n' "${{ENV_VALUES[RERANK_BINDING]}}"
-printf 'LIGHTRAG_SETUP_RERANK_PROVIDER=%s\\n' "${{ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]:-}}"
-printf 'RERANK_MODEL=%s\\n' "${{ENV_VALUES[RERANK_MODEL]:-}}"
-printf 'RERANK_BINDING_HOST=%s\\n' "${{ENV_VALUES[RERANK_BINDING_HOST]:-}}\"
-""")
-    values = parse_lines(output)
+}
+prompt_secret_until_valid_with_default() { printf 'cohere-secret-123'; }
+""",
+        print_env=(
+            "RERANK_BINDING",
+            "LIGHTRAG_SETUP_RERANK_PROVIDER",
+            "RERANK_MODEL",
+            "RERANK_BINDING_HOST",
+        ),
+    )
     assert values["RERANK_BINDING"] == "cohere"
     assert values["LIGHTRAG_SETUP_RERANK_PROVIDER"] == ""
     assert values["RERANK_MODEL"] != "BAAI/bge-reranker-v2-m3"
@@ -1020,15 +904,15 @@ printf 'RERANK_BINDING_HOST=%s\\n' "${{ENV_VALUES[RERANK_BINDING_HOST]:-}}\"
 
 def test_collect_rerank_config_ignores_vllm_marker_when_docker_is_predeclined() -> None:
     """A predeclined Docker path should default the provider prompt to the binding, not the setup marker."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]="vllm"
-ENV_VALUES[RERANK_BINDING]="cohere"
-
-prompt_choice() {{
+    values = run_collect_bash(
+        'collect_rerank_config "yes" "no"',
+        env_values={
+            "LIGHTRAG_SETUP_RERANK_PROVIDER": "vllm",
+            "RERANK_BINDING": "cohere",
+        },
+        prompt_answers={},
+        stubs="""
+prompt_choice() {
   case "$1" in
     "Rerank provider")
       if [[ "$2" != "cohere" ]]; then
@@ -1037,41 +921,25 @@ prompt_choice() {{
       fi
       printf 'cohere'
       ;;
-    *)
-      printf '%s' "$2"
-      ;;
+    *) printf '%s' "$2" ;;
   esac
-}}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf 'cohere-secret-123'; }}
-
-collect_rerank_config "yes" "no"
-
-printf 'RERANK_BINDING=%s\\n' "${{ENV_VALUES[RERANK_BINDING]}}\"
-""")
-    values = parse_lines(output)
+}
+prompt_secret_until_valid_with_default() { printf 'cohere-secret-123'; }
+""",
+        print_env=("RERANK_BINDING",),
+    )
     assert values["RERANK_BINDING"] == "cohere"
 
 
 def test_collect_milvus_config_defaults_to_existing_database_name() -> None:
     """Milvus database prompt should preserve the documented default database."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-confirm_default_yes() {{ return 1; }}
-prompt_with_default() {{
-  printf '%s' "$2"
-}}
-prompt_until_valid() {{
-  printf '%s' "$2"
-}}
-
-collect_milvus_config no
-
-printf 'MILVUS_DB_NAME=%s\\n' "${{ENV_VALUES[MILVUS_DB_NAME]}}\"
-""")
+    values = run_collect_bash(
+        "collect_milvus_config no",
+        prompt_answers={},
+        until_valid_answers={},
+        stubs="confirm_default_yes() { return 1; }",
+        print_env=("MILVUS_DB_NAME",),
+    )
     assert values["MILVUS_DB_NAME"] == "lightrag"
 
 
@@ -1079,66 +947,51 @@ def test_collect_milvus_config_initializes_minio_credentials_for_local_docker(
     tmp_path: Path,
 ) -> None:
     """Local Docker Milvus should write default MinIO credentials when none exist yet."""
-    env_file = tmp_path / ".env"
-    env_example = tmp_path / "env.example"
-    env_example.write_text((REPO_ROOT / "env.example").read_text(encoding="utf-8"))
-    run_bash(
-        f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-confirm_default_yes() {{ return 0; }}
-prompt_choice() {{ printf '%s' "$2"; }}
-prompt_with_default() {{
-  printf '%s' "$2"
-}}
-prompt_until_valid() {{
-  printf '%s' "$2"
-}}
-
+    copy_repo_template(tmp_path, "env.example")
+    run_collect_bash(
+        """
 collect_milvus_config yes
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
+generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env"
+""",
+        tmp_path=tmp_path,
+        prompt_answers={},
+        until_valid_answers={},
+        stubs="""
+confirm_default_yes() { return 0; }
+prompt_choice() { printf '%s' "$2"; }
 """,
         cwd=tmp_path,
     )
-    env_text = env_file.read_text(encoding="utf-8")
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "MINIO_ACCESS_KEY_ID=minioadmin" in env_text
     assert "MINIO_SECRET_ACCESS_KEY=minioadmin" in env_text
 
 
 @pytest.mark.parametrize(
-    ("setup_lines", "nvidia_impl", "expected_device"),
+    ("env_values", "nvidia_impl", "expected_device"),
     [
-        (['ENV_VALUES[MILVUS_DEVICE]="cpu"'], "nvidia-smi() { return 0; }", "cpu"),
-        (['ENV_VALUES[MILVUS_DEVICE]="cuda"'], "nvidia-smi() { return 1; }", "cuda"),
-        ([], "nvidia-smi() { return 0; }", "cuda"),
+        ({"MILVUS_DEVICE": "cpu"}, "nvidia-smi() { return 0; }", "cpu"),
+        ({"MILVUS_DEVICE": "cuda"}, "nvidia-smi() { return 1; }", "cuda"),
+        ({}, "nvidia-smi() { return 0; }", "cuda"),
     ],
     ids=["saved-cpu-wins", "saved-cuda-wins", "gpu-host-defaults-to-cuda"],
 )
 def test_collect_milvus_config_resolves_device_default_for_local_docker(
-    setup_lines: list[str], nvidia_impl: str, expected_device: str
+    env_values: dict[str, str], nvidia_impl: str, expected_device: str
 ) -> None:
     """Milvus device defaults should prefer saved state and otherwise use host CUDA detection."""
-    setup_block = "\n".join(setup_lines)
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-{setup_block}
+    values = run_collect_bash(
+        "collect_milvus_config yes",
+        env_values=env_values,
+        prompt_answers={},
+        until_valid_answers={},
+        stubs=f"""
 {nvidia_impl}
-
 confirm_default_yes() {{ return 0; }}
 prompt_choice() {{ printf '%s' "$2"; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-
-collect_milvus_config yes
-
-printf 'MILVUS_DEVICE=%s\\n' "${{ENV_VALUES[MILVUS_DEVICE]}}\"
-""")
+""",
+        print_env=("MILVUS_DEVICE",),
+    )
     assert values["MILVUS_DEVICE"] == expected_device
 
 
@@ -1153,32 +1006,11 @@ def test_local_vector_db_device_prompt_is_first_follow_up_after_docker_choice(
     collector_call: str, device_prompt: str, endpoint_prompt: str
 ) -> None:
     """GPU/CPU selection should be the first prompt after choosing local Docker deployment."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-PROMPT_LOG_FILE="$(mktemp)"
-: > "$PROMPT_LOG_FILE"
-
-confirm_default_yes() {{ return 0; }}
-prompt_choice() {{
-  printf '%s\\n' "$1" >> "$PROMPT_LOG_FILE"
-  printf '%s' "$2"
-}}
-prompt_with_default() {{
-  printf '%s\\n' "$1" >> "$PROMPT_LOG_FILE"
-  printf '%s' "$2"
-}}
-prompt_until_valid() {{
-  printf '%s\\n' "$1" >> "$PROMPT_LOG_FILE"
-  printf '%s' "$2"
-}}
-
-{collector_call}
-
-printf 'PROMPT_LOG=%s\\n' "$(paste -sd '|' "$PROMPT_LOG_FILE")"
-""")
+    values = run_collect_bash(
+        collector_call,
+        stubs="confirm_default_yes() { return 0; }",
+        log_prompts=True,
+    )
     assert values["PROMPT_LOG"].startswith(f"{device_prompt}|{endpoint_prompt}")
 
 
@@ -1186,29 +1018,18 @@ def test_collect_mongodb_config_local_service_strips_stale_credentials_on_rerun(
     None
 ):
     """Bundled MongoDB should keep host `.env` aligned with the unauthenticated template."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-ENV_VALUES[MONGO_URI]="mongodb://root:secret@localhost:27018/"
-
-confirm_default_yes() {{ return 0; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_with_default() {{
-  if [[ "$1" == "MongoDB database" ]]; then
-    printf 'LightRAG'
-  else
-    printf '%s' "$2"
-  fi
-}}
-
+    values = run_collect_bash(
+        """
 collect_mongodb_config yes
-
-printf 'MONGO_URI=%s\\n' "${{ENV_VALUES[MONGO_URI]}}"
-printf 'COMPOSE_MONGO_URI=%s\\n' "${{COMPOSE_ENV_OVERRIDES[MONGO_URI]}}"
-printf 'DOCKER_SERVICE=%s\\n' "${{DOCKER_SERVICES[0]}}\"
-""")
+printf 'COMPOSE_MONGO_URI=%s\\n' "${COMPOSE_ENV_OVERRIDES[MONGO_URI]}"
+printf 'DOCKER_SERVICE=%s\\n' "${DOCKER_SERVICES[0]}"
+""",
+        env_values={"MONGO_URI": "mongodb://root:secret@localhost:27018/"},
+        prompt_answers={"MongoDB database": "LightRAG"},
+        until_valid_answers={},
+        stubs="confirm_default_yes() { return 0; }",
+        print_env=("MONGO_URI",),
+    )
     assert values["MONGO_URI"] == "mongodb://localhost:27017/?directConnection=true"
     assert (
         values["COMPOSE_MONGO_URI"] == "mongodb://mongodb:27017/?directConnection=true"
@@ -1216,77 +1037,55 @@ printf 'DOCKER_SERVICE=%s\\n' "${{DOCKER_SERVICES[0]}}\"
     assert values["DOCKER_SERVICE"] == "mongodb"
 
 
-def test_collect_mongodb_config_resets_wizard_managed_local_uri_when_switching_off_docker() -> (
-    None
-):
-    """Switching off bundled MongoDB should not preserve the old wizard-managed local URI."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-ENV_VALUES[LIGHTRAG_VECTOR_STORAGE]="MongoVectorDBStorage"
-ENV_VALUES[MONGO_URI]="mongodb://localhost:27017/?directConnection=true"
-
-confirm_default_yes() {{ return 1; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-
+@pytest.mark.parametrize(
+    ("initial_uri", "expected_uri"),
+    [
+        (
+            "mongodb://localhost:27017/?directConnection=true",
+            "mongodb+srv://cluster.example.mongodb.net/",
+        ),
+        (
+            "mongodb://atlas-local.example.com:27017/LightRAG?replicaSet=rs0&directConnection=true",
+            "mongodb://atlas-local.example.com:27017/LightRAG?replicaSet=rs0&directConnection=true",
+        ),
+    ],
+    ids=["resets-wizard-managed-local-uri", "preserves-external-atlas-local-uri"],
+)
+def test_collect_mongodb_config_switching_off_docker_handles_mongo_uri(
+    initial_uri: str, expected_uri: str
+) -> None:
+    """Switching off bundled MongoDB resets the managed local URI while keeping external Atlas Local URIs."""
+    values = run_collect_bash(
+        """
 collect_mongodb_config yes
-
-printf 'MONGO_URI=%s\\n' "${{ENV_VALUES[MONGO_URI]}}"
-printf 'COMPOSE_MONGO_URI=%s\\n' "${{COMPOSE_ENV_OVERRIDES[MONGO_URI]-}}\"
-""")
-    assert values["MONGO_URI"] == "mongodb+srv://cluster.example.mongodb.net/"
-    assert values["COMPOSE_MONGO_URI"] == ""
-
-
-def test_collect_mongodb_config_preserves_external_atlas_local_uri_when_switching_off_docker() -> (
-    None
-):
-    """Switching off bundled MongoDB should keep an explicitly configured external Atlas Local URI."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-ENV_VALUES[LIGHTRAG_VECTOR_STORAGE]="MongoVectorDBStorage"
-ENV_VALUES[MONGO_URI]="mongodb://atlas-local.example.com:27017/LightRAG?replicaSet=rs0&directConnection=true"
-
-confirm_default_yes() {{ return 1; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-
-collect_mongodb_config yes
-
-printf 'MONGO_URI=%s\\n' "${{ENV_VALUES[MONGO_URI]}}"
-printf 'COMPOSE_MONGO_URI=%s\\n' "${{COMPOSE_ENV_OVERRIDES[MONGO_URI]-}}\"
-""")
-    assert (
-        values["MONGO_URI"]
-        == "mongodb://atlas-local.example.com:27017/LightRAG?replicaSet=rs0&directConnection=true"
+printf 'COMPOSE_MONGO_URI=%s\\n' "${COMPOSE_ENV_OVERRIDES[MONGO_URI]-}"
+""",
+        env_values={
+            "LIGHTRAG_VECTOR_STORAGE": "MongoVectorDBStorage",
+            "MONGO_URI": initial_uri,
+        },
+        prompt_answers={},
+        until_valid_answers={},
+        stubs="confirm_default_yes() { return 1; }",
+        print_env=("MONGO_URI",),
     )
+    assert values["MONGO_URI"] == expected_uri
     assert values["COMPOSE_MONGO_URI"] == ""
 
 
 def test_collect_redis_config_local_service_normalizes_custom_host_port() -> None:
     """Bundled Redis should keep host `.env` aligned with the published local port."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-ENV_VALUES[REDIS_URI]="redis://localhost:6380/1"
-
-confirm_default_yes() {{ return 0; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-
+    values = run_collect_bash(
+        """
 collect_redis_config yes
-
-printf 'REDIS_URI=%s\\n' "${{ENV_VALUES[REDIS_URI]}}"
-printf 'COMPOSE_REDIS_URI=%s\\n' "${{COMPOSE_ENV_OVERRIDES[REDIS_URI]}}"
-printf 'DOCKER_SERVICE=%s\\n' "${{DOCKER_SERVICES[0]}}\"
-""")
+printf 'COMPOSE_REDIS_URI=%s\\n' "${COMPOSE_ENV_OVERRIDES[REDIS_URI]}"
+printf 'DOCKER_SERVICE=%s\\n' "${DOCKER_SERVICES[0]}"
+""",
+        env_values={"REDIS_URI": "redis://localhost:6380/1"},
+        until_valid_answers={},
+        stubs="confirm_default_yes() { return 0; }",
+        print_env=("REDIS_URI",),
+    )
     assert values["REDIS_URI"] == "redis://localhost:6379/1"
     assert values["COMPOSE_REDIS_URI"] == "redis://redis:6379"
     assert values["DOCKER_SERVICE"] == "redis"
@@ -1296,41 +1095,32 @@ def test_collect_security_config_can_clear_existing_values_on_rerun(
     tmp_path: Path,
 ) -> None:
     """Rerunning security setup should be able to remove previously saved values."""
-    env_file = tmp_path / ".env"
-    env_file.write_text(
-        "\n".join(
-            [
-                "AUTH_ACCOUNTS=admin:secret",
-                "TOKEN_SECRET=jwt-secret",
-                "TOKEN_EXPIRE_HOURS=72",
-                "LIGHTRAG_API_KEY=api-key",
-                "WHITELIST_PATHS=/health,/api/*,/docs",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-confirm_default_no() {{ return 0; }}
-prompt_clearable_with_default() {{ printf '%s' "$CLEAR_INPUT_SENTINEL"; }}
-prompt_clearable_secret_with_default() {{ printf '%s' "$CLEAR_INPUT_SENTINEL"; }}
-
+    values = run_collect_bash(
+        f"""
 collect_security_config yes no
 generate_env_file "{REPO_ROOT}/env.example" "$REPO_ROOT/.env.generated"
-
-printf 'AUTH_ACCOUNTS_SET=%s\\n' "${{ENV_VALUES[AUTH_ACCOUNTS]+set}}"
-printf 'TOKEN_SECRET_SET=%s\\n' "${{ENV_VALUES[TOKEN_SECRET]+set}}"
-printf 'TOKEN_EXPIRE_HOURS_SET=%s\\n' "${{ENV_VALUES[TOKEN_EXPIRE_HOURS]+set}}"
-printf 'LIGHTRAG_API_KEY_SET=%s\\n' "${{ENV_VALUES[LIGHTRAG_API_KEY]+set}}"
-printf 'WHITELIST_PATHS_SET=%s\\n' "${{ENV_VALUES[WHITELIST_PATHS]+set}}\"
-""")
-    values = parse_lines(output)
+""",
+        tmp_path=tmp_path,
+        env_lines=[
+            "AUTH_ACCOUNTS=admin:secret",
+            "TOKEN_SECRET=jwt-secret",
+            "TOKEN_EXPIRE_HOURS=72",
+            "LIGHTRAG_API_KEY=api-key",
+            "WHITELIST_PATHS=/health,/api/*,/docs",
+        ],
+        stubs="""
+confirm_default_no() { return 0; }
+prompt_clearable_with_default() { printf '%s' "$CLEAR_INPUT_SENTINEL"; }
+prompt_clearable_secret_with_default() { printf '%s' "$CLEAR_INPUT_SENTINEL"; }
+""",
+        print_set=(
+            "AUTH_ACCOUNTS",
+            "TOKEN_SECRET",
+            "TOKEN_EXPIRE_HOURS",
+            "LIGHTRAG_API_KEY",
+            "WHITELIST_PATHS",
+        ),
+    )
     generated_lines = (
         (tmp_path / ".env.generated").read_text(encoding="utf-8").splitlines()
     )
@@ -1350,24 +1140,17 @@ def test_collect_security_config_preserves_explicit_empty_whitelist_on_rerun(
     tmp_path: Path,
 ) -> None:
     """Rerunning security setup should keep an explicitly empty whitelist unchanged."""
-    env_file = tmp_path / ".env"
-    env_file.write_text("WHITELIST_PATHS=\n", encoding="utf-8")
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-prompt_clearable_with_default() {{ printf '%s' "$2"; }}
-prompt_clearable_secret_with_default() {{ printf '%s' "$2"; }}
-
-collect_security_config no no
-
-printf 'WHITELIST_PATHS_SET=%s\\n' "${{ENV_VALUES[WHITELIST_PATHS]+set}}"
-printf 'WHITELIST_PATHS=%s\\n' "${{ENV_VALUES[WHITELIST_PATHS]}}\"
-""")
-    values = parse_lines(output)
+    values = run_collect_bash(
+        "collect_security_config no no",
+        tmp_path=tmp_path,
+        env_lines=["WHITELIST_PATHS="],
+        stubs="""
+prompt_clearable_with_default() { printf '%s' "$2"; }
+prompt_clearable_secret_with_default() { printf '%s' "$2"; }
+""",
+        print_env=("WHITELIST_PATHS",),
+        print_set=("WHITELIST_PATHS",),
+    )
     assert values["WHITELIST_PATHS_SET"] == "set"
     assert values["WHITELIST_PATHS"] == ""
 
@@ -1376,36 +1159,25 @@ def test_collect_observability_config_clears_existing_values_on_rerun(
     tmp_path: Path,
 ) -> None:
     """Rerunning setup should remove saved Langfuse settings when observability is declined."""
-    env_file = tmp_path / ".env"
-    env_file.write_text(
-        "\n".join(
-            [
-                "LANGFUSE_ENABLE_TRACE=true",
-                "LANGFUSE_SECRET_KEY=old-secret",
-                "LANGFUSE_PUBLIC_KEY=old-public",
-                "LANGFUSE_HOST=https://langfuse.example",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-
+    values = run_collect_bash(
+        f"""
 collect_observability_config
 generate_env_file "{REPO_ROOT}/env.example" "$REPO_ROOT/.env.generated"
-
-printf 'LANGFUSE_ENABLE_TRACE_SET=%s\\n' "${{ENV_VALUES[LANGFUSE_ENABLE_TRACE]+set}}"
-printf 'LANGFUSE_SECRET_KEY_SET=%s\\n' "${{ENV_VALUES[LANGFUSE_SECRET_KEY]+set}}"
-printf 'LANGFUSE_PUBLIC_KEY_SET=%s\\n' "${{ENV_VALUES[LANGFUSE_PUBLIC_KEY]+set}}"
-printf 'LANGFUSE_HOST_SET=%s\\n' "${{ENV_VALUES[LANGFUSE_HOST]+set}}\"
-""")
-    values = parse_lines(output)
+""",
+        tmp_path=tmp_path,
+        env_lines=[
+            "LANGFUSE_ENABLE_TRACE=true",
+            "LANGFUSE_SECRET_KEY=old-secret",
+            "LANGFUSE_PUBLIC_KEY=old-public",
+            "LANGFUSE_HOST=https://langfuse.example",
+        ],
+        print_set=(
+            "LANGFUSE_ENABLE_TRACE",
+            "LANGFUSE_SECRET_KEY",
+            "LANGFUSE_PUBLIC_KEY",
+            "LANGFUSE_HOST",
+        ),
+    )
     generated_lines = (
         (tmp_path / ".env.generated").read_text(encoding="utf-8").splitlines()
     )
@@ -1425,55 +1197,36 @@ def test_collect_neo4j_config_bundled_service_keeps_username_editable(
     tmp_path: Path,
 ) -> None:
     """Bundled Neo4j should preserve editable credentials and existing database overrides."""
-    compose_file = tmp_path / "docker-compose.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "    env_file:",
-                "      - .env",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_text_lines(
+        tmp_path / "docker-compose.yml",
+        [
+            "services:",
+            "  lightrag:",
+            "    image: example/lightrag:test",
+            "    env_file:",
+            "      - .env",
+        ],
     )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-ENV_VALUES[NEO4J_USERNAME]="custom-user"
-ENV_VALUES[NEO4J_PASSWORD]="existing-password"
-ENV_VALUES[NEO4J_DATABASE]="custom-db"
-
-confirm_default_yes() {{ return 0; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_log_file="$(mktemp)"
-trap 'rm -f "$prompt_log_file"' EXIT
-prompt_with_default() {{
-  printf '%s\\n' "$1" >> "$prompt_log_file"
-  if [[ "$1" == "Neo4j database" ]]; then
-    printf 'custom-db-2'
-  else
-    printf '%s' "$2"
-  fi
-}}
-prompt_secret_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
+    values = run_collect_bash(
+        """
 collect_neo4j_config yes
 generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml"
-
-printf 'NEO4J_USERNAME=%s\\n' "${{ENV_VALUES[NEO4J_USERNAME]}}"
-printf 'NEO4J_PASSWORD=%s\\n' "${{ENV_VALUES[NEO4J_PASSWORD]}}"
-printf 'NEO4J_DATABASE=%s\\n' "${{ENV_VALUES[NEO4J_DATABASE]}}"
-printf 'DOCKER_SERVICE=%s\\n' "${{DOCKER_SERVICES[0]}}"
-printf 'DATABASE_PROMPTS=%s\\n' "$(grep -c '^Neo4j database$' "$prompt_log_file" || true)\"
-""")
-    values = parse_lines(output)
+printf 'DOCKER_SERVICE=%s\\n' "${DOCKER_SERVICES[0]}"
+""",
+        tmp_path=tmp_path,
+        env_values={
+            "NEO4J_USERNAME": "custom-user",
+            "NEO4J_PASSWORD": "existing-password",
+            "NEO4J_DATABASE": "custom-db",
+        },
+        prompt_answers={"Neo4j database": "custom-db-2"},
+        log_prompts=True,
+        stubs="""
+confirm_default_yes() { return 0; }
+prompt_secret_until_valid_with_default() { printf '%s' "$2"; }
+""",
+        print_env=("NEO4J_USERNAME", "NEO4J_PASSWORD", "NEO4J_DATABASE"),
+    )
     generated_compose = (tmp_path / "docker-compose.generated.yml").read_text(
         encoding="utf-8"
     )
@@ -1481,7 +1234,7 @@ printf 'DATABASE_PROMPTS=%s\\n' "$(grep -c '^Neo4j database$' "$prompt_log_file"
     assert values["NEO4J_PASSWORD"] == "existing-password"
     assert values["NEO4J_DATABASE"] == "custom-db-2"
     assert values["DOCKER_SERVICE"] == "neo4j"
-    assert values["DATABASE_PROMPTS"] == "1"
+    assert values["PROMPT_LOG"].split("|").count("Neo4j database") == 1
     assert (
         "NEO4J_AUTH: ${NEO4J_USERNAME:?missing}/${NEO4J_PASSWORD:?missing}"
         in generated_compose
@@ -1491,68 +1244,49 @@ printf 'DATABASE_PROMPTS=%s\\n' "$(grep -c '^Neo4j database$' "$prompt_log_file"
 
 def test_collect_neo4j_config_bundled_service_defaults_database_when_unset() -> None:
     """Bundled Neo4j should pin the community default database when no prior value exists."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-prompt_log_file="$(mktemp)"
-trap 'rm -f "$prompt_log_file"' EXIT
-
-confirm_default_yes() {{ return 0; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_with_default() {{
-  printf '%s\\n' "$1" >> "$prompt_log_file"
-  printf '%s' "$2"
-}}
-prompt_secret_until_valid_with_default() {{ printf 'secure-password'; }}
-
-collect_neo4j_config yes
-
-printf 'DATABASE=%s\\n' "${{ENV_VALUES[NEO4J_DATABASE]}}"
-printf 'DATABASE_PROMPTS=%s\\n' "$(grep -c '^Neo4j database$' "$prompt_log_file" || true)\"
-""")
-    values = parse_lines(output)
-    assert values["DATABASE"] == "neo4j"
-    assert values["DATABASE_PROMPTS"] == "0"
+    values = run_collect_bash(
+        "collect_neo4j_config yes",
+        log_prompts=True,
+        stubs="""
+confirm_default_yes() { return 0; }
+prompt_secret_until_valid_with_default() { printf 'secure-password'; }
+""",
+        print_env=("NEO4J_DATABASE",),
+    )
+    assert values["NEO4J_DATABASE"] == "neo4j"
+    assert "Neo4j database" not in values["PROMPT_LOG"].split("|")
 
 
 def test_collect_neo4j_config_uses_existing_password_as_default_in_external_mode() -> (
     None
 ):
     """External Neo4j should preserve the existing password when the default is accepted."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-ENV_VALUES[NEO4J_PASSWORD]="from-env-password"
-
-confirm_default_no() {{ return 1; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_with_default() {{ printf '%s' "$2"; }}
-
-collect_neo4j_config no
-
-printf 'PASSWORD=%s\\n' "${{ENV_VALUES[NEO4J_PASSWORD]}}\"
-""")
-    values = parse_lines(output)
-    assert values["PASSWORD"] == "from-env-password"
+    values = run_collect_bash(
+        "collect_neo4j_config no",
+        env_values={"NEO4J_PASSWORD": "from-env-password"},
+        prompt_answers={},
+        until_valid_answers={},
+        stubs="""
+confirm_default_no() { return 1; }
+prompt_secret_with_default() { printf '%s' "$2"; }
+""",
+        print_env=("NEO4J_PASSWORD",),
+    )
+    assert values["NEO4J_PASSWORD"] == "from-env-password"
 
 
 def test_collect_neo4j_config_bundled_service_reprompts_for_empty_credentials() -> None:
     """Bundled Neo4j should reject empty username and password values."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-prompt_log_file="$(mktemp)"
-trap 'rm -f "$prompt_log_file"' EXIT
-
-confirm_default_yes() {{ return 0; }}
-prompt_until_valid() {{
+    values = run_collect_bash(
+        """
+collect_neo4j_config yes
+printf 'USERNAME_CALLS=%s\\n' "$(grep -c '^username$' "$PROMPT_LOG_FILE")"
+printf 'PASSWORD_CALLS=%s\\n' "$(grep -c '^password$' "$PROMPT_LOG_FILE")"
+""",
+        log_prompts=True,
+        stubs="""
+confirm_default_yes() { return 0; }
+prompt_until_valid() {
   local prompt="$1"
   local default="$2"
   local validator="$3"
@@ -1563,8 +1297,8 @@ prompt_until_valid() {{
     if [[ "$prompt" == "Neo4j URI" ]]; then
       value="$default"
     else
-      printf 'username\\n' >> "$prompt_log_file"
-      if [[ "$(grep -c '^username$' "$prompt_log_file")" -eq 1 ]]; then
+      printf 'username\\n' >> "$PROMPT_LOG_FILE"
+      if [[ "$(grep -c '^username$' "$PROMPT_LOG_FILE")" -eq 1 ]]; then
         value=""
       else
         value="neo4j-user"
@@ -1576,9 +1310,8 @@ prompt_until_valid() {{
       return 0
     fi
   done
-}}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{
+}
+prompt_secret_until_valid_with_default() {
   local prompt="$1"
   local default="$2"
   local validator="$3"
@@ -1586,8 +1319,8 @@ prompt_secret_until_valid_with_default() {{
   local value=""
 
   while true; do
-    printf 'password\\n' >> "$prompt_log_file"
-    if [[ "$(grep -c '^password$' "$prompt_log_file")" -eq 1 ]]; then
+    printf 'password\\n' >> "$PROMPT_LOG_FILE"
+    if [[ "$(grep -c '^password$' "$PROMPT_LOG_FILE")" -eq 1 ]]; then
       value=""
     else
       value="secure-password"
@@ -1598,36 +1331,30 @@ prompt_secret_until_valid_with_default() {{
       return 0
     fi
   done
-}}
-
-collect_neo4j_config yes
-
-printf 'USERNAME=%s\\n' "${{ENV_VALUES[NEO4J_USERNAME]}}"
-printf 'PASSWORD=%s\\n' "${{ENV_VALUES[NEO4J_PASSWORD]}}"
-printf 'USERNAME_CALLS=%s\\n' "$(grep -c '^username$' "$prompt_log_file")"
-printf 'PASSWORD_CALLS=%s\\n' "$(grep -c '^password$' "$prompt_log_file")\"
-""")
-    values = parse_lines(output)
-    assert values["USERNAME"] == "neo4j-user"
-    assert values["PASSWORD"] == "secure-password"
+}
+""",
+        print_env=("NEO4J_USERNAME", "NEO4J_PASSWORD"),
+    )
+    assert values["NEO4J_USERNAME"] == "neo4j-user"
+    assert values["NEO4J_PASSWORD"] == "secure-password"
     assert values["USERNAME_CALLS"] == "2"
     assert values["PASSWORD_CALLS"] == "2"
 
 
 def test_collect_neo4j_config_external_service_still_uses_standard_prompts() -> None:
     """External Neo4j setup should keep the non-Docker prompt behavior unchanged."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-prompt_log_file="$(mktemp)"
-trap 'rm -f "$prompt_log_file"' EXIT
-
-confirm_default_no() {{ return 1; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_with_default() {{
-  printf 'with_default\\n' >> "$prompt_log_file"
+    values = run_collect_bash(
+        """
+collect_neo4j_config no
+printf 'USERNAME_PROMPTS=%s\\n' "$(grep -c '^with_default$' "$PROMPT_LOG_FILE")"
+printf 'PASSWORD_PROMPTS=%s\\n' "$(grep -c '^secret_with_default$' "$PROMPT_LOG_FILE")"
+""",
+        log_prompts=True,
+        stubs="""
+confirm_default_no() { return 1; }
+prompt_until_valid() { printf '%s' "$2"; }
+prompt_with_default() {
+  printf 'with_default\\n' >> "$PROMPT_LOG_FILE"
   if [[ "$1" == "Neo4j username" ]]; then
     printf 'external-user'
   elif [[ "$1" == "Neo4j database" ]]; then
@@ -1635,244 +1362,175 @@ prompt_with_default() {{
   else
     printf '%s' "$2"
   fi
-}}
-prompt_secret_with_default() {{
-  printf 'secret_with_default\\n' >> "$prompt_log_file"
+}
+prompt_secret_with_default() {
+  printf 'secret_with_default\\n' >> "$PROMPT_LOG_FILE"
   printf 'external-password'
-}}
-
-collect_neo4j_config no
-
-printf 'USERNAME=%s\\n' "${{ENV_VALUES[NEO4J_USERNAME]}}"
-printf 'PASSWORD=%s\\n' "${{ENV_VALUES[NEO4J_PASSWORD]}}"
-printf 'DATABASE=%s\\n' "${{ENV_VALUES[NEO4J_DATABASE]}}"
-printf 'USERNAME_PROMPTS=%s\\n' "$(grep -c '^with_default$' "$prompt_log_file")"
-printf 'PASSWORD_PROMPTS=%s\\n' "$(grep -c '^secret_with_default$' "$prompt_log_file")\"
-""")
-    values = parse_lines(output)
-    assert values["USERNAME"] == "external-user"
-    assert values["PASSWORD"] == "external-password"
-    assert values["DATABASE"] == "external-db"
+}
+""",
+        print_env=("NEO4J_USERNAME", "NEO4J_PASSWORD", "NEO4J_DATABASE"),
+    )
+    assert values["NEO4J_USERNAME"] == "external-user"
+    assert values["NEO4J_PASSWORD"] == "external-password"
+    assert values["NEO4J_DATABASE"] == "external-db"
     assert values["USERNAME_PROMPTS"] == "2"
     assert values["PASSWORD_PROMPTS"] == "1"
 
 
-def test_collect_opensearch_config_preserves_explicit_graphlookup_override() -> None:
-    """collect_opensearch_config should keep an existing PPL graphlookup override."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-ENV_VALUES[OPENSEARCH_USE_PPL_GRAPHLOOKUP]="true"
-
-confirm_default_yes() {{ return 0; }}
-confirm_default_no() {{ return 1; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
-collect_opensearch_config "yes"
-printf 'GRAPHLOOKUP=%s\\n' "${{ENV_VALUES[OPENSEARCH_USE_PPL_GRAPHLOOKUP]}}\"
-""")
-    assert values["GRAPHLOOKUP"] == "true"
-
-
-def test_collect_opensearch_config_forces_docker_verify_certs_false() -> None:
-    """collect_opensearch_config should force OPENSEARCH_VERIFY_CERTS=false for Docker."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-ENV_VALUES[OPENSEARCH_USE_SSL]="false"
-ENV_VALUES[OPENSEARCH_VERIFY_CERTS]="true"
-
-confirm_default_yes() {{ return 0; }}
-confirm_default_no() {{ return 1; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
-collect_opensearch_config "yes"
-printf 'USE_SSL=%s\\n' "${{ENV_VALUES[OPENSEARCH_USE_SSL]}}"
-printf 'VERIFY_CERTS=%s\\n' "${{ENV_VALUES[OPENSEARCH_VERIFY_CERTS]}}\"
-""")
-    assert values["USE_SSL"] == "false"
-    assert values["VERIFY_CERTS"] == "false"
-
-
-def test_collect_opensearch_config_defaults_docker_tls_flags_when_unset() -> None:
-    """collect_opensearch_config should supply Docker TLS defaults when .env has no values."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-confirm_default_yes() {{ return 0; }}
-confirm_default_no() {{ return 1; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
-collect_opensearch_config "yes"
-printf 'USE_SSL=%s\\n' "${{ENV_VALUES[OPENSEARCH_USE_SSL]}}"
-printf 'VERIFY_CERTS=%s\\n' "${{ENV_VALUES[OPENSEARCH_VERIFY_CERTS]}}\"
-if [[ -v 'ENV_VALUES[OPENSEARCH_USE_PPL_GRAPHLOOKUP]' ]]; then
-  printf 'GRAPHLOOKUP_SET=yes\\n'
-else
-  printf 'GRAPHLOOKUP_SET=no\\n'
-fi
-""")
-    assert values["USE_SSL"] == "true"
-    assert values["VERIFY_CERTS"] == "false"
+@pytest.mark.parametrize(
+    ("env_values", "expected_env", "expected_graphlookup_set"),
+    [
+        (
+            {"OPENSEARCH_USE_PPL_GRAPHLOOKUP": "true"},
+            {"OPENSEARCH_USE_PPL_GRAPHLOOKUP": "true"},
+            "set",
+        ),
+        (
+            {"OPENSEARCH_USE_SSL": "false", "OPENSEARCH_VERIFY_CERTS": "true"},
+            {"OPENSEARCH_USE_SSL": "false", "OPENSEARCH_VERIFY_CERTS": "false"},
+            "",
+        ),
+        (
+            {},
+            {"OPENSEARCH_USE_SSL": "true", "OPENSEARCH_VERIFY_CERTS": "false"},
+            "",
+        ),
+    ],
+    ids=[
+        "preserves-explicit-graphlookup-override",
+        "forces-docker-verify-certs-false",
+        "defaults-docker-tls-flags-when-unset",
+    ],
+)
+def test_collect_opensearch_config_docker_flags(
+    env_values: dict[str, str],
+    expected_env: dict[str, str],
+    expected_graphlookup_set: str,
+) -> None:
+    """collect_opensearch_config should default/force Docker TLS flags and preserve PPL graphlookup overrides."""
+    values = run_collect_bash(
+        'collect_opensearch_config "yes"',
+        env_values=env_values,
+        prompt_answers={},
+        until_valid_answers={},
+        stubs="""
+confirm_default_yes() { return 0; }
+confirm_default_no() { return 1; }
+prompt_secret_until_valid_with_default() { printf '%s' "$2"; }
+""",
+        print_env=tuple(expected_env),
+        print_set=("OPENSEARCH_USE_PPL_GRAPHLOOKUP",),
+    )
+    for key, expected in expected_env.items():
+        assert values[key] == expected
     # PPL graphlookup stays unset (auto-detected) unless explicitly configured.
-    assert values["GRAPHLOOKUP_SET"] == "no"
+    assert values["OPENSEARCH_USE_PPL_GRAPHLOOKUP_SET"] == expected_graphlookup_set
 
 
 def test_collect_opensearch_config_uses_original_index_settings_as_defaults() -> None:
     """collect_opensearch_config should prefer ORIGINAL_ENV_VALUES for shard/replica defaults."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-default_log="$(mktemp)"
-
-ORIGINAL_ENV_VALUES[OPENSEARCH_NUMBER_OF_SHARDS]="3"
-ORIGINAL_ENV_VALUES[OPENSEARCH_NUMBER_OF_REPLICAS]="2"
-ENV_VALUES[OPENSEARCH_NUMBER_OF_SHARDS]="9"
-ENV_VALUES[OPENSEARCH_NUMBER_OF_REPLICAS]="8"
-
-confirm_default_yes() {{ return 1; }}
-confirm_default_no() {{ return 1; }}
-prompt_until_valid() {{
-  case "$1" in
-    "Number of index shards"|"Number of index replicas (use 2 for 3-AZ clusters)")
-      printf '%s=%s\\n' "$1" "$2" >> "$default_log"
-      ;;
-  esac
-  printf '%s' "$2"
-}}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
-collect_opensearch_config "no"
-printf 'SHARDS=%s\\n' "${{ENV_VALUES[OPENSEARCH_NUMBER_OF_SHARDS]}}"
-printf 'REPLICAS=%s\\n' "${{ENV_VALUES[OPENSEARCH_NUMBER_OF_REPLICAS]}}"
-printf 'DEFAULTS=%s\\n' "$(tr '\\n' ';' < "$default_log")\"
-""")
-    assert values["SHARDS"] == "3"
-    assert values["REPLICAS"] == "2"
-    assert "Number of index shards=3;" in values["DEFAULTS"]
-    assert "Number of index replicas (use 2 for 3-AZ clusters)=2;" in values["DEFAULTS"]
-
-
-def test_collect_opensearch_config_validates_index_settings_during_prompt() -> None:
-    """collect_opensearch_config should validate shard and replica prompts."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-validator_file="$(mktemp)"
-
-confirm_default_yes() {{ return 1; }}
-confirm_default_no() {{ return 1; }}
-prompt_until_valid() {{
-  case "$1" in
-    "Number of index shards"|"Number of index replicas (use 2 for 3-AZ clusters)")
-      printf '%s=%s\\n' "$1" "$3" >> "$validator_file"
-      ;;
-  esac
-  printf '%s' "$2"
-}}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
-collect_opensearch_config "no"
-printf 'VALIDATORS=%s\\n' "$(tr '\\n' ';' < "$validator_file")\"
-""")
-    assert "Number of index shards=validate_positive_integer;" in values["VALIDATORS"]
-    assert (
-        "Number of index replicas (use 2 for 3-AZ clusters)=validate_non_negative_integer;"
-        in values["VALIDATORS"]
+    values = run_collect_bash(
+        'collect_opensearch_config "no"',
+        original_env_values={
+            "OPENSEARCH_NUMBER_OF_SHARDS": "3",
+            "OPENSEARCH_NUMBER_OF_REPLICAS": "2",
+        },
+        env_values={
+            "OPENSEARCH_NUMBER_OF_SHARDS": "9",
+            "OPENSEARCH_NUMBER_OF_REPLICAS": "8",
+        },
+        log_prompts=True,
+        log_defaults=True,
+        stubs="""
+confirm_default_yes() { return 1; }
+confirm_default_no() { return 1; }
+prompt_secret_until_valid_with_default() { printf '%s' "$2"; }
+""",
+        print_env=("OPENSEARCH_NUMBER_OF_SHARDS", "OPENSEARCH_NUMBER_OF_REPLICAS"),
     )
+    logged = values["PROMPT_LOG"].split("|")
+    assert values["OPENSEARCH_NUMBER_OF_SHARDS"] == "3"
+    assert values["OPENSEARCH_NUMBER_OF_REPLICAS"] == "2"
+    assert "Number of index shards[3]" in logged
+    assert "Number of index replicas (use 2 for 3-AZ clusters)[2]" in logged
 
 
-def test_collect_opensearch_config_validates_hosts_during_prompt() -> None:
-    """collect_opensearch_config should validate OPENSEARCH_HOSTS at prompt time."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-validator_file="$(mktemp)"
-
-confirm_default_yes() {{ return 0; }}
+@pytest.mark.parametrize(
+    ("default_docker", "confirm_yes_rc", "expected_validators"),
+    [
+        (
+            "no",
+            1,
+            (
+                "Number of index shards=validate_positive_integer",
+                "Number of index replicas (use 2 for 3-AZ clusters)=validate_non_negative_integer",
+            ),
+        ),
+        (
+            "yes",
+            0,
+            ("validate_opensearch_hosts_format",),
+        ),
+        (
+            "yes",
+            0,
+            ("secret:validate_opensearch_password_strength",),
+        ),
+    ],
+    ids=["index-settings", "hosts", "password"],
+)
+def test_collect_opensearch_config_validates_inputs_during_prompt(
+    default_docker: str,
+    confirm_yes_rc: int,
+    expected_validators: tuple[str, ...],
+) -> None:
+    """collect_opensearch_config should attach prompt-time validators for index settings, hosts, and password."""
+    values = run_collect_bash(
+        f"""
+collect_opensearch_config "{default_docker}"
+printf 'VALIDATORS=%s\\n' "$(paste -sd '|' "$PROMPT_LOG_FILE")"
+""",
+        log_prompts=True,
+        stubs=f"""
+confirm_default_yes() {{ return {confirm_yes_rc}; }}
 confirm_default_no() {{ return 1; }}
 prompt_until_valid() {{
-  printf '%s' "$3" > "$validator_file"
+  printf '%s=%s\\n' "$1" "$3" >> "$PROMPT_LOG_FILE"
   printf '%s' "$2"
 }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
-collect_opensearch_config "yes"
-printf 'HOST_VALIDATOR=%s\\n' "$(cat "$validator_file")\"
-""")
-    assert values["HOST_VALIDATOR"] == "validate_opensearch_hosts_format"
-
-
-def test_collect_opensearch_config_validates_password_during_prompt() -> None:
-    """collect_opensearch_config should validate OPENSEARCH_PASSWORD at prompt time."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-validator_file="$(mktemp)"
-
-confirm_default_yes() {{ return 0; }}
-confirm_default_no() {{ return 1; }}
-prompt_until_valid() {{ printf '%s' "$2"; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
 prompt_secret_until_valid_with_default() {{
-  printf '%s' "$3" > "$validator_file"
+  printf 'secret:%s\\n' "$3" >> "$PROMPT_LOG_FILE"
   printf '%s' "$2"
 }}
-
-collect_opensearch_config "yes"
-printf 'PASSWORD_VALIDATOR=%s\\n' "$(cat "$validator_file")\"
-""")
-    assert values["PASSWORD_VALIDATOR"] == "validate_opensearch_password_strength"
+""",
+    )
+    for expected in expected_validators:
+        assert expected in values["VALIDATORS"]
 
 
 def test_collect_llm_config_offers_openai_responses() -> None:
     """The Responses binding is a selectable LLM provider with OpenAI defaults."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-prompt_choice() {{
+    output = run_setup_bash(
+        """
+OPTIONS_FILE="$(mktemp)"
+trap 'rm -f "$OPTIONS_FILE"' EXIT
+prompt_choice() {
   shift 2
   printf '%s\\n' "$@" > "$OPTIONS_FILE"
   printf 'openai_responses'
-}}
-OPTIONS_FILE="$(mktemp)"
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf 'sk-test-key'; }}
+}
+prompt_with_default() { printf '%s' "$2"; }
+prompt_secret_until_valid_with_default() { printf 'sk-test-key'; }
 
 collect_llm_config
 
 printf 'OFFERED=%s\\n' "$(grep -cx openai_responses "$OPTIONS_FILE")"
-printf 'LLM_BINDING=%s\\n' "${{ENV_VALUES[LLM_BINDING]}}"
-printf 'LLM_MODEL=%s\\n' "${{ENV_VALUES[LLM_MODEL]}}"
-printf 'LLM_BINDING_HOST=%s\\n' "${{ENV_VALUES[LLM_BINDING_HOST]}}"
-printf 'LLM_BINDING_API_KEY=%s\\n' "${{ENV_VALUES[LLM_BINDING_API_KEY]}}"
-rm -f "$OPTIONS_FILE"
-""")
+printf 'LLM_BINDING=%s\\n' "${ENV_VALUES[LLM_BINDING]}"
+printf 'LLM_MODEL=%s\\n' "${ENV_VALUES[LLM_MODEL]}"
+printf 'LLM_BINDING_HOST=%s\\n' "${ENV_VALUES[LLM_BINDING_HOST]}"
+printf 'LLM_BINDING_API_KEY=%s\\n' "${ENV_VALUES[LLM_BINDING_API_KEY]}"
+"""
+    )
     values = parse_lines(output)
     assert values["OFFERED"] == "1"
     assert values["LLM_BINDING"] == "openai_responses"
@@ -1892,23 +1550,18 @@ def test_collect_llm_config_keeps_existing_openai_responses_settings(
     pick another binding. The stub models exactly that: accept the default
     only when it is offered, fail otherwise.
     """
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    values = run_collect_bash(
+        "collect_llm_config",
+        tmp_path=tmp_path,
+        env_lines=[
             "LLM_BINDING=openai_responses",
             "LLM_MODEL=gpt-5.6",
             "LLM_BINDING_HOST=https://gateway.example/v1",
             "LLM_BINDING_API_KEY=existing-key",
         ],
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-prompt_choice() {{
+        prompt_answers={},
+        stubs="""
+prompt_choice() {
   local default="$2"
   shift 2
   local option
@@ -1920,18 +1573,16 @@ prompt_choice() {{
   done
   echo "DEFAULT_NOT_OFFERED: $default" >&2
   return 1
-}}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
-collect_llm_config
-
-printf 'LLM_BINDING=%s\\n' "${{ENV_VALUES[LLM_BINDING]}}"
-printf 'LLM_MODEL=%s\\n' "${{ENV_VALUES[LLM_MODEL]}}"
-printf 'LLM_BINDING_HOST=%s\\n' "${{ENV_VALUES[LLM_BINDING_HOST]}}"
-printf 'LLM_BINDING_API_KEY=%s\\n' "${{ENV_VALUES[LLM_BINDING_API_KEY]}}"
-""")
-    values = parse_lines(output)
+}
+prompt_secret_until_valid_with_default() { printf '%s' "$2"; }
+""",
+        print_env=(
+            "LLM_BINDING",
+            "LLM_MODEL",
+            "LLM_BINDING_HOST",
+            "LLM_BINDING_API_KEY",
+        ),
+    )
     assert values["LLM_BINDING"] == "openai_responses"
     assert values["LLM_MODEL"] == "gpt-5.6"
     assert values["LLM_BINDING_HOST"] == "https://gateway.example/v1"
@@ -1943,32 +1594,25 @@ def test_collect_embedding_config_reuses_openai_responses_llm_credentials(
 ) -> None:
     """openai_responses has no embedding side; an openai embedding next to it
     is the same provider and reuses the LLM endpoint and key."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    values = run_collect_bash(
+        "collect_embedding_config",
+        tmp_path=tmp_path,
+        env_lines=[
             "LLM_BINDING=openai_responses",
             "LLM_BINDING_HOST=https://gateway.example/v1",
             "LLM_BINDING_API_KEY=shared-key",
         ],
+        prompt_answers={},
+        stubs="""
+prompt_choice() { printf 'openai'; }
+prompt_secret_until_valid_with_default() { printf '%s' "$2"; }
+""",
+        print_env=(
+            "EMBEDDING_BINDING",
+            "EMBEDDING_BINDING_HOST",
+            "EMBEDDING_BINDING_API_KEY",
+        ),
     )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-prompt_choice() {{ printf 'openai'; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf '%s' "$2"; }}
-
-collect_embedding_config
-
-printf 'EMBEDDING_BINDING=%s\\n' "${{ENV_VALUES[EMBEDDING_BINDING]}}"
-printf 'EMBEDDING_BINDING_HOST=%s\\n' "${{ENV_VALUES[EMBEDDING_BINDING_HOST]}}"
-printf 'EMBEDDING_BINDING_API_KEY=%s\\n' "${{ENV_VALUES[EMBEDDING_BINDING_API_KEY]:-}}"
-""")
-    values = parse_lines(output)
     assert values["EMBEDDING_BINDING"] == "openai"
     assert values["EMBEDDING_BINDING_HOST"] == "https://gateway.example/v1"
     assert values["EMBEDDING_BINDING_API_KEY"] == "shared-key"

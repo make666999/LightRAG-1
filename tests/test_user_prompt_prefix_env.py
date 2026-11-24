@@ -269,7 +269,7 @@ def test_lightrag_field_factory_reads_the_env(monkeypatch):
     """The field uses default_factory, so the env is read per instantiation.
 
     That is what lets this test avoid the subprocess dance
-    ``tests/test_queryparam_empty_int_env.py`` needs for QueryParam's
+    ``tests/test_env_field_defaults.py`` needs for QueryParam's
     import-time defaults.
     """
     from lightrag import LightRAG

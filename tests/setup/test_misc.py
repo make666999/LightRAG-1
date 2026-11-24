@@ -3,44 +3,59 @@
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 import pytest
 
 from tests.setup._helpers import (
+    FILE_STORAGE_ENV,
+    MONGO_STORAGE_ENV,
+    OPENSEARCH_STORAGE_ENV,
     REPO_ROOT,
     assert_single_compose_backup,
     parse_lines,
     run_bash,
     run_bash_process,
-    run_bash_lines,
+    run_security_check,
+    run_setup_bash,
+    run_setup_bash_process,
+    write_setup_workspace,
     write_text_lines,
 )
 
 pytestmark = pytest.mark.offline
 
+_LEGACY_MONGO_COMPOSE = (
+    "services:",
+    "  lightrag:",
+    "    image: example/lightrag:test",
+    "  mongodb:",
+    "    image: mongo:8.2.4",
+    "    volumes:",
+    "      - mongo_data:/data/db",
+    "volumes:",
+    "  mongo_data:",
+)
+
 
 def test_prepare_compose_runtime_overrides_keeps_env_unchanged() -> None:
     """Loopback endpoints should be rewritten only for compose overrides."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
+    output = run_setup_bash(
+        """
 ENV_VALUES[LLM_BINDING_HOST]="http://localhost:11434"
 ENV_VALUES[EMBEDDING_BINDING_HOST]="http://127.0.0.1:11434"
 ENV_VALUES[RERANK_BINDING_HOST]="http://localhost:8000/rerank"
 
 prepare_compose_runtime_overrides
 
-printf 'ENV_LLM=%s\\n' "${{ENV_VALUES[LLM_BINDING_HOST]}}"
-printf 'ENV_EMBEDDING=%s\\n' "${{ENV_VALUES[EMBEDDING_BINDING_HOST]}}"
-printf 'ENV_RERANK=%s\\n' "${{ENV_VALUES[RERANK_BINDING_HOST]}}"
-printf 'COMPOSE_LLM=%s\\n' "${{COMPOSE_ENV_OVERRIDES[LLM_BINDING_HOST]}}"
-printf 'COMPOSE_EMBEDDING=%s\\n' "${{COMPOSE_ENV_OVERRIDES[EMBEDDING_BINDING_HOST]}}"
-printf 'COMPOSE_RERANK=%s\\n' "${{COMPOSE_ENV_OVERRIDES[RERANK_BINDING_HOST]}}\"
-""")
+printf 'ENV_LLM=%s\\n' "${ENV_VALUES[LLM_BINDING_HOST]}"
+printf 'ENV_EMBEDDING=%s\\n' "${ENV_VALUES[EMBEDDING_BINDING_HOST]}"
+printf 'ENV_RERANK=%s\\n' "${ENV_VALUES[RERANK_BINDING_HOST]}"
+printf 'COMPOSE_LLM=%s\\n' "${COMPOSE_ENV_OVERRIDES[LLM_BINDING_HOST]}"
+printf 'COMPOSE_EMBEDDING=%s\\n' "${COMPOSE_ENV_OVERRIDES[EMBEDDING_BINDING_HOST]}"
+printf 'COMPOSE_RERANK=%s\\n' "${COMPOSE_ENV_OVERRIDES[RERANK_BINDING_HOST]}"
+"""
+    )
     values = parse_lines(output)
     assert values["ENV_LLM"] == "http://localhost:11434"
     assert values["ENV_EMBEDDING"] == "http://127.0.0.1:11434"
@@ -52,40 +67,31 @@ printf 'COMPOSE_RERANK=%s\\n' "${{COMPOSE_ENV_OVERRIDES[RERANK_BINDING_HOST]}}\"
 
 def test_existing_ssl_env_keeps_compose_mount_overrides(tmp_path: Path) -> None:
     """Compose regeneration should preserve working SSL mounts without implying `.env` is permanently dual-purpose."""
-    compose_file = tmp_path / "docker-compose.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "    env_file:",
-                "      - .env",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
     cert_path = tmp_path / "cert.pem"
     cert_path.write_text("cert", encoding="utf-8")
     key_path = tmp_path / "key.pem"
     key_path.write_text("key", encoding="utf-8")
-    env_file = tmp_path / ".env"
-    env_file.write_text(
-        "\n".join(["SSL=true", f"SSL_CERTFILE={cert_path}", f"SSL_KEYFILE={key_path}"])
-        + "\n",
-        encoding="utf-8",
+    write_setup_workspace(
+        tmp_path,
+        env_lines=["SSL=true", f"SSL_CERTFILE={cert_path}", f"SSL_KEYFILE={key_path}"],
+        compose_lines=[
+            "services:",
+            "  lightrag:",
+            "    image: example/lightrag:test",
+            "    env_file:",
+            "      - .env",
+        ],
+        compose_name="docker-compose.yml",
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
+    run_setup_bash(
+        """
 prepare_compose_env_overrides
 stage_ssl_assets "$SSL_CERT_SOURCE_PATH" "$SSL_KEY_SOURCE_PATH"
-generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml\"
-""")
+generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml"
+""",
+        tmp_path=tmp_path,
+        load_env=True,
+    )
     generated_compose = (tmp_path / "docker-compose.generated.yml").read_text(
         encoding="utf-8"
     )
@@ -103,25 +109,16 @@ def test_finalize_base_setup_rewrites_ssl_env_to_preserved_compose_paths(
     staged_dir.mkdir(parents=True)
     (staged_dir / "server.pem").write_text("cert", encoding="utf-8")
     (staged_dir / "server.key").write_text("key", encoding="utf-8")
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    write_setup_workspace(
+        tmp_path,
+        env_lines=[
             "SSL=true",
             "SSL_CERTFILE=/missing/original-cert.pem",
             "SSL_KEYFILE=/missing/original-key.pem",
-            "LIGHTRAG_KV_STORAGE=JsonKVStorage",
-            "LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage",
-            "LIGHTRAG_GRAPH_STORAGE=NetworkXStorage",
-            "LIGHTRAG_DOC_STATUS_STORAGE=JsonDocStatusStorage",
+            *FILE_STORAGE_ENV,
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
+        copy_env_example=True,
+        compose_lines=[
             "services:",
             "  lightrag:",
             "    image: example/lightrag:test",
@@ -134,22 +131,18 @@ def test_finalize_base_setup_rewrites_ssl_env_to_preserved_compose_paths(
             "      SSL_KEYFILE: /app/data/certs/server.key",
         ],
     )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
+    output = run_setup_bash(
+        """
 initialize_default_storage_backends
 
-show_summary() {{ :; }}
-confirm_default_yes() {{
+show_summary() { :; }
+confirm_default_yes() {
   case "$1" in
     "All wizard-managed services have been removed. Remove LightRAG from Docker and switch to host mode?") return 1 ;;
     *) return 0 ;;
   esac
-}}
-confirm_required_yes_no() {{ return 0; }}
+}
+confirm_required_yes_no() { return 0; }
 
 finalize_base_setup
 
@@ -158,7 +151,10 @@ if validate_env_file; then
 else
   printf 'VALID=no\\n'
 fi
-""")
+""",
+        tmp_path=tmp_path,
+        load_env=True,
+    )
     values = parse_lines(output)
     generated_env = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "SSL_CERTFILE=/app/data/certs/server.pem" in generated_env
@@ -168,38 +164,29 @@ fi
 
 def test_removing_ssl_strips_wizard_bind_mounts_from_compose(tmp_path: Path) -> None:
     """Re-running setup without SSL must remove only wizard-managed SSL mounts."""
-    compose_file = tmp_path / "docker-compose.final.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "    volumes:",
-                '      - "./data/certs/cert.pem:/app/data/certs/cert.pem:ro"',
-                '      - "./data/certs/key.pem:/app/data/certs/key.pem:ro"',
-                '      - "./data/rag_storage:/app/data/rag_storage"',
-                '      - "./data/inputs:/app/data/inputs"',
-                '      - "./custom-data:/app/data/custom"',
-                "    environment:",
-                '      SSL_CERTFILE: "/app/data/certs/cert.pem"',
-                '      SSL_KEYFILE: "/app/data/certs/key.pem"',
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_setup_workspace(
+        tmp_path,
+        copy_env_example=True,
+        compose_lines=[
+            "services:",
+            "  lightrag:",
+            "    image: example/lightrag:test",
+            "    volumes:",
+            '      - "./data/certs/cert.pem:/app/data/certs/cert.pem:ro"',
+            '      - "./data/certs/key.pem:/app/data/certs/key.pem:ro"',
+            '      - "./data/rag_storage:/app/data/rag_storage"',
+            '      - "./data/inputs:/app/data/inputs"',
+            '      - "./custom-data:/app/data/custom"',
+            "    environment:",
+            '      SSL_CERTFILE: "/app/data/certs/cert.pem"',
+            '      SSL_KEYFILE: "/app/data/certs/key.pem"',
+        ],
     )
-    (tmp_path / "env.example").write_text(
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8"), encoding="utf-8"
+    run_setup_bash(
+        f'generate_docker_compose "{tmp_path}/docker-compose.final.yml"',
+        tmp_path=tmp_path,
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-generate_docker_compose "{tmp_path}/docker-compose.final.yml\"
-""")
-    result = compose_file.read_text(encoding="utf-8")
+    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "/app/data/certs/cert.pem" not in result
     assert "/app/data/certs/key.pem" not in result
     assert "./data/rag_storage:/app/data/rag_storage" in result
@@ -207,54 +194,43 @@ generate_docker_compose "{tmp_path}/docker-compose.final.yml\"
     assert "./custom-data:/app/data/custom" in result
 
 
-def test_find_generated_compose_file_prefers_final_compose_file(tmp_path: Path) -> None:
-    """Compose discovery should prefer docker-compose.final.yml over legacy files."""
-    write_text_lines(tmp_path / ".env", ["HOST=0.0.0.0"])
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        ["services:", "  lightrag:", "    image: final/lightrag"],
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.development.yml",
-        ["services:", "  lightrag:", "    image: dev/lightrag"],
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.production.yml",
-        ["services:", "  lightrag:", "    image: prod/lightrag"],
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-
-printf 'COMPOSE=%s\\n' "$(find_generated_compose_file)\"
-""")
-    values = parse_lines(output)
-    assert values["COMPOSE"] == str(tmp_path / "docker-compose.final.yml")
-
-
-def test_find_generated_compose_file_falls_back_to_order_without_profile(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("compose_files", "expected_name"),
+    [
+        (
+            {
+                "docker-compose.final.yml": "final/lightrag",
+                "docker-compose.development.yml": "dev/lightrag",
+                "docker-compose.production.yml": "prod/lightrag",
+            },
+            "docker-compose.final.yml",
+        ),
+        (
+            {
+                "docker-compose.development.yml": "dev/lightrag",
+                "docker-compose.production.yml": "prod/lightrag",
+            },
+            "docker-compose.development.yml",
+        ),
+    ],
+    ids=["prefers-final", "falls-back-to-development"],
+)
+def test_find_generated_compose_file_priority(
+    tmp_path: Path, compose_files: dict[str, str], expected_name: str
 ) -> None:
-    """Without legacy profile metadata, compose migration should use the default order."""
+    """Compose discovery should prefer docker-compose.final.yml and otherwise fall back in default order."""
     write_text_lines(tmp_path / ".env", ["HOST=0.0.0.0"])
-    write_text_lines(
-        tmp_path / "docker-compose.development.yml",
-        ["services:", "  lightrag:", "    image: dev/lightrag"],
+    for filename, image in compose_files.items():
+        write_text_lines(
+            tmp_path / filename,
+            ["services:", "  lightrag:", f"    image: {image}"],
+        )
+    output = run_setup_bash(
+        "printf 'COMPOSE=%s\\n' \"$(find_generated_compose_file)\"",
+        tmp_path=tmp_path,
+        reset=False,
     )
-    write_text_lines(
-        tmp_path / "docker-compose.production.yml",
-        ["services:", "  lightrag:", "    image: prod/lightrag"],
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-
-printf 'COMPOSE=%s\\n' "$(find_generated_compose_file)\"
-""")
-    values = parse_lines(output)
-    assert values["COMPOSE"] == str(tmp_path / "docker-compose.development.yml")
+    assert parse_lines(output)["COMPOSE"] == str(tmp_path / expected_name)
 
 
 def test_switching_both_providers_off_bedrock_preserves_saved_aws_credentials(
@@ -302,26 +278,24 @@ def test_switching_both_providers_off_bedrock_preserves_saved_aws_credentials(
             "EMBEDDING_BINDING_API_KEY=your_api_key",
         ],
     )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-prompt_choice() {{ printf 'openai'; }}
-prompt_with_default() {{ printf '%s' "$2"; }}
-prompt_secret_until_valid_with_default() {{ printf 'fresh-key'; }}
+    output = run_setup_bash(
+        """
+prompt_choice() { printf 'openai'; }
+prompt_with_default() { printf '%s' "$2"; }
+prompt_secret_until_valid_with_default() { printf 'fresh-key'; }
 
 collect_llm_config
 collect_embedding_config
 generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env.generated"
 
-printf 'AWS_ACCESS_KEY_ID=%s\\n' "${{ENV_VALUES[AWS_ACCESS_KEY_ID]-}}"
-printf 'AWS_SECRET_ACCESS_KEY=%s\\n' "${{ENV_VALUES[AWS_SECRET_ACCESS_KEY]-}}"
-printf 'AWS_SESSION_TOKEN=%s\\n' "${{ENV_VALUES[AWS_SESSION_TOKEN]-}}"
-printf 'AWS_REGION=%s\\n' "${{ENV_VALUES[AWS_REGION]-}}"
-""")
+printf 'AWS_ACCESS_KEY_ID=%s\\n' "${ENV_VALUES[AWS_ACCESS_KEY_ID]-}"
+printf 'AWS_SECRET_ACCESS_KEY=%s\\n' "${ENV_VALUES[AWS_SECRET_ACCESS_KEY]-}"
+printf 'AWS_SESSION_TOKEN=%s\\n' "${ENV_VALUES[AWS_SESSION_TOKEN]-}"
+printf 'AWS_REGION=%s\\n' "${ENV_VALUES[AWS_REGION]-}"
+""",
+        tmp_path=tmp_path,
+        load_env=True,
+    )
     values = parse_lines(output)
     generated_lines = (
         (tmp_path / ".env.generated").read_text(encoding="utf-8").splitlines()
@@ -348,16 +322,16 @@ def test_load_existing_env_forces_cohere_binding_for_vllm_rerank(
             "RERANK_BINDING_HOST=http://localhost:8000/rerank",
         ],
     )
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-printf 'RERANK_BINDING=%s\\n' "${{ENV_VALUES[RERANK_BINDING]}}"
-printf 'LIGHTRAG_SETUP_RERANK_PROVIDER=%s\\n' "${{ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]}}\"
-""")
+    values = parse_lines(
+        run_setup_bash(
+            """
+printf 'RERANK_BINDING=%s\\n' "${ENV_VALUES[RERANK_BINDING]}"
+printf 'LIGHTRAG_SETUP_RERANK_PROVIDER=%s\\n' "${ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]}"
+""",
+            tmp_path=tmp_path,
+            load_env=True,
+        )
+    )
     assert values["RERANK_BINDING"] == "cohere"
     assert values["LIGHTRAG_SETUP_RERANK_PROVIDER"] == "vllm"
 
@@ -379,28 +353,26 @@ def test_load_existing_env_backfills_sentinel_hosts_for_bedrock_and_gemini(
     expected_embed_host: str,
 ) -> None:
     """Flows that skip collect_*_config (--server, --storage) must not let env.example's openai URL leak through for sentinel-based providers."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    write_setup_workspace(
+        tmp_path,
+        env_lines=[
             f"LLM_BINDING={llm_binding}",
             f"EMBEDDING_BINDING={embedding_binding}",
         ],
+        copy_env_example=True,
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
+    values = parse_lines(
+        run_setup_bash(
+            """
 generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env.generated"
 
-printf 'LOADED_LLM_HOST=%s\\n' "${{ENV_VALUES[LLM_BINDING_HOST]:-}}"
-printf 'LOADED_EMBED_HOST=%s\\n' "${{ENV_VALUES[EMBEDDING_BINDING_HOST]:-}}\"
-""")
+printf 'LOADED_LLM_HOST=%s\\n' "${ENV_VALUES[LLM_BINDING_HOST]:-}"
+printf 'LOADED_EMBED_HOST=%s\\n' "${ENV_VALUES[EMBEDDING_BINDING_HOST]:-}"
+""",
+            tmp_path=tmp_path,
+            load_env=True,
+        )
+    )
     assert values["LOADED_LLM_HOST"] == expected_llm_host
     generated_lines = (
         (tmp_path / ".env.generated").read_text(encoding="utf-8").splitlines()
@@ -423,27 +395,18 @@ def test_finalize_base_setup_uses_compose_native_storage_endpoints_on_rerun(
     tmp_path: Path,
 ) -> None:
     """Preserved managed storage services should inject compose-native endpoints on base reruns."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    write_setup_workspace(
+        tmp_path,
+        env_lines=[
             "LIGHTRAG_RUNTIME_TARGET=compose",
             "LIGHTRAG_SETUP_NEO4J_DEPLOYMENT=docker",
             "LIGHTRAG_SETUP_MILVUS_DEPLOYMENT=docker",
             "NEO4J_URI=neo4j://localhost:7687",
             "MILVUS_URI=http://localhost:19530",
-            "LIGHTRAG_KV_STORAGE=JsonKVStorage",
-            "LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage",
-            "LIGHTRAG_GRAPH_STORAGE=NetworkXStorage",
-            "LIGHTRAG_DOC_STATUS_STORAGE=JsonDocStatusStorage",
+            *FILE_STORAGE_ENV,
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
+        copy_env_example=True,
+        compose_lines=[
             "services:",
             "  lightrag:",
             "    image: example/lightrag:test",
@@ -462,87 +425,74 @@ def test_finalize_base_setup_uses_compose_native_storage_endpoints_on_rerun(
             "  milvus-minio_data:",
         ],
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-show_summary() {{ :; }}
-confirm_required_yes_no() {{ return 0; }}
-confirm_default_yes() {{ return 0; }}
-validate_sensitive_env_literals() {{ return 0; }}
+    run_setup_bash(
+        """
+show_summary() { :; }
+confirm_required_yes_no() { return 0; }
+confirm_default_yes() { return 0; }
+validate_sensitive_env_literals() { return 0; }
 finalize_base_setup
-""")
+""",
+        tmp_path=tmp_path,
+        load_env=True,
+    )
     result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert 'NEO4J_URI: "neo4j://neo4j:7687"' in result
     assert 'MILVUS_URI: "http://milvus:19530"' in result
     assert 'NEO4J_URI: "neo4j://host.docker.internal:7687"' not in result
     assert 'MILVUS_URI: "http://host.docker.internal:19530"' not in result
-    assert (
-        """      milvus:
-        condition: service_healthy"""
-        in result
-    )
-    assert (
-        """      milvus-etcd:
-        condition: service_healthy"""
-        not in result
-    )
-    assert (
-        """      milvus-minio:
-        condition: service_healthy"""
-        not in result
-    )
+    assert "      milvus:\n        condition: service_healthy" in result
+    assert "      milvus-etcd:\n        condition: service_healthy" not in result
+    assert "      milvus-minio:\n        condition: service_healthy" not in result
 
 
-def test_finalize_base_setup_migrates_mongodb_to_atlas_local_for_mongo_vector_storage(
+@pytest.mark.parametrize(
+    ("finalize_call", "extra_env", "extra_stubs"),
+    [
+        (
+            "finalize_base_setup",
+            [],
+            "confirm_default_yes() { return 0; }",
+        ),
+        (
+            "finalize_server_setup",
+            ["HOST=0.0.0.0", "PORT=9621"],
+            "validate_security_config() { return 0; }",
+        ),
+    ],
+    ids=["base", "server"],
+)
+def test_finalize_flows_migrate_mongodb_to_atlas_local_for_mongo_vector_storage(
     tmp_path: Path,
+    finalize_call: str,
+    extra_env: list[str],
+    extra_stubs: str,
 ) -> None:
-    """Base reruns should upgrade docker-managed MongoDB to Atlas Local when Mongo vector storage needs it."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    """Base and server reruns should upgrade docker-managed MongoDB to Atlas Local for MongoVectorDBStorage."""
+    write_setup_workspace(
+        tmp_path,
+        env_lines=[
             "LIGHTRAG_RUNTIME_TARGET=compose",
             "LIGHTRAG_SETUP_MONGODB_DEPLOYMENT=docker",
-            "LIGHTRAG_KV_STORAGE=MongoKVStorage",
-            "LIGHTRAG_VECTOR_STORAGE=MongoVectorDBStorage",
-            "LIGHTRAG_GRAPH_STORAGE=MongoGraphStorage",
-            "LIGHTRAG_DOC_STATUS_STORAGE=MongoDocStatusStorage",
+            *MONGO_STORAGE_ENV,
             "MONGO_URI=mongodb://localhost:27017/?directConnection=true",
             "MONGO_DATABASE=LightRAG",
+            *extra_env,
         ],
+        copy_env_example=True,
+        compose_lines=_LEGACY_MONGO_COMPOSE,
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  mongodb:",
-            "    image: mongo:8.2.4",
-            "    volumes:",
-            "      - mongo_data:/data/db",
-            "volumes:",
-            "  mongo_data:",
-        ],
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
+    run_setup_bash(
+        f"""
 show_summary() {{ :; }}
 confirm_required_yes_no() {{ return 0; }}
-confirm_default_yes() {{ return 0; }}
 validate_sensitive_env_literals() {{ return 0; }}
-finalize_base_setup
-""")
+{extra_stubs}
+{finalize_call}
+""",
+        tmp_path=tmp_path,
+        load_env=True,
+    )
     result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "image: mongodb/mongodb-atlas-local:" in result
     assert "mongo_config_data:/data/configdb" in result
@@ -550,54 +500,52 @@ finalize_base_setup
     assert "image: mongo:8.2.4" not in result
 
 
-def test_finalize_base_setup_rejects_invalid_preserved_mongo_vector_config(
+@pytest.mark.parametrize(
+    ("finalize_call", "extra_env", "extra_stubs"),
+    [
+        (
+            "finalize_base_setup",
+            [],
+            "confirm_default_yes() { return 0; }",
+        ),
+        (
+            "finalize_server_setup",
+            ["HOST=0.0.0.0", "PORT=9621"],
+            "validate_security_config() { return 0; }",
+        ),
+    ],
+    ids=["base", "server"],
+)
+def test_finalize_flows_reject_invalid_preserved_mongo_vector_config(
     tmp_path: Path,
+    finalize_call: str,
+    extra_env: list[str],
+    extra_stubs: str,
 ) -> None:
-    """Base reruns should fail before writing when preserved Mongo vector config is invalid."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    """Base and server reruns should fail before writing when preserved Mongo vector config is invalid."""
+    write_setup_workspace(
+        tmp_path,
+        env_lines=[
             "LIGHTRAG_RUNTIME_TARGET=compose",
             "LIGHTRAG_SETUP_MONGODB_DEPLOYMENT=docker",
-            "LIGHTRAG_KV_STORAGE=MongoKVStorage",
-            "LIGHTRAG_VECTOR_STORAGE=MongoVectorDBStorage",
-            "LIGHTRAG_GRAPH_STORAGE=MongoGraphStorage",
-            "LIGHTRAG_DOC_STATUS_STORAGE=MongoDocStatusStorage",
+            *MONGO_STORAGE_ENV,
             "MONGO_URI=mongodb://mongo.example.com:27017/?directConnection=true",
             "MONGO_DATABASE=LightRAG",
+            *extra_env,
         ],
+        copy_env_example=True,
+        compose_lines=_LEGACY_MONGO_COMPOSE,
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  mongodb:",
-            "    image: mongo:8.2.4",
-            "    volumes:",
-            "      - mongo_data:/data/db",
-            "volumes:",
-            "  mongo_data:",
-        ],
-    )
-    result = run_bash_process(
+    result = run_setup_bash_process(
         f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
 show_summary() {{ :; }}
 confirm_required_yes_no() {{ return 0; }}
-confirm_default_yes() {{ return 0; }}
 validate_sensitive_env_literals() {{ return 0; }}
-finalize_base_setup
+{extra_stubs}
+{finalize_call}
 """,
+        tmp_path=tmp_path,
+        load_env=True,
         cwd=tmp_path,
     )
     assert result.returncode != 0
@@ -610,118 +558,200 @@ finalize_base_setup
     )
 
 
-def test_finalize_base_setup_drops_stale_storage_services_missing_from_env_markers(
+@pytest.mark.parametrize(
+    (
+        "finalize_call",
+        "env_lines",
+        "compose_lines",
+        "extra_stubs",
+        "dropped_tokens",
+    ),
+    [
+        (
+            "finalize_base_setup",
+            [
+                "LIGHTRAG_RUNTIME_TARGET=compose",
+                "LLM_BINDING=openai",
+                "LLM_MODEL=gpt-4o-mini",
+                "LLM_BINDING_HOST=https://api.openai.com/v1",
+                "LLM_BINDING_API_KEY=sk-existing",
+                "EMBEDDING_BINDING=openai",
+                "EMBEDDING_MODEL=text-embedding-3-small",
+                "EMBEDDING_DIM=1536",
+                "EMBEDDING_BINDING_HOST=https://api.openai.com/v1",
+                "EMBEDDING_BINDING_API_KEY=sk-existing",
+                *FILE_STORAGE_ENV,
+            ],
+            [
+                "services:",
+                "  lightrag:",
+                "    image: example/lightrag:test",
+                "  redis:",
+                "    image: redis:latest",
+                "  qdrant:",
+                "    image: qdrant/qdrant:latest",
+                "volumes:",
+                "  redis_data:",
+                "  qdrant_data:",
+            ],
+            """
+confirm_default_yes() { return 1; }
+confirm_default_no() { return 1; }
+""",
+            ("  redis:", "  qdrant:", "redis_data:", "qdrant_data:"),
+        ),
+        (
+            "finalize_server_setup",
+            ["HOST=0.0.0.0", "PORT=9621"],
+            [
+                "services:",
+                "  lightrag:",
+                "    image: example/lightrag:test",
+                "  redis:",
+                "    image: redis:latest",
+                "  vllm-embed:",
+                "    image: vllm/vllm-openai:latest",
+                "volumes:",
+                "  redis_data:",
+                "  vllm_embed_cache:",
+            ],
+            """
+collect_server_config() { :; }
+collect_security_config() { :; }
+collect_ssl_config() { :; }
+confirm_default_yes() {
+  case "$1" in
+    "All wizard-managed services have been removed. Remove LightRAG from Docker and switch to host mode?") return 1 ;;
+    *) return 0 ;;
+  esac
+}
+validate_security_config() { return 0; }
+""",
+            ("  redis:", "  vllm-embed:", "redis_data:", "vllm_embed_cache:"),
+        ),
+    ],
+    ids=["base", "server"],
+)
+def test_finalize_flows_drop_stale_services_missing_from_env_markers(
     tmp_path: Path,
+    finalize_call: str,
+    env_lines: list[str],
+    compose_lines: list[str],
+    extra_stubs: str,
+    dropped_tokens: tuple[str, ...],
 ) -> None:
-    """env-base should treat storage Docker state in `.env` as authoritative."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "LIGHTRAG_RUNTIME_TARGET=compose",
-            "LLM_BINDING=openai",
-            "LLM_MODEL=gpt-4o-mini",
-            "LLM_BINDING_HOST=https://api.openai.com/v1",
-            "LLM_BINDING_API_KEY=sk-existing",
-            "EMBEDDING_BINDING=openai",
-            "EMBEDDING_MODEL=text-embedding-3-small",
-            "EMBEDDING_DIM=1536",
-            "EMBEDDING_BINDING_HOST=https://api.openai.com/v1",
-            "EMBEDDING_BINDING_API_KEY=sk-existing",
-            "LIGHTRAG_KV_STORAGE=JsonKVStorage",
-            "LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage",
-            "LIGHTRAG_GRAPH_STORAGE=NetworkXStorage",
-            "LIGHTRAG_DOC_STATUS_STORAGE=JsonDocStatusStorage",
-        ],
+    """env-base and env-server should treat managed Docker markers in `.env` as authoritative."""
+    write_setup_workspace(
+        tmp_path,
+        env_lines=env_lines,
+        copy_env_example=True,
+        compose_lines=compose_lines,
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  redis:",
-            "    image: redis:latest",
-            "  qdrant:",
-            "    image: qdrant/qdrant:latest",
-            "volumes:",
-            "  redis_data:",
-            "  qdrant_data:",
-        ],
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
+    run_setup_bash(
+        f"""
 show_summary() {{ :; }}
 confirm_required_yes_no() {{ return 0; }}
-confirm_default_yes() {{ return 1; }}
-confirm_default_no() {{ return 1; }}
 validate_sensitive_env_literals() {{ return 0; }}
-finalize_base_setup
-""")
+{extra_stubs}
+{finalize_call}
+""",
+        tmp_path=tmp_path,
+        load_env=True,
+    )
     result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     generated_env = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "  lightrag:" in result
-    assert "  redis:" not in result
-    assert "  qdrant:" not in result
-    assert "redis_data:" not in result
-    assert "qdrant_data:" not in result
+    for token in dropped_tokens:
+        assert token not in result
     assert "LIGHTRAG_RUNTIME_TARGET=compose" in generated_env
 
 
 @pytest.mark.parametrize(
-    ("changed_key", "changed_value", "expected_rewrite"),
+    ("service", "baseline_env", "changed_key", "changed_value", "expected_rewrite"),
     [
-        ("NEO4J_PASSWORD", "updated-password", "no"),
-        ("NEO4J_DATABASE", "updated-database", "yes"),
-    ],
-    ids=["neo4j-password-does-not-rewrite", "neo4j-database-rewrites"],
-)
-def test_configure_storage_compose_rewrites_only_rewrites_neo4j_on_database_change(
-    changed_key: str, changed_value: str, expected_rewrite: str
-) -> None:
-    """Neo4j service rewrites should be driven by database changes, not credentials."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-EXISTING_MANAGED_ROOT_SERVICE_SET[neo4j]=1
-DOCKER_SERVICE_SET[neo4j]=1
-ORIGINAL_ENV_VALUES[NEO4J_PASSWORD]="original-password"
-ORIGINAL_ENV_VALUES[NEO4J_DATABASE]="neo4j"
-ENV_VALUES[NEO4J_PASSWORD]="original-password"
-ENV_VALUES[NEO4J_DATABASE]="neo4j"
-ENV_VALUES[{changed_key}]="{changed_value}"
-
-configure_storage_compose_rewrites
-
-if [[ -n "${{COMPOSE_REWRITE_SERVICE_SET[neo4j]+set}}" ]]; then
-  printf 'REWRITE=yes\\n'
-else
-  printf 'REWRITE=no\\n'
-fi
-""")
-    values = parse_lines(output)
-    assert values["REWRITE"] == expected_rewrite
-
-
-@pytest.mark.parametrize(
-    ("changed_key", "changed_value", "expected_rewrite"),
-    [
-        ("POSTGRES_HOST", "db.example.com", "no"),
-        ("POSTGRES_PORT", "6543", "no"),
-        ("POSTGRES_USER", "updated-user", "yes"),
-        ("POSTGRES_PASSWORD", "updated-password", "yes"),
-        ("POSTGRES_DATABASE", "updated-database", "yes"),
+        (
+            "neo4j",
+            {"NEO4J_PASSWORD": "original-password", "NEO4J_DATABASE": "neo4j"},
+            "NEO4J_PASSWORD",
+            "updated-password",
+            "no",
+        ),
+        (
+            "neo4j",
+            {"NEO4J_PASSWORD": "original-password", "NEO4J_DATABASE": "neo4j"},
+            "NEO4J_DATABASE",
+            "updated-database",
+            "yes",
+        ),
+        (
+            "postgres",
+            {
+                "POSTGRES_HOST": "localhost",
+                "POSTGRES_PORT": "5432",
+                "POSTGRES_USER": "rag",
+                "POSTGRES_PASSWORD": "rag",
+                "POSTGRES_DATABASE": "lightrag",
+            },
+            "POSTGRES_HOST",
+            "db.example.com",
+            "no",
+        ),
+        (
+            "postgres",
+            {
+                "POSTGRES_HOST": "localhost",
+                "POSTGRES_PORT": "5432",
+                "POSTGRES_USER": "rag",
+                "POSTGRES_PASSWORD": "rag",
+                "POSTGRES_DATABASE": "lightrag",
+            },
+            "POSTGRES_PORT",
+            "6543",
+            "no",
+        ),
+        (
+            "postgres",
+            {
+                "POSTGRES_HOST": "localhost",
+                "POSTGRES_PORT": "5432",
+                "POSTGRES_USER": "rag",
+                "POSTGRES_PASSWORD": "rag",
+                "POSTGRES_DATABASE": "lightrag",
+            },
+            "POSTGRES_USER",
+            "updated-user",
+            "yes",
+        ),
+        (
+            "postgres",
+            {
+                "POSTGRES_HOST": "localhost",
+                "POSTGRES_PORT": "5432",
+                "POSTGRES_USER": "rag",
+                "POSTGRES_PASSWORD": "rag",
+                "POSTGRES_DATABASE": "lightrag",
+            },
+            "POSTGRES_PASSWORD",
+            "updated-password",
+            "yes",
+        ),
+        (
+            "postgres",
+            {
+                "POSTGRES_HOST": "localhost",
+                "POSTGRES_PORT": "5432",
+                "POSTGRES_USER": "rag",
+                "POSTGRES_PASSWORD": "rag",
+                "POSTGRES_DATABASE": "lightrag",
+            },
+            "POSTGRES_DATABASE",
+            "updated-database",
+            "yes",
+        ),
     ],
     ids=[
+        "neo4j-password-does-not-rewrite",
+        "neo4j-database-rewrites",
         "postgres-host-does-not-rewrite",
         "postgres-port-does-not-rewrite",
         "postgres-user-rewrites",
@@ -729,78 +759,79 @@ fi
         "postgres-database-rewrites",
     ],
 )
-def test_configure_storage_compose_rewrites_only_rewrites_postgres_for_service_env_changes(
-    changed_key: str, changed_value: str, expected_rewrite: str
+def test_configure_storage_compose_rewrites_respects_service_env_keys(
+    service: str,
+    baseline_env: dict[str, str],
+    changed_key: str,
+    changed_value: str,
+    expected_rewrite: str,
 ) -> None:
-    """Postgres service rewrites should only follow changes emitted into the postgres block."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
-EXISTING_MANAGED_ROOT_SERVICE_SET[postgres]=1
-DOCKER_SERVICE_SET[postgres]=1
-ORIGINAL_ENV_VALUES[POSTGRES_HOST]="localhost"
-ORIGINAL_ENV_VALUES[POSTGRES_PORT]="5432"
-ORIGINAL_ENV_VALUES[POSTGRES_USER]="rag"
-ORIGINAL_ENV_VALUES[POSTGRES_PASSWORD]="rag"
-ORIGINAL_ENV_VALUES[POSTGRES_DATABASE]="lightrag"
-ENV_VALUES[POSTGRES_HOST]="localhost"
-ENV_VALUES[POSTGRES_PORT]="5432"
-ENV_VALUES[POSTGRES_USER]="rag"
-ENV_VALUES[POSTGRES_PASSWORD]="rag"
-ENV_VALUES[POSTGRES_DATABASE]="lightrag"
-ENV_VALUES[{changed_key}]="{changed_value}"
-
+    """Service compose rewrites should only follow changes emitted into that service block."""
+    assignments = [
+        f"EXISTING_MANAGED_ROOT_SERVICE_SET[{service}]=1",
+        f"DOCKER_SERVICE_SET[{service}]=1",
+        *(f'ORIGINAL_ENV_VALUES[{k}]="{v}"' for k, v in baseline_env.items()),
+        *(f'ENV_VALUES[{k}]="{v}"' for k, v in baseline_env.items()),
+        f'ENV_VALUES[{changed_key}]="{changed_value}"',
+    ]
+    output = run_setup_bash(
+        "\n".join(assignments)
+        + f"""
 configure_storage_compose_rewrites
-
-if [[ -n "${{COMPOSE_REWRITE_SERVICE_SET[postgres]+set}}" ]]; then
+if [[ -n "${{COMPOSE_REWRITE_SERVICE_SET[{service}]+set}}" ]]; then
   printf 'REWRITE=yes\\n'
 else
   printf 'REWRITE=no\\n'
 fi
-""")
-    values = parse_lines(output)
-    assert values["REWRITE"] == expected_rewrite
+"""
+    )
+    assert parse_lines(output)["REWRITE"] == expected_rewrite
 
 
 @pytest.mark.parametrize(
-    ("vector_storage", "deployment_marker", "expected_rewrite"),
+    ("compose_lines", "vector_storage", "deployment_marker", "expected_rewrite"),
     [
-        ("MongoVectorDBStorage", "docker", "yes"),
-        ("NanoVectorDBStorage", "docker", "no"),
-        ("MongoVectorDBStorage", "", "no"),
+        (_LEGACY_MONGO_COMPOSE, "MongoVectorDBStorage", "docker", "yes"),
+        (_LEGACY_MONGO_COMPOSE, "NanoVectorDBStorage", "docker", "no"),
+        (_LEGACY_MONGO_COMPOSE, "MongoVectorDBStorage", "", "no"),
+        (
+            (
+                "services:",
+                "  lightrag:",
+                "    image: example/lightrag:test",
+                "  mongodb:",
+                "    image: mongodb/mongodb-atlas-local:8",
+                "    volumes:",
+                "      - mongo_data:/data/db",
+                "      - mongo_config_data:/data/configdb",
+                "volumes:",
+                "  mongo_data:",
+                "  mongo_config_data:",
+            ),
+            "MongoVectorDBStorage",
+            "docker",
+            "yes",
+        ),
     ],
     ids=[
         "mongo-vector-with-docker-rewrites",
         "non-mongo-vector-does-not-rewrite",
         "mongo-vector-without-docker-does-not-rewrite",
+        "atlas-local-missing-mongot-volume-rewrites",
     ],
 )
-def test_configure_mongodb_compose_migration_rewrite_only_runs_for_atlas_local_vector_path(
-    tmp_path: Path, vector_storage: str, deployment_marker: str, expected_rewrite: str
+def test_configure_mongodb_compose_migration_rewrite(
+    tmp_path: Path,
+    compose_lines: tuple[str, ...],
+    vector_storage: str,
+    deployment_marker: str,
+    expected_rewrite: str,
 ) -> None:
-    """Atlas Local migration should only run for docker-managed MongoDB vector storage."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  mongodb:",
-            "    image: mongo:8.2.4",
-            "    volumes:",
-            "      - mongo_data:/data/db",
-            "volumes:",
-            "  mongo_data:",
-        ],
-    )
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+    """Atlas Local migration rewrite should trigger only for docker-managed Mongo vector configs needing upgrade or repair."""
+    write_text_lines(tmp_path / "docker-compose.final.yml", compose_lines)
+    values = parse_lines(
+        run_setup_bash(
+            f"""
 ENV_VALUES[LIGHTRAG_VECTOR_STORAGE]="{vector_storage}"
 ENV_VALUES[LIGHTRAG_SETUP_MONGODB_DEPLOYMENT]="{deployment_marker}"
 EXISTING_MANAGED_ROOT_SERVICE_SET[mongodb]=1
@@ -813,111 +844,61 @@ if [[ -n "${{COMPOSE_REWRITE_SERVICE_SET[mongodb]+set}}" ]]; then
 else
   printf 'REWRITE=no\\n'
 fi
-""")
-    assert values["REWRITE"] == expected_rewrite
-
-
-def test_configure_mongodb_compose_migration_rewrite_repairs_missing_mongot_volume(
-    tmp_path: Path,
-) -> None:
-    """Atlas Local compose rewrites should repair stale MongoDB services missing mongot persistence."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  mongodb:",
-            "    image: mongodb/mongodb-atlas-local:8",
-            "    volumes:",
-            "      - mongo_data:/data/db",
-            "      - mongo_config_data:/data/configdb",
-            "volumes:",
-            "  mongo_data:",
-            "  mongo_config_data:",
-        ],
+""",
+            tmp_path=tmp_path,
+        )
     )
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-ENV_VALUES[LIGHTRAG_VECTOR_STORAGE]="MongoVectorDBStorage"
-ENV_VALUES[LIGHTRAG_SETUP_MONGODB_DEPLOYMENT]="docker"
-EXISTING_MANAGED_ROOT_SERVICE_SET[mongodb]=1
-DOCKER_SERVICE_SET[mongodb]=1
-
-configure_mongodb_compose_migration_rewrite "$REPO_ROOT/docker-compose.final.yml"
-
-if [[ -n "${{COMPOSE_REWRITE_SERVICE_SET[mongodb]+set}}" ]]; then
-  printf 'REWRITE=yes\\n'
-else
-  printf 'REWRITE=no\\n'
-fi
-""")
-    assert values["REWRITE"] == "yes"
+    assert values["REWRITE"] == expected_rewrite
 
 
 def test_switching_to_non_docker_storage_removes_stale_services_from_compose(
     tmp_path: Path,
 ) -> None:
     """env-storage must strip managed storage services while preserving user sidecars."""
-    compose_file = tmp_path / "docker-compose.final.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "  postgres:",
-                "    image: gzdaniel/postgres-for-rag:pg18-age-pgvector",
-                "  neo4j:",
-                "    image: neo4j:5.26.21-community",
-                "  sidecar:",
-                "    image: busybox",
-                '    command: ["sleep", "infinity"]',
-                "    volumes:",
-                "      - sidecar_data:/data",
-                "volumes:",
-                "  postgres_data:",
-                "  neo4j_data:",
-                "  sidecar_data:",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_setup_workspace(
+        tmp_path,
+        env_lines=["LLM_BINDING=openai"],
+        copy_env_example=True,
+        copy_compose_template=True,
+        compose_lines=[
+            "services:",
+            "  lightrag:",
+            "    image: example/lightrag:test",
+            "  postgres:",
+            "    image: gzdaniel/postgres-for-rag:pg18-age-pgvector",
+            "  neo4j:",
+            "    image: neo4j:5.26.21-community",
+            "  sidecar:",
+            "    image: busybox",
+            '    command: ["sleep", "infinity"]',
+            "    volumes:",
+            "      - sidecar_data:/data",
+            "volumes:",
+            "  postgres_data:",
+            "  neo4j_data:",
+            "  sidecar_data:",
+        ],
     )
-    env_file = tmp_path / ".env"
-    env_file.write_text("LLM_BINDING=openai\n", encoding="utf-8")
-    (tmp_path / "env.example").write_text(
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    (tmp_path / "docker-compose.yml").write_text(
-        (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-select_storage_backends() {{
+    run_setup_bash(
+        """
+select_storage_backends() {
   ENV_VALUES[LIGHTRAG_KV_STORAGE]="JsonKVStorage"
   ENV_VALUES[LIGHTRAG_VECTOR_STORAGE]="NanoVectorDBStorage"
   ENV_VALUES[LIGHTRAG_GRAPH_STORAGE]="NetworkXStorage"
   ENV_VALUES[LIGHTRAG_DOC_STATUS_STORAGE]="JsonDocStatusStorage"
-}}
-collect_database_config() {{ :; }}
-collect_docker_image_tags() {{ :; }}
-validate_required_variables() {{ return 0; }}
-confirm_default_yes() {{ return 0; }}
-confirm_default_no() {{ return 1; }}
-confirm_required_yes_no() {{ return 0; }}
+}
+collect_database_config() { :; }
+collect_docker_image_tags() { :; }
+validate_required_variables() { return 0; }
+confirm_default_yes() { return 0; }
+confirm_default_no() { return 1; }
+confirm_required_yes_no() { return 0; }
 
 env_storage_flow
-""")
-    result = compose_file.read_text(encoding="utf-8")
+""",
+        tmp_path=tmp_path,
+    )
+    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "postgres:" not in result
     assert "neo4j:" not in result
     assert "postgres_data:" not in result
@@ -976,17 +957,15 @@ def test_prepare_compose_runtime_overrides_rewrites_container_endpoints(
     env_key: str, env_value: str, expected_value: str
 ) -> None:
     """Loopback and 0.0.0.0 endpoints should be rewritten for container reachability."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
+    values = parse_lines(
+        run_setup_bash(
+            f"""
 ENV_VALUES[{env_key}]="{env_value}"
-
 prepare_compose_runtime_overrides
-
-printf '{env_key}=%s\\n' "${{COMPOSE_ENV_OVERRIDES[{env_key}]}}\"
-""")
+printf '{env_key}=%s\\n' "${{COMPOSE_ENV_OVERRIDES[{env_key}]}}"
+"""
+        )
+    )
     assert values[env_key] == expected_value
 
 
@@ -1002,20 +981,18 @@ def test_prepare_compose_runtime_overrides_normalizes_server_binding(
     host_value: str, expected_port_mapping: str
 ) -> None:
     """Compose runtime should keep variable-based publishing while fixing container bind values."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
+    values = parse_lines(
+        run_setup_bash(
+            f"""
 ENV_VALUES[HOST]="{host_value}"
 ENV_VALUES[PORT]="8080"
-
 prepare_compose_runtime_overrides
-
 printf 'HOST=%s\\n' "${{COMPOSE_ENV_OVERRIDES[HOST]}}"
 printf 'PORT=%s\\n' "${{COMPOSE_ENV_OVERRIDES[PORT]}}"
-printf 'PORT_MAPPING=%s\\n' "${{LIGHTRAG_COMPOSE_SERVER_PORT_MAPPING}}\"
-""")
+printf 'PORT_MAPPING=%s\\n' "${{LIGHTRAG_COMPOSE_SERVER_PORT_MAPPING}}"
+"""
+        )
+    )
     assert values["HOST"] == "0.0.0.0"
     assert values["PORT"] == "9621"
     assert values["PORT_MAPPING"] == expected_port_mapping
@@ -1025,9 +1002,85 @@ def test_finalize_server_setup_skips_embedded_milvus_sub_services(
     tmp_path: Path,
 ) -> None:
     """finalize_server_setup must keep prefixed Milvus child services on rerun."""
-    compose_file = tmp_path / "docker-compose.final.yml"
-    compose_file.write_text(
-        "\n".join(
+    write_setup_workspace(
+        tmp_path,
+        env_lines=["LIGHTRAG_SETUP_MILVUS_DEPLOYMENT=docker"],
+        copy_env_example=True,
+        compose_lines=[
+            "services:",
+            "  lightrag:",
+            "    image: example/lightrag:test",
+            "  milvus:",
+            "    image: milvusdb/milvus:v2.6.11",
+            "  milvus-etcd:",
+            "    image: quay.io/coreos/etcd:v3.5.16",
+            "  milvus-minio:",
+            "    image: minio/minio:RELEASE.2024-12-13T22-19-12Z",
+            "volumes:",
+            "  milvus_data:",
+            "  milvus-etcd_data:",
+            "  milvus-minio_data:",
+        ],
+    )
+    run_setup_bash(
+        """
+collect_server_config() { :; }
+collect_security_config() { :; }
+collect_ssl_config() { :; }
+confirm_required_yes_no() { return 0; }
+finalize_server_setup
+""",
+        tmp_path=tmp_path,
+        load_env=True,
+    )
+    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
+    assert "milvus" in result
+    assert "milvus-etcd" in result
+    assert "milvus-minio" in result
+    assert "      milvus:\n        condition: service_healthy" in result
+    assert "      milvus-etcd:\n        condition: service_healthy" not in result
+    assert "      milvus-minio:\n        condition: service_healthy" not in result
+
+
+def test_finalize_server_setup_uses_compose_native_neo4j_endpoint_on_rerun(
+    tmp_path: Path,
+) -> None:
+    """Preserved managed services should inject compose-native endpoints on server reruns."""
+    write_setup_workspace(
+        tmp_path,
+        env_lines=[
+            "LIGHTRAG_SETUP_NEO4J_DEPLOYMENT=docker",
+            "NEO4J_URI=neo4j://localhost:7687",
+        ],
+        copy_env_example=True,
+        compose_lines=[
+            "services:",
+            "  lightrag:",
+            "    image: example/lightrag:test",
+            "  neo4j:",
+            "    image: neo4j:latest",
+        ],
+    )
+    run_setup_bash(
+        """
+show_summary() { :; }
+confirm_required_yes_no() { return 0; }
+validate_sensitive_env_literals() { return 0; }
+validate_security_config() { return 0; }
+finalize_server_setup
+""",
+        tmp_path=tmp_path,
+        load_env=True,
+    )
+    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
+    assert 'NEO4J_URI: "neo4j://neo4j:7687"' in result
+    assert 'NEO4J_URI: "neo4j://host.docker.internal:7687"' not in result
+
+
+@pytest.mark.parametrize(
+    ("compose_lines", "expected_roots"),
+    [
+        (
             [
                 "services:",
                 "  lightrag:",
@@ -1037,315 +1090,37 @@ def test_finalize_server_setup_skips_embedded_milvus_sub_services(
                 "  milvus-etcd:",
                 "    image: quay.io/coreos/etcd:v3.5.16",
                 "  milvus-minio:",
-                "    image: minio/minio:RELEASE.2024-12-13T22-19-12Z",
-                "volumes:",
-                "  milvus_data:",
-                "  milvus-etcd_data:",
-                "  milvus-minio_data:",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "env.example").write_text(
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    write_text_lines(tmp_path / ".env", ["LIGHTRAG_SETUP_MILVUS_DEPLOYMENT=docker"])
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-collect_server_config() {{ :; }}
-collect_security_config() {{ :; }}
-collect_ssl_config() {{ :; }}
-confirm_required_yes_no() {{ return 0; }}
-finalize_server_setup
-""")
-    result = compose_file.read_text(encoding="utf-8")
-    assert "milvus" in result
-    assert "milvus-etcd" in result
-    assert "milvus-minio" in result
-    assert (
-        """      milvus:
-        condition: service_healthy"""
-        in result
-    )
-    assert (
-        """      milvus-etcd:
-        condition: service_healthy"""
-        not in result
-    )
-    assert (
-        """      milvus-minio:
-        condition: service_healthy"""
-        not in result
-    )
-
-
-def test_finalize_server_setup_uses_compose_native_neo4j_endpoint_on_rerun(
-    tmp_path: Path,
+                "    image: minio/minio:latest",
+                "  neo4j:",
+                "    image: neo4j:latest",
+            ],
+            ["milvus", "neo4j"],
+        ),
+        (
+            [
+                "services:",
+                "  lightrag:",
+                "    image: example/lightrag:test",
+                "  opensearch:",
+                "    image: opensearchproject/opensearch:3",
+                "  dashboards:",
+                "    image: opensearchproject/opensearch-dashboards:3",
+            ],
+            ["opensearch"],
+        ),
+    ],
+    ids=["milvus-children", "opensearch-dashboards"],
+)
+def test_detect_managed_root_services_collapses_child_services(
+    tmp_path: Path, compose_lines: list[str], expected_roots: list[str]
 ) -> None:
-    """Preserved managed services should inject compose-native endpoints on server reruns."""
-    write_text_lines(
-        tmp_path / ".env",
-        ["LIGHTRAG_SETUP_NEO4J_DEPLOYMENT=docker", "NEO4J_URI=neo4j://localhost:7687"],
+    """Managed service discovery should collapse Milvus children and opensearch-dashboards to their root service."""
+    write_text_lines(tmp_path / "docker-compose.final.yml", compose_lines)
+    output = run_setup_bash(
+        f'detect_managed_root_services "{tmp_path}/docker-compose.final.yml"',
+        reset=False,
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  neo4j:",
-            "    image: neo4j:latest",
-        ],
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-show_summary() {{ :; }}
-confirm_required_yes_no() {{ return 0; }}
-validate_sensitive_env_literals() {{ return 0; }}
-validate_security_config() {{ return 0; }}
-finalize_server_setup
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
-    assert 'NEO4J_URI: "neo4j://neo4j:7687"' in result
-    assert 'NEO4J_URI: "neo4j://host.docker.internal:7687"' not in result
-
-
-def test_finalize_server_setup_migrates_mongodb_to_atlas_local_for_mongo_vector_storage(
-    tmp_path: Path,
-) -> None:
-    """Server reruns should upgrade docker-managed MongoDB to Atlas Local when Mongo vector storage needs it."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "LIGHTRAG_RUNTIME_TARGET=compose",
-            "LIGHTRAG_SETUP_MONGODB_DEPLOYMENT=docker",
-            "LIGHTRAG_KV_STORAGE=MongoKVStorage",
-            "LIGHTRAG_VECTOR_STORAGE=MongoVectorDBStorage",
-            "LIGHTRAG_GRAPH_STORAGE=MongoGraphStorage",
-            "LIGHTRAG_DOC_STATUS_STORAGE=MongoDocStatusStorage",
-            "MONGO_URI=mongodb://localhost:27017/?directConnection=true",
-            "MONGO_DATABASE=LightRAG",
-            "HOST=0.0.0.0",
-            "PORT=9621",
-        ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  mongodb:",
-            "    image: mongo:8.2.4",
-            "    volumes:",
-            "      - mongo_data:/data/db",
-            "volumes:",
-            "  mongo_data:",
-        ],
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-show_summary() {{ :; }}
-confirm_required_yes_no() {{ return 0; }}
-validate_sensitive_env_literals() {{ return 0; }}
-validate_security_config() {{ return 0; }}
-finalize_server_setup
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
-    assert "image: mongodb/mongodb-atlas-local:" in result
-    assert "mongo_config_data:/data/configdb" in result
-    assert "mongo_mongot_data:/data/mongot" in result
-    assert "image: mongo:8.2.4" not in result
-
-
-def test_finalize_server_setup_rejects_invalid_preserved_mongo_vector_config(
-    tmp_path: Path,
-) -> None:
-    """Server reruns should fail before writing when preserved Mongo vector config is invalid."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "LIGHTRAG_RUNTIME_TARGET=compose",
-            "LIGHTRAG_SETUP_MONGODB_DEPLOYMENT=docker",
-            "LIGHTRAG_KV_STORAGE=MongoKVStorage",
-            "LIGHTRAG_VECTOR_STORAGE=MongoVectorDBStorage",
-            "LIGHTRAG_GRAPH_STORAGE=MongoGraphStorage",
-            "LIGHTRAG_DOC_STATUS_STORAGE=MongoDocStatusStorage",
-            "MONGO_URI=mongodb://mongo.example.com:27017/?directConnection=true",
-            "MONGO_DATABASE=LightRAG",
-            "HOST=0.0.0.0",
-            "PORT=9621",
-        ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  mongodb:",
-            "    image: mongo:8.2.4",
-            "    volumes:",
-            "      - mongo_data:/data/db",
-            "volumes:",
-            "  mongo_data:",
-        ],
-    )
-    result = run_bash_process(
-        f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-show_summary() {{ :; }}
-confirm_required_yes_no() {{ return 0; }}
-validate_sensitive_env_literals() {{ return 0; }}
-validate_security_config() {{ return 0; }}
-finalize_server_setup
-""",
-        cwd=tmp_path,
-    )
-    assert result.returncode != 0
-    assert (
-        "MongoVectorDBStorage requires the bundled Atlas Local endpoint"
-        in result.stderr
-    )
-    assert "image: mongo:8.2.4" in (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
-    )
-
-
-def test_finalize_server_setup_drops_stale_managed_services_missing_from_env_markers(
-    tmp_path: Path,
-) -> None:
-    """env-server should remove stale wizard-managed services not marked in `.env`."""
-    write_text_lines(tmp_path / ".env", ["HOST=0.0.0.0", "PORT=9621"])
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  redis:",
-            "    image: redis:latest",
-            "  vllm-embed:",
-            "    image: vllm/vllm-openai:latest",
-            "volumes:",
-            "  redis_data:",
-            "  vllm_embed_cache:",
-        ],
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-show_summary() {{ :; }}
-collect_server_config() {{ :; }}
-collect_security_config() {{ :; }}
-collect_ssl_config() {{ :; }}
-confirm_required_yes_no() {{ return 0; }}
-confirm_default_yes() {{
-  case "$1" in
-    "All wizard-managed services have been removed. Remove LightRAG from Docker and switch to host mode?") return 1 ;;
-    *) return 0 ;;
-  esac
-}}
-validate_sensitive_env_literals() {{ return 0; }}
-validate_security_config() {{ return 0; }}
-finalize_server_setup
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
-    generated_env = (tmp_path / ".env").read_text(encoding="utf-8")
-    assert "  redis:" not in result
-    assert "  vllm-embed:" not in result
-    assert "redis_data:" not in result
-    assert "vllm_embed_cache:" not in result
-    assert "  lightrag:" in result
-    assert "LIGHTRAG_RUNTIME_TARGET=compose" in generated_env
-
-
-def test_detect_managed_root_services_deduplicates_embedded_milvus_children(
-    tmp_path: Path,
-) -> None:
-    """Managed service discovery should collapse Milvus child services to the root service."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  milvus:",
-            "    image: milvusdb/milvus:v2.6.11",
-            "  milvus-etcd:",
-            "    image: quay.io/coreos/etcd:v3.5.16",
-            "  milvus-minio:",
-            "    image: minio/minio:latest",
-            "  neo4j:",
-            "    image: neo4j:latest",
-        ],
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-detect_managed_root_services "{tmp_path}/docker-compose.final.yml\"
-""")
-    assert output.splitlines() == ["milvus", "neo4j"]
-
-
-def test_detect_managed_root_services_groups_opensearch_dashboards_under_opensearch(
-    tmp_path: Path,
-) -> None:
-    """opensearch-dashboards must collapse to the opensearch root so orphan dashboards blocks don't masquerade as external services."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "  opensearch:",
-            "    image: opensearchproject/opensearch:3",
-            "  dashboards:",
-            "    image: opensearchproject/opensearch-dashboards:3",
-        ],
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-detect_managed_root_services "{tmp_path}/docker-compose.final.yml\"
-""")
-    assert output.splitlines() == ["opensearch"]
+    assert output.splitlines() == expected_roots
 
 
 def test_compose_has_non_wizard_services_ignores_orphan_dashboards(
@@ -1363,161 +1138,89 @@ def test_compose_has_non_wizard_services_ignores_orphan_dashboards(
             "    image: opensearchproject/opensearch-dashboards:3",
         ],
     )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
+    output = run_setup_bash(
+        f"""
 if compose_has_non_wizard_services "{compose_file}"; then
   printf 'RESULT=non_wizard_detected\\n'
 else
   printf 'RESULT=wizard_only\\n'
 fi
-""")
-    values = parse_lines(output)
-    assert values["RESULT"] == "wizard_only"
+""",
+        reset=False,
+    )
+    assert parse_lines(output)["RESULT"] == "wizard_only"
 
 
-def test_finalize_server_setup_allows_risky_security_config_and_security_check_reports_it(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("env_lines", "expected_audit_message"),
+    [
+        (
+            [
+                "AUTH_ACCOUNTS=admin:secret",
+                "TOKEN_SECRET=jwt-secret",
+                "WHITELIST_PATHS=/health,/api/*",
+            ],
+            "WHITELIST_PATHS exposes /api routes",
+        ),
+        (
+            [
+                "AUTH_ACCOUNTS=admin:Passw0rd!",
+                "TOKEN_SECRET=jwt-secret",
+                "WHITELIST_PATHS=/health",
+            ],
+            "AUTH_ACCOUNTS uses a predictable password prefix.",
+        ),
+    ],
+    ids=["exposed-api-whitelist", "predictable-auth-password"],
+)
+def test_finalize_server_setup_allows_audit_warnings_and_security_check_reports_them(
+    tmp_path: Path, env_lines: list[str], expected_audit_message: str
 ) -> None:
-    """Wizard writes `.env` without blocking, while security-check reports risky settings."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "AUTH_ACCOUNTS=admin:secret",
-            "TOKEN_SECRET=jwt-secret",
-            "WHITELIST_PATHS=/health,/api/*",
-        ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-show_summary() {{ :; }}
-confirm_default_yes() {{ return 0; }}
-confirm_required_yes_no() {{ return 0; }}
+    """Wizard writes `.env` without blocking on audit-level risks, while security-check reports them."""
+    write_setup_workspace(tmp_path, env_lines=env_lines, copy_env_example=True)
+    output = run_setup_bash(
+        """
+show_summary() { :; }
+confirm_default_yes() { return 0; }
+confirm_required_yes_no() { return 0; }
 
 if finalize_server_setup; then
   printf 'RESULT=success\\n'
 else
   printf 'RESULT=failure\\n'
 fi
-""")
-    values = parse_lines(output)
-    assert values["RESULT"] == "success"
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
 """,
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
+        tmp_path=tmp_path,
+        load_env=True,
     )
-    assert result.returncode == 1
-    assert "WHITELIST_PATHS exposes /api routes" in result.stdout
-
-
-def test_finalize_server_setup_allows_predictable_auth_passwords_and_security_check_reports_it(
-    tmp_path: Path,
-) -> None:
-    """Server setup should not block on weak password prefixes that belong to security audit."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "AUTH_ACCOUNTS=admin:Passw0rd!",
-            "TOKEN_SECRET=jwt-secret",
-            "WHITELIST_PATHS=/health",
-        ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-show_summary() {{ :; }}
-confirm_default_yes() {{ return 0; }}
-confirm_required_yes_no() {{ return 0; }}
-
-if finalize_server_setup; then
-  printf 'RESULT=success\\n'
-else
-  printf 'RESULT=failure\\n'
-fi
-""")
-    values = parse_lines(output)
-    assert values["RESULT"] == "success"
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 1
-    assert "AUTH_ACCOUNTS uses a predictable password prefix." in result.stdout
+    assert parse_lines(output)["RESULT"] == "success"
+    audit = run_security_check(tmp_path)
+    assert audit.returncode == 1
+    assert expected_audit_message in audit.stdout
 
 
 def test_finalize_server_setup_rejects_malformed_auth_accounts(tmp_path: Path) -> None:
     """Server setup should fail fast instead of persisting invalid AUTH_ACCOUNTS syntax."""
-    write_text_lines(tmp_path / ".env", ["HOST=0.0.0.0"])
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    output = run_bash(
-        f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
-collect_server_config() {{ :; }}
-collect_ssl_config() {{ :; }}
+    write_setup_workspace(tmp_path, env_lines=["HOST=0.0.0.0"], copy_env_example=True)
+    output = run_setup_bash(
+        """
+collect_server_config() { :; }
+collect_ssl_config() { :; }
 ENV_VALUES[AUTH_ACCOUNTS]="admin"
 ENV_VALUES[TOKEN_SECRET]="jwt-secret"
-show_summary() {{ :; }}
-confirm_default_yes() {{ return 0; }}
-confirm_required_yes_no() {{ return 0; }}
+show_summary() { :; }
+confirm_default_yes() { return 0; }
+confirm_required_yes_no() { return 0; }
 
 if finalize_server_setup; then
   printf 'RESULT=success\\n'
 else
   printf 'RESULT=failure\\n'
 fi
-printf 'ENV=%s\\n' "$(cat "$REPO_ROOT/.env")\"
+printf 'ENV=%s\\n' "$(cat "$REPO_ROOT/.env")"
 """,
+        tmp_path=tmp_path,
+        load_env=True,
         cwd=tmp_path,
     )
     values = parse_lines(output)
@@ -1529,27 +1232,19 @@ def test_ssl_staging_uses_distinct_names_for_same_basename_inputs(
     tmp_path: Path,
 ) -> None:
     """Cert/key files with the same basename should stage to distinct paths."""
-    env_example = tmp_path / "env.example"
-    env_example.write_text(
-        "\n".join(
-            ["SSL_CERTFILE=/placeholder/cert.pem", "SSL_KEYFILE=/placeholder/key.pem"]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_text_lines(
+        tmp_path / "env.example",
+        ["SSL_CERTFILE=/placeholder/cert.pem", "SSL_KEYFILE=/placeholder/key.pem"],
     )
-    compose_file = tmp_path / "docker-compose.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "    env_file:",
-                "      - .env",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_text_lines(
+        tmp_path / "docker-compose.yml",
+        [
+            "services:",
+            "  lightrag:",
+            "    image: example/lightrag:test",
+            "    env_file:",
+            "      - .env",
+        ],
     )
     cert_dir = tmp_path / "certs"
     key_dir = tmp_path / "keys"
@@ -1559,12 +1254,8 @@ def test_ssl_staging_uses_distinct_names_for_same_basename_inputs(
     cert_path.write_text("cert", encoding="utf-8")
     key_path = key_dir / "server.pem"
     key_path.write_text("key", encoding="utf-8")
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+    run_setup_bash(
+        f"""
 ENV_VALUES[SSL_CERTFILE]="{cert_path}"
 ENV_VALUES[SSL_KEYFILE]="{key_path}"
 SSL_CERT_SOURCE_PATH="{cert_path}"
@@ -1572,8 +1263,10 @@ SSL_KEY_SOURCE_PATH="{key_path}"
 
 prepare_compose_env_overrides
 stage_ssl_assets "$SSL_CERT_SOURCE_PATH" "$SSL_KEY_SOURCE_PATH"
-generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml\"
-""")
+generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml"
+""",
+        tmp_path=tmp_path,
+    )
     generated_compose = (tmp_path / "docker-compose.generated.yml").read_text(
         encoding="utf-8"
     )
@@ -1603,15 +1296,11 @@ def test_ssl_staging_skips_copy_for_already_staged_relative_paths(
     key_path = staged_dir / "server.key"
     cert_path.write_text("cert", encoding="utf-8")
     key_path.write_text("key", encoding="utf-8")
-    run_bash(f"""
-set -euo pipefail
-cd "{tmp_path}"
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-stage_ssl_assets "./data/certs/server.pem" "./data/certs/server.key\"
-""")
+    run_setup_bash(
+        'stage_ssl_assets "./data/certs/server.pem" "./data/certs/server.key"',
+        tmp_path=tmp_path,
+        cwd=tmp_path,
+    )
     assert cert_path.read_text(encoding="utf-8") == "cert"
     assert key_path.read_text(encoding="utf-8") == "key"
 
@@ -1663,29 +1352,19 @@ def test_finalize_flows_stage_inherited_ssl_assets_for_compose(
     key_path = tmp_path / f"{name}-source-key.pem"
     cert_path.write_text("cert", encoding="utf-8")
     key_path.write_text("key", encoding="utf-8")
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    write_setup_workspace(
+        tmp_path,
+        env_lines=[
             *env_lines,
             "SSL=true",
             f"SSL_CERTFILE={cert_path}",
             f"SSL_KEYFILE={key_path}",
         ],
+        copy_env_example=True,
+        copy_compose_template=True,
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    (tmp_path / "docker-compose.yml").write_text(
-        (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-
+    run_setup_bash(
+        f"""
 {setup_snippet}
 
 show_summary() {{ :; }}
@@ -1693,7 +1372,10 @@ confirm_default_yes() {{ return 0; }}
 confirm_required_yes_no() {{ return 0; }}
 
 {finalize_call}
-""")
+""",
+        tmp_path=tmp_path,
+        load_env=True,
+    )
     generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
         encoding="utf-8"
     )
@@ -1711,444 +1393,236 @@ confirm_required_yes_no() {{ return 0; }}
     )
 
 
-def test_security_check_reports_missing_authentication(tmp_path: Path) -> None:
-    """Security audit should flag unauthenticated API exposure."""
-    write_text_lines(tmp_path / ".env", ["HOST=0.0.0.0"])
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
+@pytest.mark.parametrize(
+    ("env_assignments", "expected_fragments"),
+    [
+        (
+            'ENV_VALUES[HOST]="0.0.0.0"',
+            ("no authentication is configured", "AUTH_ACCOUNTS"),
+        ),
+        ('ENV_VALUES[HOST]="127.0.0.1"', ()),
+        ('ENV_VALUES[HOST]="0.0.0.0"\nENV_VALUES[LIGHTRAG_API_KEY]="some-key"', ()),
+    ],
+    ids=["public-without-auth", "loopback-silent", "public-with-auth-silent"],
+)
+def test_warn_if_exposed_network_exposure_matrix(
+    env_assignments: str, expected_fragments: tuple[str, ...]
+) -> None:
+    """warn_if_network_exposed_without_auth should warn only on non-loopback hosts without auth."""
+    result = run_setup_bash_process(
+        f"{env_assignments}\nwarn_if_network_exposed_without_auth",
+        reset=False,
     )
-    assert result.returncode == 1
-    assert "No API protection is configured" in result.stdout
-    assert "HOST=0.0.0.0 is reachable from the network" in result.stdout
+    if expected_fragments:
+        for fragment in expected_fragments:
+            assert fragment in result.stdout
+    else:
+        assert result.stdout.strip() == ""
 
 
-def test_security_check_passes_for_authenticated_minimal_config(tmp_path: Path) -> None:
-    """Security audit should pass for a minimally hardened config."""
-    write_text_lines(
-        tmp_path / ".env",
+@pytest.mark.parametrize(
+    ("env_lines", "expected_rc", "expected_stdout", "forbidden_stdout"),
+    [
+        (
+            ["HOST=0.0.0.0"],
+            1,
+            (
+                "No API protection is configured",
+                "HOST=0.0.0.0 is reachable from the network",
+            ),
+            (),
+        ),
+        (
+            [
+                "AUTH_ACCOUNTS=admin:secret",
+                "TOKEN_SECRET=jwt-secret",
+                "WHITELIST_PATHS=/health",
+            ],
+            0,
+            (),
+            (),
+        ),
+        (
+            ["HOST=127.0.0.1"],
+            1,
+            ("No API protection is configured.",),
+            ("reachable from the network",),
+        ),
+        (
+            [
+                "AUTH_ACCOUNTS=admin:admin123!",
+                "TOKEN_SECRET=jwt-secret",
+                "WHITELIST_PATHS=/health",
+            ],
+            1,
+            ("AUTH_ACCOUNTS uses a predictable password prefix.",),
+            (),
+        ),
+    ],
+    ids=[
+        "missing-auth-public-bind",
+        "authenticated-minimal",
+        "missing-auth-loopback-bind",
+        "predictable-auth-password-prefix",
+    ],
+)
+def test_security_check_auth_and_exposure_matrix(
+    tmp_path: Path,
+    env_lines: list[str],
+    expected_rc: int,
+    expected_stdout: tuple[str, ...],
+    forbidden_stdout: tuple[str, ...],
+) -> None:
+    """Security audit should flag missing auth, network exposure, and predictable passwords."""
+    result = run_security_check(tmp_path, env_lines)
+    assert result.returncode == expected_rc
+    for fragment in expected_stdout:
+        assert fragment in result.stdout
+    for fragment in forbidden_stdout:
+        assert fragment not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("env_lines", "expected_rc", "expected_stdout", "forbidden_stdout"),
+    [
+        # With LIGHTRAG_API_KEY set, unset WHITELIST_PATHS defaults to /health
+        # (config.default_whitelist_paths), so /api is protected by the key.
+        (
+            ["LIGHTRAG_API_KEY=my-secret-key"],
+            0,
+            (),
+            ("WHITELIST_PATHS exposes /api routes",),
+        ),
+        # AUTH_ACCOUNTS plus a key: the key-following default keeps /api protected.
+        (
+            [
+                "AUTH_ACCOUNTS=reader:a-strong-secret",
+                "TOKEN_SECRET=jwt-secret",
+                "LIGHTRAG_API_KEY=my-secret-key",
+            ],
+            None,
+            (),
+            ("WHITELIST_PATHS exposes /api routes",),
+        ),
+        # AUTH_ACCOUNTS without a key: the default still exempts /api, and the remedy
+        # named by the audit is LIGHTRAG_API_KEY (the only credential an Ollama client can send).
+        (
+            ["AUTH_ACCOUNTS=reader:a-strong-secret", "TOKEN_SECRET=jwt-secret"],
+            1,
+            ("WHITELIST_PATHS exposes /api routes", "Set LIGHTRAG_API_KEY"),
+            (),
+        ),
+        (
+            ["LIGHTRAG_API_KEY=my-secret-key", "WHITELIST_PATHS=/health,/api/*"],
+            1,
+            ("WHITELIST_PATHS exposes /api routes",),
+            (),
+        ),
+        # Regression for GHSA-mmg5-8x8q-v934: '/*' strips to an empty prefix that
+        # every path starts with, so a naive '/api' prefix check missed it.
+        (
+            ["LIGHTRAG_API_KEY=my-secret-key", "WHITELIST_PATHS=/*"],
+            1,
+            ("WHITELIST_PATHS exposes /api routes",),
+            (),
+        ),
+        # Guards the /api/ route boundary: /apiary/* must not be treated as exposing /api.
+        (
+            ["LIGHTRAG_API_KEY=my-secret-key", "WHITELIST_PATHS=/health,/apiary/*"],
+            0,
+            ("No obvious security issues found",),
+            (),
+        ),
+        (
+            ["LIGHTRAG_API_KEY=my-secret-key", "WHITELIST_PATHS=/health"],
+            0,
+            ("No obvious security issues found",),
+            (),
+        ),
+    ],
+    ids=[
+        "api-key-only-default-whitelist",
+        "accounts-and-api-key-default-whitelist",
+        "accounts-only-default-whitelist",
+        "api-key-only-explicit-api-wildcard",
+        "api-key-only-catch-all-whitelist",
+        "api-key-only-apiary-whitelist",
+        "api-key-only-safe-whitelist",
+    ],
+)
+def test_security_check_whitelist_and_auth_matrix(
+    tmp_path: Path,
+    env_lines: list[str],
+    expected_rc: int | None,
+    expected_stdout: tuple[str, ...],
+    forbidden_stdout: tuple[str, ...],
+) -> None:
+    """Security audit should accurately classify /api exposure across auth and WHITELIST_PATHS combinations."""
+    result = run_security_check(tmp_path, env_lines)
+    if expected_rc is not None:
+        assert result.returncode == expected_rc
+    for fragment in expected_stdout:
+        assert fragment in result.stdout
+    for fragment in forbidden_stdout:
+        assert fragment not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("storage_lines", "extra_lines", "expected_rc", "expects_warning"),
+    [
+        (
+            FILE_STORAGE_ENV,
+            ["OPENSEARCH_PASSWORD=LightRAG2026_!@"],
+            0,
+            False,
+        ),
+        (
+            OPENSEARCH_STORAGE_ENV,
+            [
+                "OPENSEARCH_HOSTS=localhost:9200",
+                "OPENSEARCH_USER=admin",
+                "OPENSEARCH_PASSWORD=LightRAG2026_!@",
+            ],
+            1,
+            True,
+        ),
+    ],
+    ids=["opensearch-unused", "opensearch-selected"],
+)
+def test_security_check_default_opensearch_password(
+    tmp_path: Path,
+    storage_lines: tuple[str, ...],
+    extra_lines: list[str],
+    expected_rc: int,
+    expects_warning: bool,
+) -> None:
+    """Security audit should flag the default OpenSearch password only when OpenSearch is selected."""
+    result = run_security_check(
+        tmp_path,
         [
             "AUTH_ACCOUNTS=admin:secret",
             "TOKEN_SECRET=jwt-secret",
             "WHITELIST_PATHS=/health",
+            *storage_lines,
+            *extra_lines,
         ],
     )
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0
-
-
-def test_security_check_no_auth_message_omits_host_for_loopback(
-    tmp_path: Path,
-) -> None:
-    """A loopback bind without auth is flagged, but not as network-reachable."""
-    write_text_lines(tmp_path / ".env", ["HOST=127.0.0.1"])
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 1
-    assert "No API protection is configured." in result.stdout
-    assert "reachable from the network" not in result.stdout
-
-
-def _run_warn_if_exposed(env_assignments: str) -> subprocess.CompletedProcess[str]:
-    """Source setup.sh, seed ENV_VALUES, and run the exposure hint."""
-    return subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-{env_assignments}
-warn_if_network_exposed_without_auth
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-def test_warn_if_exposed_flags_public_bind_without_auth() -> None:
-    """Non-loopback host with no auth should print a suggestion."""
-    result = _run_warn_if_exposed('ENV_VALUES[HOST]="0.0.0.0"')
-    assert "no authentication is configured" in result.stdout
-    assert "AUTH_ACCOUNTS" in result.stdout
-
-
-def test_warn_if_exposed_silent_for_loopback() -> None:
-    """A loopback bind needs no exposure suggestion."""
-    result = _run_warn_if_exposed('ENV_VALUES[HOST]="127.0.0.1"')
-    assert result.stdout.strip() == ""
-
-
-def test_warn_if_exposed_silent_when_auth_configured() -> None:
-    """A public bind with auth configured needs no exposure suggestion."""
-    result = _run_warn_if_exposed(
-        'ENV_VALUES[HOST]="0.0.0.0"\nENV_VALUES[LIGHTRAG_API_KEY]="some-key"'
-    )
-    assert result.stdout.strip() == ""
-
-
-def test_security_check_reports_predictable_auth_password_prefix(
-    tmp_path: Path,
-) -> None:
-    """Security audit should flag AUTH_ACCOUNTS passwords with predictable prefixes."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "AUTH_ACCOUNTS=admin:admin123!",
-            "TOKEN_SECRET=jwt-secret",
-            "WHITELIST_PATHS=/health",
-        ],
-    )
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 1
-    assert "AUTH_ACCOUNTS uses a predictable password prefix." in result.stdout
-
-
-def _security_check(tmp_path: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-def test_security_check_passes_for_api_key_only_with_default_whitelist(
-    tmp_path: Path,
-) -> None:
-    """With LIGHTRAG_API_KEY set, an unset WHITELIST_PATHS defaults to /health.
-
-    The server's default follows the key (config.default_whitelist_paths), so
-    the audit must not report /api as exposed: it is protected by the key.
-    """
-    write_text_lines(tmp_path / ".env", ["LIGHTRAG_API_KEY=my-secret-key"])
-    result = _security_check(tmp_path)
-    assert result.returncode == 0
-    assert "WHITELIST_PATHS exposes /api routes" not in result.stdout
-
-
-def test_security_check_passes_for_accounts_and_api_key_with_default_whitelist(
-    tmp_path: Path,
-) -> None:
-    """AUTH_ACCOUNTS plus a key: the key-following default keeps /api protected."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "AUTH_ACCOUNTS=reader:a-strong-secret",
-            "TOKEN_SECRET=jwt-secret",
-            "LIGHTRAG_API_KEY=my-secret-key",
-        ],
-    )
-    result = _security_check(tmp_path)
-    assert "WHITELIST_PATHS exposes /api routes" not in result.stdout
-
-
-def test_security_check_reports_accounts_only_with_default_whitelist(
-    tmp_path: Path,
-) -> None:
-    """AUTH_ACCOUNTS without a key: the default still exempts /api, and the remedy
-    the audit names is the key, the only credential an Ollama client can send."""
-    write_text_lines(
-        tmp_path / ".env",
-        ["AUTH_ACCOUNTS=reader:a-strong-secret", "TOKEN_SECRET=jwt-secret"],
-    )
-    result = _security_check(tmp_path)
-    assert result.returncode == 1
-    assert "WHITELIST_PATHS exposes /api routes" in result.stdout
-    assert "Set LIGHTRAG_API_KEY" in result.stdout
-
-
-def test_security_check_reports_api_key_only_with_explicit_api_wildcard_whitelist(
-    tmp_path: Path,
-) -> None:
-    """API-key-only deployment with WHITELIST_PATHS=/health,/api/* must be flagged."""
-    write_text_lines(
-        tmp_path / ".env",
-        ["LIGHTRAG_API_KEY=my-secret-key", "WHITELIST_PATHS=/health,/api/*"],
-    )
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 1
-    assert "WHITELIST_PATHS exposes /api routes" in result.stdout
-
-
-def test_security_check_reports_api_key_only_with_catch_all_whitelist(
-    tmp_path: Path,
-) -> None:
-    """A catch-all WHITELIST_PATHS=/* exempts every route (incl. /api) and must be flagged.
-
-    Regression for GHSA-mmg5-8x8q-v934: '/*' strips to an empty prefix that
-    every path starts with, so the old substring check (entries beginning with
-    '/api') missed it and emitted no notice.
-    """
-    write_text_lines(
-        tmp_path / ".env",
-        ["LIGHTRAG_API_KEY=my-secret-key", "WHITELIST_PATHS=/*"],
-    )
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 1
-    assert "WHITELIST_PATHS exposes /api routes" in result.stdout
-
-
-def test_security_check_passes_for_api_key_only_with_apiary_whitelist(
-    tmp_path: Path,
-) -> None:
-    """A /apiary/* whitelist exempts only /apiary, not /api/chat, and must NOT be flagged.
-
-    Guards the /api/ route boundary: the wildcard-prefix check must not treat
-    any prefix that merely begins with the substring "/api" as exposing the
-    Ollama routes, which would fail the audit on a safe whitelist.
-    """
-    write_text_lines(
-        tmp_path / ".env",
-        ["LIGHTRAG_API_KEY=my-secret-key", "WHITELIST_PATHS=/health,/apiary/*"],
-    )
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0
-    assert "No obvious security issues found" in result.stdout
-
-
-def test_security_check_passes_for_api_key_only_with_safe_whitelist(
-    tmp_path: Path,
-) -> None:
-    """API-key-only deployment with a safe WHITELIST_PATHS should pass the security check."""
-    write_text_lines(
-        tmp_path / ".env", ["LIGHTRAG_API_KEY=my-secret-key", "WHITELIST_PATHS=/health"]
-    )
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0
-    assert "No obvious security issues found" in result.stdout
-
-
-def test_security_check_ignores_default_opensearch_password_when_opensearch_unused(
-    tmp_path: Path,
-) -> None:
-    """Security audit should ignore OpenSearch defaults when no OpenSearch storage is selected."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "AUTH_ACCOUNTS=admin:secret",
-            "TOKEN_SECRET=jwt-secret",
-            "WHITELIST_PATHS=/health",
-            "LIGHTRAG_KV_STORAGE=JsonKVStorage",
-            "LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage",
-            "LIGHTRAG_GRAPH_STORAGE=NetworkXStorage",
-            "LIGHTRAG_DOC_STATUS_STORAGE=JsonDocStatusStorage",
-            "OPENSEARCH_PASSWORD=LightRAG2026_!@",
-        ],
-    )
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0
-    assert "OPENSEARCH_PASSWORD uses a well-known default value." not in result.stdout
-
-
-def test_security_check_reports_default_opensearch_password_when_opensearch_selected(
-    tmp_path: Path,
-) -> None:
-    """Security audit should flag the default OpenSearch password when OpenSearch is selected."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
-            "AUTH_ACCOUNTS=admin:secret",
-            "TOKEN_SECRET=jwt-secret",
-            "WHITELIST_PATHS=/health",
-            "LIGHTRAG_KV_STORAGE=OpenSearchKVStorage",
-            "LIGHTRAG_VECTOR_STORAGE=OpenSearchVectorDBStorage",
-            "LIGHTRAG_GRAPH_STORAGE=OpenSearchGraphStorage",
-            "LIGHTRAG_DOC_STATUS_STORAGE=OpenSearchDocStatusStorage",
-            "OPENSEARCH_HOSTS=localhost:9200",
-            "OPENSEARCH_USER=admin",
-            "OPENSEARCH_PASSWORD=LightRAG2026_!@",
-        ],
-    )
-    result = subprocess.run(
-        [
-            "bash",
-            "--norc",
-            "--noprofile",
-            "-c",
-            f"""
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-security_check_env_file
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 1
-    assert "OPENSEARCH_PASSWORD uses a well-known default value." in result.stdout
+    assert result.returncode == expected_rc
+    warning = "OPENSEARCH_PASSWORD uses a well-known default value."
+    assert (warning in result.stdout) is expects_warning
 
 
 def test_show_summary_masks_auth_accounts() -> None:
     """Configuration summaries should not print auth account passwords."""
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-reset_state
-
+    output = run_setup_bash(
+        """
 ENV_VALUES[AUTH_ACCOUNTS]="admin:secret,reader:hunter2"
 ENV_VALUES[TOKEN_SECRET]="jwt-secret"
 ENV_VALUES[HOST]="0.0.0.0"
 
 show_summary
-""")
+"""
+    )
     assert "AUTH_ACCOUNTS=***" in output
     assert "TOKEN_SECRET=***" in output
     assert "admin:secret" not in output
@@ -2157,10 +1631,9 @@ show_summary
 
 def test_opensearch_index_validators_accept_zero_padded_values() -> None:
     """OpenSearch shard and replica validators should accept zero-padded decimals."""
-    values = run_bash_lines(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-
+    values = parse_lines(
+        run_setup_bash(
+            """
 if validate_positive_integer "08"; then
   printf 'SHARDS=valid\\n'
 else
@@ -2172,53 +1645,43 @@ if validate_non_negative_integer "09"; then
 else
   printf 'REPLICAS=invalid\\n'
 fi
-""")
+""",
+            reset=False,
+        )
+    )
     assert values["SHARDS"] == "valid"
     assert values["REPLICAS"] == "valid"
 
 
-def test_backup_only_backs_up_env_and_generated_compose(tmp_path: Path) -> None:
-    """backup_only should back up both .env and the active generated compose file."""
+@pytest.mark.parametrize(
+    "with_compose",
+    [True, False],
+    ids=["with-compose", "env-only"],
+)
+def test_backup_only_handles_env_and_optional_compose(
+    tmp_path: Path, with_compose: bool
+) -> None:
+    """backup_only should back up .env and also back up the generated compose file when present."""
     compose_content = (
         "\n".join(["services:", "  lightrag:", "    image: example/lightrag:test"])
         + "\n"
     )
     write_text_lines(tmp_path / ".env", ["HOST=0.0.0.0"])
-    (tmp_path / "docker-compose.final.yml").write_text(
-        compose_content, encoding="utf-8"
-    )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-
-backup_only
-""")
+    if with_compose:
+        (tmp_path / "docker-compose.final.yml").write_text(
+            compose_content, encoding="utf-8"
+        )
+    output = run_setup_bash("backup_only", tmp_path=tmp_path, reset=False)
     env_backups = sorted(tmp_path.glob(".env.backup.*"))
     assert len(env_backups) == 1
     assert env_backups[0].read_text(encoding="utf-8") == "HOST=0.0.0.0\n"
     assert "Backed up .env to" in output
-    assert "Backed up compose file to" in output
-    assert_single_compose_backup(tmp_path, compose_content)
-
-
-def test_backup_only_skips_compose_backup_when_no_generated_compose_exists(
-    tmp_path: Path,
-) -> None:
-    """backup_only should still succeed when only .env exists."""
-    write_text_lines(tmp_path / ".env", ["HOST=0.0.0.0"])
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-
-backup_only
-""")
-    env_backups = sorted(tmp_path.glob(".env.backup.*"))
-    assert len(env_backups) == 1
-    assert "Backed up .env to" in output
-    assert "Backed up compose file to" not in output
-    assert list(tmp_path.glob("docker-compose.backup*.yml")) == []
+    if with_compose:
+        assert "Backed up compose file to" in output
+        assert_single_compose_backup(tmp_path, compose_content)
+    else:
+        assert "Backed up compose file to" not in output
+        assert list(tmp_path.glob("docker-compose.backup*.yml")) == []
 
 
 class TestTheWizardSelectsAValidConfigurationBackend:

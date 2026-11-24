@@ -1,5 +1,5 @@
 """Process-tree probe for ``lightrag.kg.working_dir_lock``, run as a
-subprocess by ``test_working_dir_lock.py``.
+subprocess by ``test_workspace_locks.py``.
 
 Each command runs in a fresh interpreter so it cannot inherit the calling
 process's claim bookkeeping or lock descriptor.

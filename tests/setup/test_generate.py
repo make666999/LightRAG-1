@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import shlex
 from pathlib import Path
 
@@ -14,11 +15,26 @@ from tests.setup._helpers import (
     PRESERVED_NOTICE,
     REPO_ROOT,
     parse_lines,
-    run_bash,
+    run_setup_bash,
+    write_setup_workspace,
     write_text_lines,
 )
 
 pytestmark = pytest.mark.offline
+
+_MINIMAL_LIGHTRAG_COMPOSE = (
+    "services:",
+    "  lightrag:",
+    "    image: example/lightrag:test",
+)
+
+_TEMPLATE_PRESERVED_EXAMPLE = (
+    "HOST=0.0.0.0",
+    PRESERVED_HEADER,
+    PRESERVED_NOTICE,
+    "### Template preserved comment",
+    "# template_example=true",
+)
 
 
 def _count_ui_template_mount_targets(compose: str) -> int:
@@ -29,50 +45,90 @@ def _count_ui_template_mount_targets(compose: str) -> int:
     )
 
 
+def _run_generate_compose(
+    tmp_path: Path,
+    *,
+    compose_lines: Sequence[str] | None = None,
+    compose_name: str = "docker-compose.final.yml",
+    output_name: str | None = None,
+    env_lines: Sequence[str] | None = None,
+    copy_env_example: bool = False,
+    load_env: bool = False,
+    extra_bash: str = "",
+) -> str:
+    """Seed compose/env fixtures, run ``generate_docker_compose``, and return the output text."""
+    write_setup_workspace(
+        tmp_path,
+        env_lines=env_lines,
+        compose_lines=compose_lines,
+        compose_name=compose_name,
+        copy_env_example=copy_env_example,
+    )
+    target_name = output_name or compose_name
+    run_setup_bash(
+        f"""
+{extra_bash}
+generate_docker_compose "$REPO_ROOT/{target_name}"
+""",
+        tmp_path=tmp_path,
+        load_env=load_env,
+    )
+    return (tmp_path / target_name).read_text(encoding="utf-8")
+
+
+def _run_generate_env(
+    tmp_path: Path,
+    *,
+    template_lines: Sequence[str],
+    env_lines: Sequence[str] | None = None,
+    env_values: dict[str, str] | None = None,
+    passes: int = 1,
+) -> list[str]:
+    """Seed template/env fixtures, run ``generate_env_file`` ``passes`` times, and return output lines."""
+    write_text_lines(tmp_path / "env.example", template_lines)
+    if env_lines is not None:
+        write_text_lines(tmp_path / ".env", env_lines)
+    steps: list[str] = []
+    if env_lines is not None:
+        steps.append('load_env_file "$REPO_ROOT/.env"')
+    for key, value in (env_values or {}).items():
+        steps.append(f"ENV_VALUES[{key}]={shlex.quote(value)}")
+    for _ in range(passes):
+        steps.append('generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env"')
+    run_setup_bash("\n".join(steps), tmp_path=tmp_path)
+    return (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
+
+
 def test_generate_files_keep_host_env_values_and_inject_compose_overrides(
     tmp_path: Path,
 ) -> None:
     """This generation path keeps host-style values in `.env` and injects compose-only overrides separately."""
-    env_example = tmp_path / "env.example"
-    env_example.write_text(
-        "\n".join(
-            [
-                "SSL_CERTFILE=/placeholder/cert.pem",
-                "SSL_KEYFILE=/placeholder/key.pem",
-                "LLM_BINDING_HOST=https://api.example.com/v1",
-                "EMBEDDING_BINDING_HOST=https://api.example.com/v1",
-                "RERANK_BINDING_HOST=https://api.example.com/v1",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    compose_file = tmp_path / "docker-compose.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "    env_file:",
-                "      - .env",
-                "    volumes:",
-                "      - ./.env:/app/.env",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_text_lines(
+        tmp_path / "env.example",
+        [
+            "SSL_CERTFILE=/placeholder/cert.pem",
+            "SSL_KEYFILE=/placeholder/key.pem",
+            "LLM_BINDING_HOST=https://api.example.com/v1",
+            "EMBEDDING_BINDING_HOST=https://api.example.com/v1",
+            "RERANK_BINDING_HOST=https://api.example.com/v1",
+        ],
     )
     cert_path = tmp_path / "cert.pem"
     cert_path.write_text("cert", encoding="utf-8")
     key_path = tmp_path / "key.pem"
     key_path.write_text("key", encoding="utf-8")
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
+            "    env_file:",
+            "      - .env",
+            "    volumes:",
+            "      - ./.env:/app/.env",
+        ],
+        compose_name="docker-compose.yml",
+        output_name="docker-compose.generated.yml",
+        extra_bash=f"""
 ENV_VALUES[SSL_CERTFILE]="{cert_path}"
 ENV_VALUES[SSL_KEYFILE]="{key_path}"
 ENV_VALUES[LLM_BINDING_HOST]="http://localhost:11434"
@@ -84,12 +140,9 @@ SSL_KEY_SOURCE_PATH="{key_path}"
 prepare_compose_env_overrides
 stage_ssl_assets "$SSL_CERT_SOURCE_PATH" "$SSL_KEY_SOURCE_PATH"
 generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env"
-generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml\"
-""")
-    generated_env = (tmp_path / ".env").read_text(encoding="utf-8")
-    generated_compose = (tmp_path / "docker-compose.generated.yml").read_text(
-        encoding="utf-8"
+""",
     )
+    generated_env = (tmp_path / ".env").read_text(encoding="utf-8")
     assert f"SSL_CERTFILE={cert_path}" in generated_env
     assert f"SSL_KEYFILE={key_path}" in generated_env
     assert "LLM_BINDING_HOST=http://localhost:11434" in generated_env
@@ -115,9 +168,9 @@ def test_generate_docker_compose_replaces_env_file_with_required_environment(
     tmp_path: Path,
 ) -> None:
     """Generated compose should remove ``env_file`` and inject required settings."""
-    write_text_lines(
-        tmp_path / "docker-compose.yml",
-        [
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
             "services:",
             "  lightrag:",
             "    container_name: lightrag",
@@ -127,17 +180,8 @@ def test_generate_docker_compose_replaces_env_file_with_required_environment(
             "    volumes:",
             "      - ./.env:/app/.env",
         ],
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.generated.yml").read_text(
-        encoding="utf-8"
+        compose_name="docker-compose.yml",
+        output_name="docker-compose.generated.yml",
     )
     assert '      UI_TEMPLATES_DIR: "/app/data/ui_templates"' in generated_compose
     assert "env_file:" not in generated_compose
@@ -150,9 +194,9 @@ def test_generate_docker_compose_removes_lightrag_container_name_from_existing_o
     tmp_path: Path,
 ) -> None:
     """Compose regeneration should strip fixed lightrag container names from prior output."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
             "services:",
             "  lightrag:",
             "    container_name: lightrag",
@@ -160,17 +204,6 @@ def test_generate_docker_compose_removes_lightrag_container_name_from_existing_o
             "    environment:",
             '      UI_TEMPLATES_DIR: "/custom/ui_templates"',
         ],
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
     )
     assert "container_name:" not in generated_compose
     # UI_TEMPLATES_DIR is seeded, never managed: a value the operator wrote
@@ -183,31 +216,16 @@ def test_generate_docker_compose_preserves_list_style_lightrag_environment(
     tmp_path: Path,
 ) -> None:
     """Compose regeneration should not mix mapping entries into list-style environments."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    environment:",
             "      - PORT=9621",
             "      - FOO=bar",
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-set_compose_override "PORT" "1234"
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+        copy_env_example=True,
+        extra_bash='set_compose_override "PORT" "1234"',
     )
     assert '      - "PORT=1234"' in generated_compose
     assert "      - FOO=bar" in generated_compose
@@ -218,20 +236,13 @@ def test_generate_docker_compose_injects_healthchecks_and_lightrag_depends_on(
     tmp_path: Path,
 ) -> None:
     """Generated compose should gate LightRAG on all managed dependencies becoming healthy."""
-    write_text_lines(
-        tmp_path / "docker-compose.yml",
-        ["services:", "  lightrag:", "    image: example/lightrag:test"],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=_MINIMAL_LIGHTRAG_COMPOSE,
+        compose_name="docker-compose.yml",
+        output_name="docker-compose.final.yml",
+        copy_env_example=True,
+        extra_bash="""
 add_docker_service postgres
 add_docker_service neo4j
 add_docker_service mongodb
@@ -241,11 +252,7 @@ add_docker_service qdrant
 add_docker_service memgraph
 add_docker_service vllm-embed
 add_docker_service vllm-rerank
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+""",
     )
     lightrag_start = generated_compose.index("  lightrag:\n")
     embed_start = generated_compose.index("\n  vllm-embed:\n")
@@ -264,22 +271,15 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
         "vllm-rerank",
     ):
         assert (
-            f"""      {service_name}:
-        condition: service_healthy"""
+            f"      {service_name}:\n        condition: service_healthy"
             in lightrag_block
         )
     assert generated_compose.count("    healthcheck:") == 10
     assert "  milvus-etcd:" in generated_compose
     assert "  milvus-minio:" in generated_compose
+    assert "      milvus-etcd:\n        condition: service_healthy" in generated_compose
     assert (
-        """      milvus-etcd:
-        condition: service_healthy"""
-        in generated_compose
-    )
-    assert (
-        """      milvus-minio:
-        condition: service_healthy"""
-        in generated_compose
+        "      milvus-minio:\n        condition: service_healthy" in generated_compose
     )
 
 
@@ -287,12 +287,10 @@ def test_generate_docker_compose_preserves_user_depends_on_and_removes_stale_man
     tmp_path: Path,
 ) -> None:
     """Compose regeneration should preserve user dependencies while refreshing wizard-managed ones."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    depends_on:",
             "      sidecar:",
             "        condition: service_started",
@@ -303,44 +301,14 @@ def test_generate_docker_compose_preserves_user_depends_on_and_removes_stale_man
             "  sidecar:",
             "    image: busybox",
         ],
+        copy_env_example=True,
+        extra_bash="add_docker_service postgres\nadd_docker_service redis",
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-add_docker_service postgres
-add_docker_service redis
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
-    )
+    assert "      sidecar:\n        condition: service_started" in generated_compose
+    assert "      postgres:\n        condition: service_healthy" in generated_compose
+    assert "      redis:\n        condition: service_healthy" in generated_compose
     assert (
-        """      sidecar:
-        condition: service_started"""
-        in generated_compose
-    )
-    assert (
-        """      postgres:
-        condition: service_healthy"""
-        in generated_compose
-    )
-    assert (
-        """      redis:
-        condition: service_healthy"""
-        in generated_compose
-    )
-    assert (
-        """      vllm-embed:
-        condition: service_healthy"""
-        not in generated_compose
+        "      vllm-embed:\n        condition: service_healthy" not in generated_compose
     )
 
 
@@ -348,12 +316,10 @@ def test_generate_docker_compose_repairs_misplaced_lightrag_depends_on_from_exis
     tmp_path: Path,
 ) -> None:
     """Regeneration should move stale lightrag depends_on content back onto the lightrag service."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    environment:",
             "  vllm-rerank:",
             "    image: example/vllm:test",
@@ -364,39 +330,16 @@ def test_generate_docker_compose_repairs_misplaced_lightrag_depends_on_from_exis
             "volumes:",
             "  vllm_rerank_cache:",
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-add_docker_service vllm-rerank
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+        copy_env_example=True,
+        extra_bash="add_docker_service vllm-rerank",
     )
     lightrag_start = generated_compose.index("  lightrag:\n")
     rerank_start = generated_compose.index("\n  vllm-rerank:\n")
     lightrag_block = generated_compose[lightrag_start:rerank_start]
     rerank_block = generated_compose[rerank_start:]
     assert "    depends_on:" in lightrag_block
-    assert (
-        """      my-service:
-        condition: service_healthy"""
-        in lightrag_block
-    )
-    assert (
-        """      vllm-rerank:
-        condition: service_healthy"""
-        in lightrag_block
-    )
+    assert "      my-service:\n        condition: service_healthy" in lightrag_block
+    assert "      vllm-rerank:\n        condition: service_healthy" in lightrag_block
     assert "    depends_on:" not in rerank_block
     assert generated_compose.count("\n  vllm-rerank:\n") == 1
 
@@ -405,34 +348,17 @@ def test_generate_docker_compose_normalizes_lightrag_restart_policy_from_existin
     tmp_path: Path,
 ) -> None:
     """Regeneration should replace legacy lightrag restart with deploy.restart_policy."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    restart: unless-stopped",
             "    extra_hosts:",
             '      - "host.docker.internal:host-gateway"',
         ],
+        copy_env_example=True,
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
-    )
-    lightrag_start = generated_compose.index("  lightrag:\n")
-    lightrag_block = generated_compose[lightrag_start:]
+    lightrag_block = generated_compose[generated_compose.index("  lightrag:\n") :]
     assert "    restart: unless-stopped" not in lightrag_block
     assert "    deploy:\n" in lightrag_block
     assert "      restart_policy:\n" in lightrag_block
@@ -444,46 +370,19 @@ def test_generate_docker_compose_normalizes_lightrag_restart_policy_without_blan
     tmp_path: Path,
 ) -> None:
     """Regeneration should move the separator blank line after deploy, not before it."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    restart: unless-stopped",
             "",
             "  sidecar:",
             "    image: busybox",
         ],
+        copy_env_example=True,
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
-    )
-    assert (
-        """    image: example/lightrag:test
-
-    deploy:
-"""
-        not in generated_compose
-    )
-    assert (
-        """    image: example/lightrag:test
-    deploy:
-"""
-        in generated_compose
-    )
+    assert "    image: example/lightrag:test\n\n    deploy:\n" not in generated_compose
+    assert "    image: example/lightrag:test\n    deploy:\n" in generated_compose
     assert "        max_attempts: 10\n\n    volumes:\n" in generated_compose
     assert (
         "      - ./data/prompts:/app/data/prompts\n"
@@ -508,12 +407,10 @@ def test_generate_docker_compose_respects_long_syntax_ui_template_mounts(
     first (the common form) and ``target:`` first (legal, and the one a
     list-item-only parser is most likely to misread).
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    volumes:",
             "      - ./data/rag_storage:/app/data/rag_storage",
             "      - type: bind",
@@ -524,21 +421,7 @@ def test_generate_docker_compose_respects_long_syntax_ui_template_mounts(
             "        type: bind",
             "        source: ./branding/prompts",
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+        copy_env_example=True,
     )
     assert _count_ui_template_mount_targets(generated_compose) == 1
     assert generated_compose.count("/app/data/prompts") == 1
@@ -560,33 +443,17 @@ def test_generate_docker_compose_respects_commented_volume_targets(
     the same container path is appended. Covers the long form and the short
     form, the latter being the pre-existing `/app/data/prompts` check.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    volumes:",
             "      - type: bind",
             "        source: ./branding/acme",
             "        target: /app/data/ui_templates # acme branding",
             "      - ./branding/prompts:/app/data/prompts   # custom profiles",
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+        copy_env_example=True,
     )
     assert _count_ui_template_mount_targets(generated_compose) == 1
     assert generated_compose.count("/app/data/prompts") == 1
@@ -622,15 +489,12 @@ def test_strip_yaml_inline_comment_respects_quotes_and_bare_hashes() -> None:
         # escaping the closing delimiter.
         ('"./win\\\\:/app/x" # note', '"./win\\\\:/app/x"'),
     ]
-    script_lines = [
-        "set -euo pipefail",
-        f'source "{REPO_ROOT}/scripts/setup/setup.sh"',
-    ]
-    for value, _ in cases:
-        script_lines.append(f"_strip_yaml_inline_comment {shlex.quote(value)}; echo")
-    # `run_bash` returns stdout; take the last len(cases) lines so anything
+    body = "\n".join(
+        f"_strip_yaml_inline_comment {shlex.quote(value)}; echo" for value, _ in cases
+    )
+    # `run_setup_bash` returns stdout; take the last len(cases) lines so anything
     # `setup.sh` prints while sourcing cannot shift the alignment.
-    output = run_bash("\n".join(script_lines)).splitlines()[-len(cases) :]
+    output = run_setup_bash(body, reset=False).splitlines()[-len(cases) :]
     for (value, expected), actual in zip(cases, output):
         assert actual == expected, f"{value!r} -> {actual!r}, expected {expected!r}"
 
@@ -647,31 +511,15 @@ def test_generate_docker_compose_respects_interpolated_mount_sources(
     convention (`/app/data/ui_templates`); only the host source is
     configurable, so the mount must be recognised and not duplicated.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    volumes:",
             '      - "${UI_BUNDLE_SOURCE:-./branding}:/app/data/ui_templates:ro"',
             '      - "${PROMPT_SOURCE:-./branding/prompts}:/app/data/prompts"',
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+        copy_env_example=True,
     )
     assert _count_ui_template_mount_targets(generated_compose) == 1
     assert generated_compose.count("/app/data/prompts") == 1
@@ -689,30 +537,14 @@ def test_generate_docker_compose_injects_when_only_a_longer_path_matches(
     managed one is still injected. Guards the substring match against the
     obvious false positive.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    volumes:",
             "      - ./backup:/app/data/ui_templates_backup:ro",
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+        copy_env_example=True,
     )
     assert "./data/ui_templates:/app/data/ui_templates:ro" in generated_compose
     assert "./backup:/app/data/ui_templates_backup:ro" in generated_compose
@@ -745,30 +577,14 @@ def test_generate_docker_compose_recognizes_target_regardless_of_mode(
     mode, or several modes all count as covering the container path and must
     not draw a duplicate.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    volumes:",
             f"      - {mount}",
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+        copy_env_example=True,
     )
     assert _count_ui_template_mount_targets(generated_compose) == 1
     assert "./data/ui_templates:/app/data/ui_templates:ro" not in generated_compose
@@ -784,31 +600,15 @@ def test_generate_docker_compose_respects_escaped_quotes_in_mount_specs(
     quote byte truncates the spec, the container target disappears with the
     tail, and a duplicate mount is appended for a path already mounted.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    volumes:",
             "      - './customer''s-brand:/app/data/ui_templates:ro' # branding",
             '      - "./say-\\"hi\\":/app/data/prompts" # quoted',
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+        copy_env_example=True,
     )
     assert _count_ui_template_mount_targets(generated_compose) == 1
     assert generated_compose.count("/app/data/prompts") == 1
@@ -825,33 +625,17 @@ def test_generate_docker_compose_tolerates_extra_list_item_spacing(
     the long-form nor the short-form shape, and a duplicate mount was appended
     for a container path already mounted. Covers both syntaxes.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    volumes:",
             "      -   target: /app/data/ui_templates",
             "          type: bind",
             "          source: ./branding/acme",
             "      -    ./branding/prompts:/app/data/prompts",
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+        copy_env_example=True,
     )
     assert _count_ui_template_mount_targets(generated_compose) == 1
     assert generated_compose.count("/app/data/prompts") == 1
@@ -862,12 +646,10 @@ def test_generate_docker_compose_preserves_non_managed_named_volumes(
     tmp_path: Path,
 ) -> None:
     """Retained services should keep their referenced top-level named volumes."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    volumes:",
             "      - my_cache:/app/cache",
             "  sidecar:",
@@ -886,19 +668,8 @@ def test_generate_docker_compose_preserves_non_managed_named_volumes(
             "    driver: local",
             "  postgres_data:",
         ],
+        copy_env_example=True,
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "  sidecar:" in result
     assert "my_cache:/app/cache" in result
     assert "sidecar_data:/data" in result
@@ -912,12 +683,10 @@ def test_generate_docker_compose_inserts_managed_services_before_top_level_secti
     tmp_path: Path,
 ) -> None:
     """Managed services should stay inside services: even when custom top-level sections exist."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    volumes:",
             "      - ./.env:/app/.env",
             "  worker:",
@@ -928,25 +697,14 @@ def test_generate_docker_compose_inserts_managed_services_before_top_level_secti
             "  appnet:",
             "    driver: bridge",
         ],
-    )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+        copy_env_example=True,
+        extra_bash="""
 ENV_VALUES[POSTGRES_USER]="lightrag"
 ENV_VALUES[POSTGRES_PASSWORD]="secret"
 ENV_VALUES[POSTGRES_DATABASE]="lightrag"
 add_docker_service "postgres"
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
+""",
+    )
     assert "  postgres:" in result
     assert "\n\nnetworks:\n" in result
     assert result.index("\n  postgres:") < result.index("\nnetworks:\n")
@@ -957,12 +715,10 @@ def test_generate_docker_compose_cleans_marker_and_blank_lines_when_only_lightra
     tmp_path: Path,
 ) -> None:
     """Regeneration should not leave a managed-services marker or stacked blank lines behind."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    depends_on:",
             "      vllm-embed:",
             "        condition: service_healthy",
@@ -982,20 +738,8 @@ def test_generate_docker_compose_cleans_marker_and_blank_lines_when_only_lightra
             "  appnet:",
             "    driver: bridge",
         ],
+        copy_env_example=True,
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "  vllm-embed:" not in result
     assert "  vllm-rerank:" not in result
     assert "__WIZARD_MANAGED_SERVICES__" not in result
@@ -1016,32 +760,17 @@ def test_generate_docker_compose_keeps_blank_line_between_managed_service_and_to
     tmp_path: Path,
 ) -> None:
     """Managed service blocks should stay visually separated from following top-level sections."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "networks:",
             "  web_network:",
             "    driver: bridge",
         ],
+        copy_env_example=True,
+        extra_bash='add_docker_service "vllm-embed"',
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-add_docker_service "vllm-embed"
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "  vllm-embed:" in result
     assert (
         '      UI_TEMPLATES_DIR: "/app/data/ui_templates"\n    depends_on:\n' in result
@@ -1053,33 +782,18 @@ def test_generate_docker_compose_keeps_single_blank_line_before_generated_volume
     tmp_path: Path,
 ) -> None:
     """Generated top-level volumes should be separated from prior sections by one blank line."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "networks:",
             "  web_network:",
             "    driver: bridge",
             "",
         ],
+        copy_env_example=True,
+        extra_bash='add_docker_service "vllm-embed"',
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-add_docker_service "vllm-embed"
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "\n\nvolumes:\n" in result
     assert "\n\n\nvolumes:\n" not in result
 
@@ -1088,32 +802,27 @@ def test_generate_env_file_comments_out_later_duplicate_active_keys(
     tmp_path: Path,
 ) -> None:
     """Commented example keys should not be overridden by later active defaults."""
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+    run_setup_bash(
+        f"""
 ENV_VALUES[EMBEDDING_BINDING]="ollama"
 ENV_VALUES[EMBEDDING_MODEL]="bge-m3:latest"
 ENV_VALUES[EMBEDDING_DIM]="1024"
 ENV_VALUES[EMBEDDING_BINDING_HOST]="http://localhost:11434"
 
-generate_env_file "{REPO_ROOT}/env.example" "$REPO_ROOT/.env\"
-""")
+generate_env_file "{REPO_ROOT}/env.example" "$REPO_ROOT/.env"
+""",
+        tmp_path=tmp_path,
+    )
     generated_env = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
-    active_embedding_lines = [
+    assert [
         line for line in generated_env if line.startswith("EMBEDDING_BINDING=")
+    ] == ["EMBEDDING_BINDING=ollama"]
+    assert [line for line in generated_env if line.startswith("EMBEDDING_MODEL=")] == [
+        "EMBEDDING_MODEL=bge-m3:latest"
     ]
-    active_model_lines = [
-        line for line in generated_env if line.startswith("EMBEDDING_MODEL=")
-    ]
-    active_host_lines = [
+    assert [
         line for line in generated_env if line.startswith("EMBEDDING_BINDING_HOST=")
-    ]
-    assert active_embedding_lines == ["EMBEDDING_BINDING=ollama"]
-    assert active_model_lines == ["EMBEDDING_MODEL=bge-m3:latest"]
-    assert active_host_lines == ["EMBEDDING_BINDING_HOST=http://localhost:11434"]
+    ] == ["EMBEDDING_BINDING_HOST=http://localhost:11434"]
     assert "# EMBEDDING_BINDING=openai" in generated_env
 
 
@@ -1121,30 +830,19 @@ def test_generate_env_file_preserves_custom_variables_not_declared_in_template(
     tmp_path: Path,
 ) -> None:
     """Reruns should keep custom `.env` variables that are not declared in env.example."""
-    write_text_lines(tmp_path / "env.example", ["HOST=0.0.0.0", "# PORT=9621"])
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=["HOST=0.0.0.0", "# PORT=9621"],
+        env_lines=[
             "HOST=127.0.0.1",
             "",
             "# Custom integration settings",
             "EXTRA_API_BASE='https://example.com/api'",
             "# EXTRA_API_TOKEN=secret",
         ],
+        env_values={"HOST": "0.0.0.0", "PORT": "9621"},
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-ENV_VALUES[PORT]="9621"
-
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_env = (tmp_path / ".env").read_text(encoding="utf-8")
+    generated_env = "\n".join(generated_lines)
     assert "HOST=0.0.0.0" in generated_env
     assert "PORT=9621" in generated_env
     assert PRESERVED_HEADER in generated_env
@@ -1157,10 +855,10 @@ def test_generate_env_file_keeps_preserved_section_idempotent_across_reruns(
     tmp_path: Path,
 ) -> None:
     """Repeated reruns should keep a single preserved marker and its leading blank line."""
-    write_text_lines(tmp_path / "env.example", ["HOST=0.0.0.0", "# PORT=9621"])
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=["HOST=0.0.0.0", "# PORT=9621"],
+        env_lines=[
             "HOST=127.0.0.1",
             "",
             PRESERVED_HEADER,
@@ -1169,26 +867,15 @@ def test_generate_env_file_keeps_preserved_section_idempotent_across_reruns(
             "EXTRA_API_BASE='https://example.com/api'",
             "# EXTRA_API_TOKEN=secret",
         ],
+        env_values={"HOST": "0.0.0.0", "PORT": "9621"},
+        passes=2,
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-ENV_VALUES[PORT]="9621"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
-    marker = PRESERVED_HEADER
-    notice = PRESERVED_NOTICE
-    marker_indexes = [idx for idx, line in enumerate(generated_lines) if line == marker]
+    marker_indexes = [
+        idx for idx, line in enumerate(generated_lines) if line == PRESERVED_HEADER
+    ]
     assert marker_indexes == [3]
     assert generated_lines[2] == ""
-    assert generated_lines[4] == notice
+    assert generated_lines[4] == PRESERVED_NOTICE
     assert generated_lines[5] == ""
     assert generated_lines[6] == "# Custom integration settings"
     assert generated_lines[7] == "EXTRA_API_BASE='https://example.com/api'"
@@ -1199,10 +886,10 @@ def test_generate_env_file_preserves_multi_line_comments_inside_preserved_sectio
     tmp_path: Path,
 ) -> None:
     """Only comments already inside the preserved section should survive reruns."""
-    write_text_lines(tmp_path / "env.example", ["HOST=0.0.0.0", "# PORT=9621"])
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=["HOST=0.0.0.0", "# PORT=9621"],
+        env_lines=[
             "HOST=127.0.0.1",
             "",
             "# External note that should not migrate",
@@ -1215,27 +902,14 @@ def test_generate_env_file_preserves_multi_line_comments_inside_preserved_sectio
             "# Group B",
             "EXTRA_API_TOKEN=secret",
         ],
+        env_values={"HOST": "0.0.0.0", "PORT": "9621"},
+        passes=2,
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-ENV_VALUES[PORT]="9621"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
-    marker = PRESERVED_HEADER
-    notice = PRESERVED_NOTICE
-    marker_index = generated_lines.index(marker)
-    assert generated_lines.count(marker) == 1
-    assert generated_lines.count(notice) == 1
+    marker_index = generated_lines.index(PRESERVED_HEADER)
+    assert generated_lines.count(PRESERVED_HEADER) == 1
+    assert generated_lines.count(PRESERVED_NOTICE) == 1
     assert "# External note that should not migrate" not in generated_lines
-    assert generated_lines[marker_index + 1] == notice
+    assert generated_lines[marker_index + 1] == PRESERVED_NOTICE
     assert generated_lines[marker_index + 2] == ""
     assert generated_lines[marker_index + 3] == "# Group A"
     assert generated_lines[marker_index + 4] == "# Shared settings"
@@ -1251,10 +925,10 @@ def test_generate_env_file_preserves_trailing_comments_at_end_of_preserved_secti
     tmp_path: Path,
 ) -> None:
     """Free-form comments after the last preserved variable should survive reruns."""
-    write_text_lines(tmp_path / "env.example", ["HOST=0.0.0.0", "# PORT=9621"])
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=["HOST=0.0.0.0", "# PORT=9621"],
+        env_lines=[
             "HOST=127.0.0.1",
             "",
             PRESERVED_HEADER,
@@ -1264,20 +938,9 @@ def test_generate_env_file_preserves_trailing_comments_at_end_of_preserved_secti
             "# Free-form note",
             "# This should stay at EOF",
         ],
+        env_values={"HOST": "0.0.0.0", "PORT": "9621"},
+        passes=2,
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-ENV_VALUES[PORT]="9621"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     assert generated_lines[-3] == "EXTRA_API_BASE='https://example.com/api'"
     assert generated_lines[-2] == "# Free-form note"
     assert generated_lines[-1] == "# This should stay at EOF"
@@ -1287,10 +950,10 @@ def test_generate_env_file_appends_new_external_entries_after_existing_preserved
     tmp_path: Path,
 ) -> None:
     """New template-external entries should be appended after the existing preserved payload."""
-    write_text_lines(tmp_path / "env.example", ["HOST=0.0.0.0", "# PORT=9621"])
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=["HOST=0.0.0.0", "# PORT=9621"],
+        env_lines=[
             "HOST=127.0.0.1",
             "EXTRA_EARLY=alpha",
             PRESERVED_HEADER,
@@ -1299,19 +962,8 @@ def test_generate_env_file_appends_new_external_entries_after_existing_preserved
             "# Existing note",
             "EXTRA_EXISTING=omega",
         ],
+        env_values={"HOST": "0.0.0.0", "PORT": "9621"},
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-ENV_VALUES[PORT]="9621"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     marker_index = generated_lines.index(PRESERVED_HEADER)
     assert generated_lines[marker_index + 1] == PRESERVED_NOTICE
     assert generated_lines[marker_index + 2] == ""
@@ -1324,10 +976,10 @@ def test_generate_env_file_appends_multiple_new_external_entries_in_discovery_or
     tmp_path: Path,
 ) -> None:
     """Multiple new external entries should append after preserved payload in source order."""
-    write_text_lines(tmp_path / "env.example", ["HOST=0.0.0.0", "# PORT=9621"])
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=["HOST=0.0.0.0", "# PORT=9621"],
+        env_lines=[
             "HOST=127.0.0.1",
             "EXTRA_FIRST=one",
             "# Outside comment should not migrate",
@@ -1337,19 +989,8 @@ def test_generate_env_file_appends_multiple_new_external_entries_in_discovery_or
             "",
             "EXTRA_EXISTING=existing",
         ],
+        env_values={"HOST": "0.0.0.0", "PORT": "9621"},
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-ENV_VALUES[PORT]="9621"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     marker_index = generated_lines.index(PRESERVED_HEADER)
     assert "# Outside comment should not migrate" not in generated_lines
     assert generated_lines[marker_index + 3] == "EXTRA_EXISTING=existing"
@@ -1361,33 +1002,23 @@ def test_generate_env_file_keeps_commented_template_keys_inside_preserved_sectio
     tmp_path: Path,
 ) -> None:
     """Commented env vars already placed in preserved should survive even if the template declares them."""
-    write_text_lines(
-        tmp_path / "env.example",
-        ["HOST=0.0.0.0", "# PORT=9621", "# ENTITY_EXTRACTION_USE_JSON=true"],
-    )
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=[
+            "HOST=0.0.0.0",
+            "# PORT=9621",
+            "# ENTITY_EXTRACTION_USE_JSON=true",
+        ],
+        env_lines=[
             "HOST=127.0.0.1",
             PRESERVED_HEADER,
             PRESERVED_NOTICE,
             "",
             "# ENTITY_EXTRACTION_USE_JSON=true",
         ],
+        env_values={"HOST": "0.0.0.0", "PORT": "9621"},
+        passes=2,
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-ENV_VALUES[PORT]="9621"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     marker_index = generated_lines.index(PRESERVED_HEADER)
     assert generated_lines.count("# ENTITY_EXTRACTION_USE_JSON=true") == 2
     assert generated_lines[marker_index + 3] == "# ENTITY_EXTRACTION_USE_JSON=true"
@@ -1395,20 +1026,12 @@ generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
 
 def test_generate_env_file_recognizes_lowercase_extra_variables(tmp_path: Path) -> None:
     """Lowercase template-external variables should be preserved like uppercase ones."""
-    write_text_lines(tmp_path / "env.example", ["HOST=0.0.0.0", "# PORT=9621"])
-    write_text_lines(tmp_path / ".env", ["HOST=127.0.0.1", "workspace_name=demo"])
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-ENV_VALUES[PORT]="9621"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=["HOST=0.0.0.0", "# PORT=9621"],
+        env_lines=["HOST=127.0.0.1", "workspace_name=demo"],
+        env_values={"HOST": "0.0.0.0", "PORT": "9621"},
+    )
     assert PRESERVED_HEADER in generated_lines
     assert "workspace_name=demo" in generated_lines
 
@@ -1417,20 +1040,12 @@ def test_generate_env_file_recognizes_lowercase_commented_extra_variables(
     tmp_path: Path,
 ) -> None:
     """Lowercase commented env vars should create and survive in the preserved section."""
-    write_text_lines(tmp_path / "env.example", ["HOST=0.0.0.0", "# PORT=9621"])
-    write_text_lines(tmp_path / ".env", ["HOST=127.0.0.1", "# workspace_name=demo"])
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-ENV_VALUES[PORT]="9621"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=["HOST=0.0.0.0", "# PORT=9621"],
+        env_lines=["HOST=127.0.0.1", "# workspace_name=demo"],
+        env_values={"HOST": "0.0.0.0", "PORT": "9621"},
+    )
     assert PRESERVED_HEADER in generated_lines
     assert "# workspace_name=demo" in generated_lines
 
@@ -1439,26 +1054,11 @@ def test_generate_env_file_uses_template_preserved_block_when_env_missing(
     tmp_path: Path,
 ) -> None:
     """Missing `.env` should still produce the preserved block from env.example."""
-    write_text_lines(
-        tmp_path / "env.example",
-        [
-            "HOST=0.0.0.0",
-            PRESERVED_HEADER,
-            PRESERVED_NOTICE,
-            "### Template preserved comment",
-            "# template_example=true",
-        ],
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=_TEMPLATE_PRESERVED_EXAMPLE,
+        env_values={"HOST": "0.0.0.0"},
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-ENV_VALUES[HOST]="0.0.0.0"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     assert PRESERVED_HEADER in generated_lines
     assert PRESERVED_NOTICE in generated_lines
     assert generated_lines.count(PRESERVED_HEADER) == 1
@@ -1471,26 +1071,17 @@ def test_generate_env_file_keeps_template_separator_adjacent_to_preserved_header
     tmp_path: Path,
 ) -> None:
     """Injected template preserved blocks should not add a blank line after the copied separator."""
-    write_text_lines(
-        tmp_path / "env.example",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=[
             "HOST=0.0.0.0",
             "##########################################################################",
             PRESERVED_HEADER,
             PRESERVED_NOTICE,
             "### Template preserved comment",
         ],
+        env_values={"HOST": "0.0.0.0"},
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-ENV_VALUES[HOST]="0.0.0.0"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     header_index = generated_lines.index(PRESERVED_HEADER)
     assert (
         generated_lines[header_index - 1]
@@ -1502,19 +1093,10 @@ def test_generate_env_file_does_not_inject_template_payload_when_old_preserved_e
     tmp_path: Path,
 ) -> None:
     """Existing preserved blocks should stay authoritative over template preserved payload."""
-    write_text_lines(
-        tmp_path / "env.example",
-        [
-            "HOST=0.0.0.0",
-            PRESERVED_HEADER,
-            PRESERVED_NOTICE,
-            "### Template preserved comment",
-            "# template_example=true",
-        ],
-    )
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=_TEMPLATE_PRESERVED_EXAMPLE,
+        env_lines=[
             "HOST=127.0.0.1",
             "",
             PRESERVED_HEADER,
@@ -1522,18 +1104,8 @@ def test_generate_env_file_does_not_inject_template_payload_when_old_preserved_e
             "# Existing preserved comment",
             "EXTRA_OLD=1",
         ],
+        env_values={"HOST": "0.0.0.0"},
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     assert PRESERVED_HEADER in generated_lines
     assert PRESERVED_NOTICE in generated_lines
     assert "### Template preserved comment" not in generated_lines
@@ -1546,19 +1118,10 @@ def test_generate_env_file_keeps_old_preserved_lines_even_when_they_match_templa
     tmp_path: Path,
 ) -> None:
     """Old preserved content should not be removed just because it matches env.example."""
-    write_text_lines(
-        tmp_path / "env.example",
-        [
-            "HOST=0.0.0.0",
-            PRESERVED_HEADER,
-            PRESERVED_NOTICE,
-            "### Template preserved comment",
-            "# template_example=true",
-        ],
-    )
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=_TEMPLATE_PRESERVED_EXAMPLE,
+        env_lines=[
             "HOST=127.0.0.1",
             "",
             PRESERVED_HEADER,
@@ -1566,18 +1129,8 @@ def test_generate_env_file_keeps_old_preserved_lines_even_when_they_match_templa
             "# template_example=true",
             "EXTRA_OLD=1",
         ],
+        env_values={"HOST": "0.0.0.0"},
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     assert PRESERVED_HEADER in generated_lines
     assert PRESERVED_NOTICE in generated_lines
     assert "### Template preserved comment" in generated_lines
@@ -1589,10 +1142,10 @@ def test_generate_env_file_preserves_comments_before_active_template_keys_in_pre
     tmp_path: Path,
 ) -> None:
     """Comments in preserved should survive even when followed by active template-managed keys."""
-    write_text_lines(tmp_path / "env.example", ["HOST=0.0.0.0", "# PORT=9621"])
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=["HOST=0.0.0.0", "# PORT=9621"],
+        env_lines=[
             "HOST=127.0.0.1",
             PRESERVED_HEADER,
             PRESERVED_NOTICE,
@@ -1602,19 +1155,8 @@ def test_generate_env_file_preserves_comments_before_active_template_keys_in_pre
             "PORT=9999",
             "EXTRA_AFTER=1",
         ],
+        env_values={"HOST": "0.0.0.0", "PORT": "9621"},
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-ENV_VALUES[PORT]="9621"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     marker_index = generated_lines.index(PRESERVED_HEADER)
     assert (
         generated_lines[marker_index + 3]
@@ -1629,28 +1171,12 @@ def test_generate_env_file_appends_extra_variables_after_template_preserved_bloc
     tmp_path: Path,
 ) -> None:
     """Extras from old `.env` should append after the template preserved block when none existed before."""
-    write_text_lines(
-        tmp_path / "env.example",
-        [
-            "HOST=0.0.0.0",
-            PRESERVED_HEADER,
-            PRESERVED_NOTICE,
-            "### Template preserved comment",
-            "# template_example=true",
-        ],
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=_TEMPLATE_PRESERVED_EXAMPLE,
+        env_lines=["HOST=127.0.0.1", "EXTRA_NEW=1"],
+        env_values={"HOST": "0.0.0.0"},
     )
-    write_text_lines(tmp_path / ".env", ["HOST=127.0.0.1", "EXTRA_NEW=1"])
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     assert generated_lines[-3] == "### Template preserved comment"
     assert generated_lines[-2] == "# template_example=true"
     assert generated_lines[-1] == "EXTRA_NEW=1"
@@ -1660,28 +1186,12 @@ def test_generate_env_file_appends_commented_env_vars_after_template_preserved_b
     tmp_path: Path,
 ) -> None:
     """Commented env vars from old `.env` should append after the template preserved block when none existed before."""
-    write_text_lines(
-        tmp_path / "env.example",
-        [
-            "HOST=0.0.0.0",
-            PRESERVED_HEADER,
-            PRESERVED_NOTICE,
-            "### Template preserved comment",
-            "# template_example=true",
-        ],
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=_TEMPLATE_PRESERVED_EXAMPLE,
+        env_lines=["HOST=127.0.0.1", "# EXTRA_COMMENTED=1"],
+        env_values={"HOST": "0.0.0.0"},
     )
-    write_text_lines(tmp_path / ".env", ["HOST=127.0.0.1", "# EXTRA_COMMENTED=1"])
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-load_env_file "$REPO_ROOT/.env"
-ENV_VALUES[HOST]="0.0.0.0"
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     assert generated_lines[-3] == "### Template preserved comment"
     assert generated_lines[-2] == "# template_example=true"
     assert generated_lines[-1] == "# EXTRA_COMMENTED=1"
@@ -1691,24 +1201,16 @@ def test_generate_env_file_round_trips_dollar_signs_in_single_quoted_values(
     tmp_path: Path,
 ) -> None:
     """Quoted values containing `$` should survive generate/load cycles unchanged."""
-    env_example = tmp_path / "env.example"
-    env_example.write_text(
-        "\n".join(
-            [
-                "TOKEN_SECRET=placeholder",
-                "LIGHTRAG_API_KEY=placeholder",
-                "WEBUI_DESCRIPTION=placeholder",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_text_lines(
+        tmp_path / "env.example",
+        [
+            "TOKEN_SECRET=placeholder",
+            "LIGHTRAG_API_KEY=placeholder",
+            "WEBUI_DESCRIPTION=placeholder",
+        ],
     )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+    output = run_setup_bash(
+        """
 ENV_VALUES[TOKEN_SECRET]='abc$HOME'
 ENV_VALUES[LIGHTRAG_API_KEY]='plain$token'
 ENV_VALUES[WEBUI_DESCRIPTION]='value with "$PATH" and $HOME'
@@ -1717,10 +1219,12 @@ generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env"
 reset_state
 load_env_file "$REPO_ROOT/.env"
 
-printf 'TOKEN_SECRET=%s\\n' "${{ENV_VALUES[TOKEN_SECRET]}}"
-printf 'LIGHTRAG_API_KEY=%s\\n' "${{ENV_VALUES[LIGHTRAG_API_KEY]}}"
-printf 'WEBUI_DESCRIPTION=%s\\n' "${{ENV_VALUES[WEBUI_DESCRIPTION]}}\"
-""")
+printf 'TOKEN_SECRET=%s\\n' "${ENV_VALUES[TOKEN_SECRET]}"
+printf 'LIGHTRAG_API_KEY=%s\\n' "${ENV_VALUES[LIGHTRAG_API_KEY]}"
+printf 'WEBUI_DESCRIPTION=%s\\n' "${ENV_VALUES[WEBUI_DESCRIPTION]}"
+""",
+        tmp_path=tmp_path,
+    )
     values = parse_lines(output)
     generated_env = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "TOKEN_SECRET='abc$HOME'" in generated_env
@@ -1735,37 +1239,25 @@ def test_generate_env_file_avoids_double_quotes_for_compose_sensitive_strings(
     tmp_path: Path,
 ) -> None:
     """Setup output should avoid double quotes for affected string variables."""
-    env_example = tmp_path / "env.example"
-    env_example.write_text(
-        "\n".join(
-            [
-                "WEBUI_TITLE='My Graph KB'",
-                "WEBUI_DESCRIPTION='Simple and Fast Graph Based RAG System'",
-                "# AUTH_ACCOUNTS='admin:admin123,user1:{bcrypt}$2b$12$hash'",
-                "# LANGFUSE_SECRET_KEY=''",
-                "# LANGFUSE_PUBLIC_KEY=''",
-                "# LANGFUSE_HOST='https://cloud.langfuse.com'",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    generated_lines = _run_generate_env(
+        tmp_path,
+        template_lines=[
+            "WEBUI_TITLE='My Graph KB'",
+            "WEBUI_DESCRIPTION='Simple and Fast Graph Based RAG System'",
+            "# AUTH_ACCOUNTS='admin:admin123,user1:{bcrypt}$2b$12$hash'",
+            "# LANGFUSE_SECRET_KEY=''",
+            "# LANGFUSE_PUBLIC_KEY=''",
+            "# LANGFUSE_HOST='https://cloud.langfuse.com'",
+        ],
+        env_values={
+            "WEBUI_TITLE": "My Graph KB",
+            "WEBUI_DESCRIPTION": "Simple and Fast Graph Based RAG System",
+            "AUTH_ACCOUNTS": "admin:admin123,user1:pa$$word",
+            "LANGFUSE_SECRET_KEY": "sk-lf-secret",
+            "LANGFUSE_PUBLIC_KEY": "pk-lf-public",
+            "LANGFUSE_HOST": "https://langfuse.example",
+        },
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-ENV_VALUES[WEBUI_TITLE]='My Graph KB'
-ENV_VALUES[WEBUI_DESCRIPTION]='Simple and Fast Graph Based RAG System'
-ENV_VALUES[AUTH_ACCOUNTS]='admin:admin123,user1:pa$$word'
-ENV_VALUES[LANGFUSE_SECRET_KEY]='sk-lf-secret'
-ENV_VALUES[LANGFUSE_PUBLIC_KEY]='pk-lf-public'
-ENV_VALUES[LANGFUSE_HOST]='https://langfuse.example'
-
-generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
-""")
-    generated_lines = (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
     assert "WEBUI_TITLE='My Graph KB'" in generated_lines
     assert (
         "WEBUI_DESCRIPTION='Simple and Fast Graph Based RAG System'" in generated_lines
@@ -1789,22 +1281,12 @@ def test_generate_docker_compose_escapes_dollar_signs_in_overrides_and_service_s
     tmp_path: Path,
 ) -> None:
     """Compose generation should keep `$` literals in runtime overrides and bundled secrets."""
-    write_text_lines(
-        tmp_path / "docker-compose.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
-            "    env_file:",
-            "      - .env",
-        ],
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[*_MINIMAL_LIGHTRAG_COMPOSE, "    env_file:", "      - .env"],
+        compose_name="docker-compose.yml",
+        output_name="docker-compose.generated.yml",
+        extra_bash="""
 ENV_VALUES[MONGO_URI]='mongodb://user:p$HOME@localhost:27017/'
 ENV_VALUES[POSTGRES_USER]='user$ID'
 ENV_VALUES[POSTGRES_PASSWORD]='pass$HOME'
@@ -1818,11 +1300,7 @@ prepare_compose_runtime_overrides
 add_docker_service postgres
 add_docker_service neo4j
 add_docker_service milvus
-
-generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.generated.yml").read_text(
-        encoding="utf-8"
+""",
     )
     assert (
         'MONGO_URI: "mongodb://user:p$$HOME@host.docker.internal:27017/"'
@@ -1863,27 +1341,16 @@ def test_generate_docker_compose_postgres_image_follows_graph_storage(
 ) -> None:
     """PostgreSQL gets the pgvector image, except for a deployment kept on
     PGGraphStorage, which needs Apache AGE in it."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    result = _run_generate_compose(
+        tmp_path,
+        env_lines=[
             "LIGHTRAG_KV_STORAGE=PGKVStorage",
             f"LIGHTRAG_GRAPH_STORAGE={graph_storage}",
         ],
+        copy_env_example=True,
+        load_env=True,
+        extra_bash="add_docker_service postgres",
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-add_docker_service postgres
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     images = [
         line.split("image:", 1)[1].strip()
         for line in result.splitlines()
@@ -1896,28 +1363,16 @@ def test_generate_docker_compose_uses_template_images_even_with_old_env_override
     tmp_path: Path,
 ) -> None:
     """Managed services should be regenerated from templates instead of legacy image overrides."""
-    write_text_lines(
-        tmp_path / ".env",
-        [
+    result = _run_generate_compose(
+        tmp_path,
+        env_lines=[
             "POSTGRES_IMAGE=registry.example.com/postgres-for-rag:patched",
             "VLLM_EMBED_IMAGE_TAG=patched",
         ],
+        copy_env_example=True,
+        load_env=True,
+        extra_bash="add_docker_service postgres\nadd_docker_service vllm-embed",
     )
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-add_docker_service postgres
-add_docker_service vllm-embed
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "image: pgvector/pgvector:pg18-trixie" in result
     assert "image: vllm/vllm-openai-cpu:latest" in result
     assert "registry.example.com/postgres-for-rag:patched" not in result
@@ -1928,19 +1383,11 @@ def test_generate_docker_compose_preserves_long_form_named_sidecar_volumes(
     tmp_path: Path,
 ) -> None:
     """Managed-service regeneration must not misparse preserved long-form named volumes."""
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / ".env", ["LLM_BINDING=openai", "EMBEDDING_BINDING=openai"]
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        env_lines=["LLM_BINDING=openai", "EMBEDDING_BINDING=openai"],
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "  sidecar:",
             "    image: busybox",
             '    command: ["sleep", "infinity"]',
@@ -1951,17 +1398,10 @@ def test_generate_docker_compose_preserves_long_form_named_sidecar_volumes(
             "volumes:",
             "  sidecar_data:",
         ],
+        copy_env_example=True,
+        load_env=True,
+        extra_bash="add_docker_service postgres",
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-load_existing_env_if_present
-add_docker_service postgres
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "  sidecar_data:" in result
     assert "\n  source:\n" not in result
 
@@ -1970,19 +1410,11 @@ def test_generate_docker_compose_includes_all_atlas_local_mongodb_volumes(
     tmp_path: Path,
 ) -> None:
     """MongoDB Atlas Local should emit data, config, and mongot named volumes."""
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
+    result = _run_generate_compose(
+        tmp_path,
+        copy_env_example=True,
+        extra_bash="add_docker_service mongodb",
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-add_docker_service mongodb
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "hostname: mongodb" in result
     assert "image: mongodb/mongodb-atlas-local:" in result
     assert "mongo_data:/data/db" in result
@@ -1999,36 +1431,22 @@ def test_generate_docker_compose_injects_server_host_and_port_overrides(
     tmp_path: Path,
 ) -> None:
     """Generated compose should preserve variable-based host publishing and fix container bind values."""
-    compose_file = tmp_path / "docker-compose.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "    env_file:",
-                "      - .env",
-                "    ports:",
-                '      - "${PORT:-9621}:9621"',
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
+            "    env_file:",
+            "      - .env",
+            "    ports:",
+            '      - "${PORT:-9621}:9621"',
+        ],
+        compose_name="docker-compose.yml",
+        output_name="docker-compose.generated.yml",
+        extra_bash="""
 ENV_VALUES[HOST]="localhost"
 ENV_VALUES[PORT]="8080"
-
 prepare_compose_runtime_overrides
-generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.generated.yml").read_text(
-        encoding="utf-8"
+""",
     )
     assert 'HOST: "0.0.0.0"' in generated_compose
     assert 'PORT: "9621"' in generated_compose
@@ -2046,12 +1464,10 @@ def test_generate_docker_compose_keeps_the_port_mapping_inside_lightrag_before_a
     and wrote ``ports:`` inside ``networks:``. The result did not even parse as
     YAML, and the mapping was gone from lightrag.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    volumes:",
             "      - ./.env:/app/.env",
             "",
@@ -2059,17 +1475,8 @@ def test_generate_docker_compose_keeps_the_port_mapping_inside_lightrag_before_a
             "  backbone:",
             "    driver: bridge",
         ],
+        extra_bash="prepare_compose_runtime_overrides",
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-prepare_compose_runtime_overrides
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     parsed = yaml.safe_load(result)
     assert parsed["services"]["lightrag"]["ports"] == [
         "${HOST:-0.0.0.0}:${PORT:-9621}:9621"
@@ -2092,9 +1499,7 @@ def test_inject_lightrag_port_mapping_closes_an_existing_ports_block_at_any_top_
     write_text_lines(
         compose_file,
         [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    ports:",
             '      - "8000:8000"',
             "",
@@ -2103,12 +1508,9 @@ def test_inject_lightrag_port_mapping_closes_an_existing_ports_block_at_any_top_
             "    file: ./conf.txt",
         ],
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-
-inject_lightrag_port_mapping "{compose_file}" "9621:9621"
-""")
+    run_setup_bash(
+        f'inject_lightrag_port_mapping "{compose_file}" "9621:9621"', reset=False
+    )
     parsed = yaml.safe_load(compose_file.read_text(encoding="utf-8"))
     assert parsed["services"]["lightrag"]["ports"] == ["8000:8000", "9621:9621"]
     assert parsed["configs"] == {"myconf": {"file": "./conf.txt"}}
@@ -2128,20 +1530,15 @@ def test_inject_lightrag_port_mapping_does_not_end_the_service_on_a_comment(
     write_text_lines(
         compose_file,
         [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             f"{indent}# operator comment",
             "    ports:",
             '      - "8000:8000"',
         ],
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-
-inject_lightrag_port_mapping "{compose_file}" "9621:9621"
-""")
+    run_setup_bash(
+        f'inject_lightrag_port_mapping "{compose_file}" "9621:9621"', reset=False
+    )
     result = compose_file.read_text(encoding="utf-8")
     assert result.count("    ports:") == 1
     assert yaml.safe_load(result)["services"]["lightrag"]["ports"] == [
@@ -2163,20 +1560,16 @@ def test_inject_lightrag_bind_mounts_does_not_end_the_service_on_a_comment(
     write_text_lines(
         compose_file,
         [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             f"{indent}# operator comment",
             "    volumes:",
             "      - ./data:/app/data",
         ],
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-
-inject_lightrag_bind_mounts "{compose_file}" "./certs:/app/certs:ro"
-""")
+    run_setup_bash(
+        f'inject_lightrag_bind_mounts "{compose_file}" "./certs:/app/certs:ro"',
+        reset=False,
+    )
     result = compose_file.read_text(encoding="utf-8")
     assert result.count("    volumes:") == 1
     assert yaml.safe_load(result)["services"]["lightrag"]["volumes"] == [
@@ -2199,22 +1592,20 @@ def test_strip_and_inject_ports_stay_idempotent_across_a_comment_in_the_block(
     write_text_lines(
         compose_file,
         [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    ports:",
             '      - "80:80"',
             "# operator comment inside the ports block",
             f'      - "{mapping}"',
         ],
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-
+    run_setup_bash(
+        f"""
 _strip_lightrag_wizard_ports "{compose_file}"
 inject_lightrag_port_mapping "{compose_file}" '{mapping}'
-""")
+""",
+        reset=False,
+    )
     result = compose_file.read_text(encoding="utf-8")
     assert yaml.safe_load(result)["services"]["lightrag"]["ports"] == [
         "80:80",
@@ -2236,24 +1627,22 @@ def test_lightrag_environment_has_key_looks_past_a_comment(
     write_text_lines(
         compose_file,
         [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    environment:",
             f"{indent}# operator comment",
             '      UI_TEMPLATES_DIR: "/custom/ui_templates"',
         ],
     )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-
+    output = run_setup_bash(
+        f"""
 if _lightrag_environment_has_key "{compose_file}" "UI_TEMPLATES_DIR"; then
   echo "declared"
 else
   echo "absent"
 fi
-""")
+""",
+        reset=False,
+    )
     assert output.strip() == "declared"
 
 
@@ -2268,39 +1657,27 @@ def test_generate_docker_compose_injects_env_overrides_into_lightrag_not_after_m
     end-of-environment boundary and append overrides after it — which placed them outside
     the lightrag service once postgres/neo4j were merged in.
     """
-    compose_file = tmp_path / "docker-compose.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "    environment:",
-                "      EXISTING_KEY: existing_value",
-                "    volumes:",
-                "      - ./.env:/app/.env",
-                "volumes:",
-                "  some_volume:",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
+            "    environment:",
+            "      EXISTING_KEY: existing_value",
+            "    volumes:",
+            "      - ./.env:/app/.env",
+            "volumes:",
+            "  some_volume:",
+        ],
+        compose_name="docker-compose.yml",
+        output_name="docker-compose.generated.yml",
+        extra_bash="""
 ENV_VALUES[POSTGRES_USER]="lightrag"
 ENV_VALUES[POSTGRES_PASSWORD]="secret"
 ENV_VALUES[POSTGRES_DATABASE]="lightrag"
 add_docker_service "postgres"
 set_compose_override "LLM_BINDING_HOST" "http://host.docker.internal:11434"
-
-generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml\"
-""")
-    result = (tmp_path / "docker-compose.generated.yml").read_text(encoding="utf-8")
+""",
+    )
     lightrag_pos = result.index("  lightrag:")
     postgres_pos = result.index("  postgres:")
     override_pos = result.index('LLM_BINDING_HOST: "http://host.docker.internal:11434"')
@@ -2311,56 +1688,30 @@ def test_generate_docker_compose_vllm_gpu_honors_documented_gpu_selector(
     tmp_path: Path,
 ) -> None:
     """GPU vLLM compose should honor the documented CUDA selector variables."""
-    env_example = tmp_path / "env.example"
-    env_example.write_text(
-        "\n".join(
-            [
-                "# VLLM_RERANK_DEVICE=cuda",
-                "# CUDA_VISIBLE_DEVICES=-1",
-                "# NVIDIA_VISIBLE_DEVICES=all",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    write_text_lines(
+        tmp_path / "env.example",
+        [
+            "# VLLM_RERANK_DEVICE=cuda",
+            "# CUDA_VISIBLE_DEVICES=-1",
+            "# NVIDIA_VISIBLE_DEVICES=all",
+        ],
     )
-    compose_file = tmp_path / "docker-compose.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "    env_file:",
-                "      - .env",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[*_MINIMAL_LIGHTRAG_COMPOSE, "    env_file:", "      - .env"],
+        compose_name="docker-compose.yml",
+        output_name="docker-compose.generated.yml",
+        extra_bash="""
 ENV_VALUES[VLLM_RERANK_DEVICE]="cuda"
 ENV_VALUES[CUDA_VISIBLE_DEVICES]="0"
 add_docker_service "vllm-rerank"
-
 generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env"
-generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml\"
-""")
-    generated_env = (tmp_path / ".env").read_text(encoding="utf-8")
-    generated_compose = (tmp_path / "docker-compose.generated.yml").read_text(
-        encoding="utf-8"
+""",
     )
+    generated_env = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "CUDA_VISIBLE_DEVICES=0" in generated_env
     assert "NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}" in generated_compose
-    assert (
-        """      vllm-rerank:
-        condition: service_healthy"""
-        in generated_compose
-    )
+    assert "      vllm-rerank:\n        condition: service_healthy" in generated_compose
     assert "    healthcheck:" in generated_compose
     assert "VLLM_RERANK_PORT:-8000" in generated_compose
     assert 'grep -q ":$${PORT_HEX} "' in generated_compose
@@ -2377,27 +1728,13 @@ def test_generate_docker_compose_selects_milvus_template_from_device(
     tmp_path: Path, device: str, expected_image: str
 ) -> None:
     """Milvus compose generation should switch templates based on MILVUS_DEVICE."""
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.yml",
-        ["services:", "  lightrag:", "    image: example/lightrag:test"],
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-ENV_VALUES[MILVUS_DEVICE]="{device}"
-add_docker_service milvus
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=_MINIMAL_LIGHTRAG_COMPOSE,
+        compose_name="docker-compose.yml",
+        output_name="docker-compose.final.yml",
+        copy_env_example=True,
+        extra_bash=f'ENV_VALUES[MILVUS_DEVICE]="{device}"\nadd_docker_service milvus',
     )
     assert expected_image in generated_compose
 
@@ -2406,26 +1743,13 @@ def test_generate_docker_compose_pairs_dashboards_with_opensearch(
     tmp_path: Path,
 ) -> None:
     """Generating the opensearch service block must always emit a paired dashboards service so it remains under wizard management."""
-    write_text_lines(
-        tmp_path / "env.example",
-        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
-    )
-    write_text_lines(
-        tmp_path / "docker-compose.yml",
-        ["services:", "  lightrag:", "    image: example/lightrag:test"],
-    )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-add_docker_service opensearch
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
-        encoding="utf-8"
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=_MINIMAL_LIGHTRAG_COMPOSE,
+        compose_name="docker-compose.yml",
+        output_name="docker-compose.final.yml",
+        copy_env_example=True,
+        extra_bash="add_docker_service opensearch",
     )
     assert "  opensearch:" in generated_compose
     assert "  dashboards:" in generated_compose
@@ -2437,38 +1761,18 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
 def test_generate_docker_compose_omits_config_ini_mount_from_base_template(
     tmp_path: Path,
 ) -> None:
-    compose_file = tmp_path / "docker-compose.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "    volumes:",
-                "      - ./data/rag_storage:/app/data/rag_storage",
-                "      - ./data/inputs:/app/data/inputs",
-                "      - ./.env:/app/.env",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
+            "    volumes:",
+            "      - ./data/rag_storage:/app/data/rag_storage",
+            "      - ./data/inputs:/app/data/inputs",
+            "      - ./.env:/app/.env",
+        ],
+        compose_name="docker-compose.yml",
+        output_name="docker-compose.generated.yml",
     )
-
-    run_bash(
-        f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml"
-"""
-    )
-
-    generated_compose = (tmp_path / "docker-compose.generated.yml").read_text(
-        encoding="utf-8"
-    )
-
     assert "./config.ini:/app/config.ini" not in generated_compose
     assert "./data/rag_storage:/app/data/rag_storage" in generated_compose
     assert "./data/inputs:/app/data/inputs" in generated_compose
@@ -2478,37 +1782,17 @@ generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml"
 def test_generate_docker_compose_preserves_existing_config_ini_mount(
     tmp_path: Path,
 ) -> None:
-    compose_file = tmp_path / "docker-compose.final.yml"
-    compose_file.write_text(
-        "\n".join(
-            [
-                "services:",
-                "  lightrag:",
-                "    image: example/lightrag:test",
-                "    volumes:",
-                "      - ./data/rag_storage:/app/data/rag_storage",
-                "      - ./data/inputs:/app/data/inputs",
-                "      - ./config.ini:/app/config.ini",
-                "      - ./.env:/app/.env",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    generated_compose = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
+            "    volumes:",
+            "      - ./data/rag_storage:/app/data/rag_storage",
+            "      - ./data/inputs:/app/data/inputs",
+            "      - ./config.ini:/app/config.ini",
+            "      - ./.env:/app/.env",
+        ],
     )
-
-    run_bash(
-        f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml"
-"""
-    )
-
-    generated_compose = compose_file.read_text(encoding="utf-8")
-
     assert "./config.ini:/app/config.ini" in generated_compose
     assert "./data/rag_storage:/app/data/rag_storage" in generated_compose
     assert "./data/inputs:/app/data/inputs" in generated_compose
@@ -2524,26 +1808,15 @@ def test_generate_docker_compose_seeds_ui_templates_dir_with_the_container_path(
     so one file also serves a source run, and compose supplies the path that
     is correct inside the container.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    environment:",
             '      PORT: "9621"',
         ],
+        extra_bash='ENV_VALUES[UI_TEMPLATES_DIR]="./lightrag_webui/ui_templates"',
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-ENV_VALUES[UI_TEMPLATES_DIR]="./lightrag_webui/ui_templates"
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert '      UI_TEMPLATES_DIR: "/app/data/ui_templates"' in result
     assert "./lightrag_webui/ui_templates" not in result
     assert result.count("UI_TEMPLATES_DIR") == 1
@@ -2553,25 +1826,14 @@ def test_generate_docker_compose_preserves_an_empty_ui_templates_dir(
     tmp_path: Path,
 ) -> None:
     """An explicitly empty value is how a deployment turns the feature off."""
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    environment:",
             '      UI_TEMPLATES_DIR: ""',
         ],
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert '      UI_TEMPLATES_DIR: ""' in result
     assert result.count("UI_TEMPLATES_DIR") == 1
 
@@ -2592,27 +1854,16 @@ def test_generate_docker_compose_rewrites_a_wizard_managed_key_in_any_spelling(
     own, so the regenerated file declared the key twice and compose refused to
     load it at all.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    environment:",
             f'      {spelling.format(key="PORT")} "1234"',
             f'      {spelling.format(key="WORKING_DIR")} "/custom/rag"',
         ],
+        extra_bash="prepare_compose_env_overrides",
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-prepare_compose_env_overrides
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     environment = yaml.safe_load(result)["services"]["lightrag"]["environment"]
     # The wizard owns these two, so its values replace the stale ones -- and
     # each key appears exactly once, which is what YAML requires.
@@ -2647,19 +1898,15 @@ def test_read_service_environment_value_reads_any_key_spelling(
     write_text_lines(
         compose_file,
         [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    environment:",
             f'      {spelling.format(key="SSL_CERTFILE")} "/app/data/certs/mine.pem"',
         ],
     )
-    output = run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-
-read_service_environment_value "{compose_file}" "lightrag" "SSL_CERTFILE"
-""")
+    output = run_setup_bash(
+        f'read_service_environment_value "{compose_file}" "lightrag" "SSL_CERTFILE"',
+        reset=False,
+    )
     assert "/app/data/certs/mine.pem" in output
 
 
@@ -2673,25 +1920,14 @@ def test_generate_docker_compose_preserves_ui_templates_dir_in_any_spelling(
     rejects the file outright: ``mapping key "UI_TEMPLATES_DIR" already
     defined``.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    environment:",
             f'      {spelling.format(key="UI_TEMPLATES_DIR")} "/custom/ui_templates"',
         ],
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert (
         f'      {spelling.format(key="UI_TEMPLATES_DIR")} "/custom/ui_templates"'
         in result
@@ -2713,24 +1949,13 @@ def test_generate_docker_compose_preserves_a_valueless_list_ui_templates_dir(
     Presence, not a parsed value, is what blocks the seed — otherwise the
     generated file would carry the key twice, which compose rejects.
     """
-    write_text_lines(
-        tmp_path / "docker-compose.final.yml",
-        [
-            "services:",
-            "  lightrag:",
-            "    image: example/lightrag:test",
+    result = _run_generate_compose(
+        tmp_path,
+        compose_lines=[
+            *_MINIMAL_LIGHTRAG_COMPOSE,
             "    environment:",
             "      - UI_TEMPLATES_DIR",
         ],
     )
-    run_bash(f"""
-set -euo pipefail
-source "{REPO_ROOT}/scripts/setup/setup.sh"
-REPO_ROOT="{tmp_path}"
-reset_state
-
-generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
-    result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "      - UI_TEMPLATES_DIR\n" in result
     assert result.count("UI_TEMPLATES_DIR") == 1
