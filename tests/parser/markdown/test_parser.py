@@ -650,3 +650,76 @@ def test_textpack_utf16_text_is_decoded(tmp_path: Path):
         pack, parsed_dir=tmp_path / "p", asset_dir=tmp_path / "a", base_name="note"
     )
     assert blocks[0]["content"] == _MD_TEXT.strip()
+
+
+# ---------------------------------------------------------------------------
+# Routing + registry wiring for the native markdown engine
+# ---------------------------------------------------------------------------
+
+
+def test_textpack_and_md_in_upload_allowlist():
+    from lightrag.parser import registry
+
+    suffixes = registry.available_engine_suffixes()
+    assert "textpack" in suffixes
+    assert "md" in suffixes
+
+
+def test_get_parser_native_is_dispatcher():
+    from lightrag.parser import registry
+
+    parser = registry.get_parser("native")
+    assert type(parser).__name__ == "NativeParser"
+
+
+@pytest.mark.parametrize(
+    ("path", "rules", "expected"),
+    [
+        ("note.textpack", "", "native"),
+        ("doc.md", "", "legacy"),
+        ("doc.[native].md", "", "native"),
+        ("doc.md", "md:native", "native"),
+        ("report.docx", "", "legacy"),
+        # legacy cannot parse .textpack; the per-suffix default still wins.
+        ("note.textpack", "textpack:legacy", "native"),
+    ],
+    ids=[
+        "textpack-default",
+        "md-default",
+        "md-hint-native",
+        "md-rule-native",
+        "docx-default",
+        "textpack-fallback-from-legacy",
+    ],
+)
+def test_native_markdown_routing_defaults(path: str, rules: str, expected: str):
+    from lightrag.parser.routing import resolve_file_parser_directives
+
+    assert resolve_file_parser_directives(path, parser_rules=rules)[0] == expected
+
+
+def test_dispatcher_routes_by_suffix():
+    import asyncio
+
+    from lightrag.parser.native_dispatch import NativeParser
+
+    class _SentinelParser:
+        """Minimal async parser returning its fixed label."""
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def parse(self, ctx):
+            return self.name
+
+    def _dispatch(file_path: str) -> str:
+        dispatcher = NativeParser()
+        dispatcher._docx = _SentinelParser("docx")
+        dispatcher._markdown = _SentinelParser("markdown")
+        return asyncio.run(dispatcher.parse(SimpleNamespace(file_path=file_path)))
+
+    assert _dispatch("a.md") == "markdown"
+    assert _dispatch("a.textpack") == "markdown"
+    assert _dispatch("a.[native-iet].md") == "markdown"
+    assert _dispatch("a.docx") == "docx"
+    assert _dispatch("report.[native].docx") == "docx"

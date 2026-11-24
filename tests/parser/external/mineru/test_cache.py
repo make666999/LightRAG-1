@@ -1,23 +1,25 @@
-"""``*.mineru_raw/`` cache validation tests.
+"""``*.mineru_raw/`` cache validation and artifact-deletion tests.
 
 Covers every failure mode that triggers a re-download:
-
-- missing / malformed manifest
-- source file size mismatch (fast-path)
-- source file content_hash mismatch
-- parser options signature missing / mismatch
-- engine version / endpoint env mismatch
-- critical_file (content_list.json) size or sha256 mismatch
-- any non-critical file size mismatch
+- missing / malformed / non-UTF-8 / wrong-engine manifest
+- source file size mismatch (fast-path) and same-size content_hash mismatch
+- parser options signature missing / mismatch (local & official partitions)
+- engine version / api_mode / endpoint env mismatch
+- critical_file (content_list.json) missing / size / sha256 mismatch
+- auxiliary file missing / size mismatch
+- ``delete_file_variants_by_file_path`` cleanup of ``*.mineru_raw/`` bundles
 """
 
 from __future__ import annotations
 
 import json
+import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from lightrag.constants import PARSED_DIR_NAME
 from lightrag.parser.external.mineru import (
     Manifest,
     ManifestFile,
@@ -28,6 +30,19 @@ from lightrag.parser.external.mineru import (
 )
 from lightrag.parser.external.mineru.cache import current_mineru_options_signature
 from lightrag.parser.external.mineru.manifest import write_manifest
+
+# document_routes pulls in api.auth -> api.config.parse_args(); neutralize
+# pytest's argv during that first import and restore it immediately.
+_original_argv = sys.argv[:]
+sys.argv = sys.argv[:1]
+from lightrag.api.routers.document_routes import (  # noqa: E402
+    _file_path_for_parsed_artifact_dir,
+    delete_file_variants_by_file_path,
+)
+
+sys.argv = _original_argv
+
+pytestmark = pytest.mark.offline
 
 
 # ---------------------------------------------------------------------------
@@ -78,12 +93,18 @@ def fresh_bundle(tmp_path: Path, source_file: Path) -> tuple[Path, Manifest]:
     return raw, manifest
 
 
+def _edit_manifest(raw: Path, fn: Callable[[dict], None]) -> None:
+    mp = raw / "_manifest.json"
+    payload = json.loads(mp.read_text(encoding="utf-8"))
+    fn(payload)
+    mp.write_text(json.dumps(payload), encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Layout helpers
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.offline
 def test_raw_dir_naming(tmp_path: Path) -> None:
     parsed = tmp_path / "report.pdf.parsed"
     raw = raw_dir_for_parsed_dir(parsed)
@@ -92,11 +113,10 @@ def test_raw_dir_naming(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Validation: happy path + every individual failure mode
+# Validation: happy path, env compatibility, and mutation matrix
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.offline
 def test_is_bundle_valid_happy_path(
     fresh_bundle: tuple[Path, Manifest], source_file: Path
 ) -> None:
@@ -104,139 +124,191 @@ def test_is_bundle_valid_happy_path(
     assert is_bundle_valid(raw, source_file) is True
 
 
-@pytest.mark.offline
-def test_invalid_when_manifest_missing(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
+def _compat_engine_version_match(raw: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _edit_manifest(raw, lambda p: p.__setitem__("engine_version", "magic-pdf 1.5.4"))
+    monkeypatch.setenv("MINERU_ENGINE_VERSION", "magic-pdf 1.5.4")
+
+
+def _compat_engine_version_blank_manifest(
+    raw: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Blank manifest engine_version + non-blank env should NOT invalidate.
+    monkeypatch.setenv("MINERU_ENGINE_VERSION", "anything")
+
+
+def _compat_endpoint_trailing_slash(raw: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _update(p: dict) -> None:
+        p["api_mode"] = "local"
+        p["endpoint_signature"] = "http://old.example"
+
+    _edit_manifest(raw, _update)
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://old.example/")
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        pytest.param(_compat_engine_version_match, id="engine-version-match"),
+        pytest.param(
+            _compat_engine_version_blank_manifest, id="engine-version-blank-manifest"
+        ),
+        pytest.param(_compat_endpoint_trailing_slash, id="endpoint-trailing-slash"),
+    ],
+)
+def test_is_bundle_valid_env_compatibility(
+    fresh_bundle: tuple[Path, Manifest],
+    source_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setup: Callable[[Path, pytest.MonkeyPatch], None],
 ) -> None:
     raw, _ = fresh_bundle
+    setup(raw, monkeypatch)
+    assert is_bundle_valid(raw, source_file) is True
+
+
+def _mut_manifest_missing(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     (raw / "_manifest.json").unlink()
-    assert is_bundle_valid(raw, source_file) is False
 
 
-@pytest.mark.offline
-def test_invalid_when_manifest_malformed(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
+def _mut_manifest_malformed(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    raw, _ = fresh_bundle
     (raw / "_manifest.json").write_text("not json")
-    assert is_bundle_valid(raw, source_file) is False
 
 
-@pytest.mark.offline
-def test_invalid_when_manifest_not_utf8(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
+def _mut_manifest_not_utf8(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    raw, _ = fresh_bundle
     (raw / "_manifest.json").write_bytes(b"\xff\xfe")
-    assert is_bundle_valid(raw, source_file) is False
 
 
-@pytest.mark.offline
-def test_invalid_when_manifest_wrong_engine(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
+def _mut_manifest_wrong_engine(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    raw, _ = fresh_bundle
-    payload = json.loads((raw / "_manifest.json").read_text())
-    payload["engine"] = "docling"
-    (raw / "_manifest.json").write_text(json.dumps(payload))
-    assert is_bundle_valid(raw, source_file) is False
+    _edit_manifest(raw, lambda p: p.__setitem__("engine", "docling"))
 
 
-@pytest.mark.offline
-def test_invalid_when_source_size_changes(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
+def _mut_source_size_changes(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Append bytes to the source file — size diverges from manifest fast-path.
-    raw, _ = fresh_bundle
     with source_file.open("ab") as fh:
         fh.write(b"x")
-    assert is_bundle_valid(raw, source_file) is False
 
 
-@pytest.mark.offline
-def test_invalid_when_source_hash_changes_but_size_same(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
+def _mut_source_hash_same_size(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """In-place rewrite that preserves byte size but mutates content. The
-    fast-path passes but the full hash check catches it."""
-    raw, _ = fresh_bundle
     data = source_file.read_bytes()
-    # Flip first byte; keep length identical.
     mutated = bytes([data[0] ^ 0xFF]) + data[1:]
     assert len(mutated) == len(data)
     source_file.write_bytes(mutated)
-    assert is_bundle_valid(raw, source_file) is False
 
 
-@pytest.mark.offline
-def test_invalid_when_engine_version_mismatch(
-    fresh_bundle: tuple[Path, Manifest],
-    source_file: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def _mut_engine_version_mismatch(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    raw, _ = fresh_bundle
-    payload = json.loads((raw / "_manifest.json").read_text())
-    payload["engine_version"] = "magic-pdf 1.5.4"
-    (raw / "_manifest.json").write_text(json.dumps(payload))
+    _edit_manifest(raw, lambda p: p.__setitem__("engine_version", "magic-pdf 1.5.4"))
     monkeypatch.setenv("MINERU_ENGINE_VERSION", "magic-pdf 1.6.0")
-    assert is_bundle_valid(raw, source_file) is False
 
 
-@pytest.mark.offline
-def test_engine_version_match_passes(
-    fresh_bundle: tuple[Path, Manifest],
-    source_file: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def _mut_api_mode_mismatch(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    raw, _ = fresh_bundle
-    payload = json.loads((raw / "_manifest.json").read_text())
-    payload["engine_version"] = "magic-pdf 1.5.4"
-    (raw / "_manifest.json").write_text(json.dumps(payload))
-    monkeypatch.setenv("MINERU_ENGINE_VERSION", "magic-pdf 1.5.4")
-    assert is_bundle_valid(raw, source_file) is True
-
-
-@pytest.mark.offline
-def test_engine_version_skip_when_either_side_blank(
-    fresh_bundle: tuple[Path, Manifest],
-    source_file: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Blank manifest engine_version + non-blank env should NOT invalidate
-    (no signal from manifest); same for the reverse."""
-    raw, _ = fresh_bundle
-    # Manifest engine_version is empty by default.
-    monkeypatch.setenv("MINERU_ENGINE_VERSION", "anything")
-    assert is_bundle_valid(raw, source_file) is True
-
-
-@pytest.mark.offline
-def test_invalid_when_api_mode_mismatch(
-    fresh_bundle: tuple[Path, Manifest],
-    source_file: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    raw, _ = fresh_bundle
-    payload = json.loads((raw / "_manifest.json").read_text())
-    payload["api_mode"] = "local"
-    (raw / "_manifest.json").write_text(json.dumps(payload))
+    _edit_manifest(raw, lambda p: p.__setitem__("api_mode", "local"))
     monkeypatch.setenv("MINERU_API_MODE", "official")
     monkeypatch.setenv("MINERU_API_TOKEN", "token")
-    assert is_bundle_valid(raw, source_file) is False
 
 
-@pytest.mark.offline
-def test_invalid_when_options_signature_missing(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
+def _mut_options_signature_missing(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _edit_manifest(raw, lambda p: p.pop("options_signature", None))
+
+
+def _mut_endpoint_signature_mismatch(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _update(p: dict) -> None:
+        p["api_mode"] = "local"
+        p["endpoint_signature"] = "http://old.example"
+
+    _edit_manifest(raw, _update)
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://new.example")
+
+
+def _mut_critical_file_missing(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (raw / "content_list.json").unlink()
+
+
+def _mut_critical_file_size_changes(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cl = raw / "content_list.json"
+    cl.write_text(cl.read_text() + "/* extra */")
+
+
+def _mut_critical_file_hash_changes(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cl = raw / "content_list.json"
+    data = cl.read_text()
+    mutated = data[:-1] + "X"
+    assert len(mutated) == len(data)
+    cl.write_text(mutated)
+
+
+def _mut_aux_file_size_changes(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = raw / "images" / "img1.png"
+    p.write_bytes(p.read_bytes() + b"corruption")
+
+
+def _mut_aux_file_missing(
+    raw: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (raw / "images" / "img2.png").unlink()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(_mut_manifest_missing, id="manifest-missing"),
+        pytest.param(_mut_manifest_malformed, id="manifest-malformed"),
+        pytest.param(_mut_manifest_not_utf8, id="manifest-not-utf8"),
+        pytest.param(_mut_manifest_wrong_engine, id="manifest-wrong-engine"),
+        pytest.param(_mut_source_size_changes, id="source-size-changes"),
+        pytest.param(_mut_source_hash_same_size, id="source-hash-same-size"),
+        pytest.param(_mut_engine_version_mismatch, id="engine-version-mismatch"),
+        pytest.param(_mut_api_mode_mismatch, id="api-mode-mismatch"),
+        pytest.param(_mut_options_signature_missing, id="options-signature-missing"),
+        pytest.param(
+            _mut_endpoint_signature_mismatch, id="endpoint-signature-mismatch"
+        ),
+        pytest.param(_mut_critical_file_missing, id="critical-file-missing"),
+        pytest.param(_mut_critical_file_size_changes, id="critical-file-size-changes"),
+        pytest.param(_mut_critical_file_hash_changes, id="critical-file-hash-changes"),
+        pytest.param(_mut_aux_file_size_changes, id="aux-file-size-changes"),
+        pytest.param(_mut_aux_file_missing, id="aux-file-missing"),
+    ],
+)
+def test_is_bundle_valid_rejects_invalid_mutations(
+    fresh_bundle: tuple[Path, Manifest],
+    source_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate: Callable[[Path, Path, pytest.MonkeyPatch], None],
 ) -> None:
     raw, _ = fresh_bundle
-    payload = json.loads((raw / "_manifest.json").read_text())
-    payload.pop("options_signature", None)
-    (raw / "_manifest.json").write_text(json.dumps(payload))
+    mutate(raw, source_file, monkeypatch)
     assert is_bundle_valid(raw, source_file) is False
 
 
-@pytest.mark.offline
 @pytest.mark.parametrize(
     ("key", "value"),
     [
@@ -259,7 +331,6 @@ def test_invalid_when_local_parser_options_change(
     assert is_bundle_valid(raw, source_file) is False
 
 
-@pytest.mark.offline
 @pytest.mark.parametrize(
     ("key", "value"),
     [
@@ -278,11 +349,7 @@ def test_invalid_when_official_parser_options_change(
     key: str,
     value: str,
 ) -> None:
-    """Symmetric coverage for the official-mode partition of the signature.
-
-    Build a bundle whose ``options_signature`` reflects the official defaults,
-    sanity-check that it validates, then flip ``key`` and assert a cache miss.
-    """
+    """Symmetric coverage for the official-mode partition of the signature."""
     monkeypatch.setenv("MINERU_API_MODE", "official")
 
     raw = tmp_path / "src.mineru_raw"
@@ -311,96 +378,11 @@ def test_invalid_when_official_parser_options_change(
     assert is_bundle_valid(raw, source_file) is False
 
 
-@pytest.mark.offline
-def test_invalid_when_endpoint_signature_mismatch(
-    fresh_bundle: tuple[Path, Manifest],
-    source_file: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    raw, _ = fresh_bundle
-    payload = json.loads((raw / "_manifest.json").read_text())
-    payload["api_mode"] = "local"
-    payload["endpoint_signature"] = "http://old.example"
-    (raw / "_manifest.json").write_text(json.dumps(payload))
-    monkeypatch.setenv("MINERU_API_MODE", "local")
-    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://new.example")
-    assert is_bundle_valid(raw, source_file) is False
-
-
-@pytest.mark.offline
-def test_endpoint_signature_ignores_trailing_slash(
-    fresh_bundle: tuple[Path, Manifest],
-    source_file: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    raw, _ = fresh_bundle
-    payload = json.loads((raw / "_manifest.json").read_text())
-    payload["api_mode"] = "local"
-    payload["endpoint_signature"] = "http://old.example"
-    (raw / "_manifest.json").write_text(json.dumps(payload))
-    monkeypatch.setenv("MINERU_API_MODE", "local")
-    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://old.example/")
-    assert is_bundle_valid(raw, source_file) is True
-
-
-@pytest.mark.offline
-def test_invalid_when_critical_file_missing(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
-) -> None:
-    raw, _ = fresh_bundle
-    (raw / "content_list.json").unlink()
-    assert is_bundle_valid(raw, source_file) is False
-
-
-@pytest.mark.offline
-def test_invalid_when_critical_file_size_changes(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
-) -> None:
-    raw, _ = fresh_bundle
-    cl = raw / "content_list.json"
-    cl.write_text(cl.read_text() + "/* extra */")
-    assert is_bundle_valid(raw, source_file) is False
-
-
-@pytest.mark.offline
-def test_invalid_when_critical_file_hash_changes(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
-) -> None:
-    """Same size, different bytes. sha256 is the terminal check."""
-    raw, _ = fresh_bundle
-    cl = raw / "content_list.json"
-    data = cl.read_text()
-    mutated = data[:-1] + "X"  # swap last char; size preserved
-    assert len(mutated) == len(data)
-    cl.write_text(mutated)
-    assert is_bundle_valid(raw, source_file) is False
-
-
-@pytest.mark.offline
-def test_invalid_when_aux_file_size_changes(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
-) -> None:
-    raw, _ = fresh_bundle
-    p = raw / "images" / "img1.png"
-    p.write_bytes(p.read_bytes() + b"corruption")
-    assert is_bundle_valid(raw, source_file) is False
-
-
-@pytest.mark.offline
-def test_invalid_when_aux_file_missing(
-    fresh_bundle: tuple[Path, Manifest], source_file: Path
-) -> None:
-    raw, _ = fresh_bundle
-    (raw / "images" / "img2.png").unlink()
-    assert is_bundle_valid(raw, source_file) is False
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.offline
 def test_clear_dir_contents_preserves_directory(tmp_path: Path) -> None:
     d = tmp_path / "raw"
     d.mkdir()
@@ -412,7 +394,6 @@ def test_clear_dir_contents_preserves_directory(tmp_path: Path) -> None:
     assert list(d.iterdir()) == []
 
 
-@pytest.mark.offline
 def test_compute_size_and_hash_consistency(tmp_path: Path) -> None:
     """Both values describe the same byte stream."""
     p = tmp_path / "f.bin"
@@ -421,3 +402,88 @@ def test_compute_size_and_hash_consistency(tmp_path: Path) -> None:
     size, h = compute_size_and_hash(p)
     assert size == len(payload)
     assert h.startswith("sha256:") and len(h) == len("sha256:") + 64
+
+
+# ---------------------------------------------------------------------------
+# delete_file_variants_by_file_path cleanup of *.mineru_raw/ bundles
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_basename_recognizes_both_suffixes() -> None:
+    assert _file_path_for_parsed_artifact_dir("foo.pdf.parsed") == "foo.pdf"
+    assert _file_path_for_parsed_artifact_dir("foo.pdf.mineru_raw") == "foo.pdf"
+    assert _file_path_for_parsed_artifact_dir("foo.pdf.parsed_001") == "foo.pdf"
+    assert _file_path_for_parsed_artifact_dir("foo.pdf.mineru_raw_002") == "foo.pdf"
+    assert _file_path_for_parsed_artifact_dir("foo.parsed.bak") is None
+    assert _file_path_for_parsed_artifact_dir("notes.txt") is None
+
+
+def test_delete_file_variants_removes_parsed_and_mineru_raw(tmp_path: Path) -> None:
+    """Both sidecar dir and raw bundle dir should disappear in one call."""
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+    parsed_root = input_dir / PARSED_DIR_NAME
+    parsed_root.mkdir()
+
+    archived_source = parsed_root / "demo.pdf"
+    archived_source.write_bytes(b"PDFCONTENT")
+
+    parsed_dir = parsed_root / "demo.pdf.parsed"
+    parsed_dir.mkdir()
+    (parsed_dir / "demo.blocks.jsonl").write_text("{}\n")
+
+    raw_dir = parsed_root / "demo.pdf.mineru_raw"
+    raw_dir.mkdir()
+    (raw_dir / "_manifest.json").write_text("{}")
+    (raw_dir / "content_list.json").write_text("[]")
+    (raw_dir / "images").mkdir()
+    (raw_dir / "images" / "img.png").write_bytes(b"png")
+
+    deleted, errors = delete_file_variants_by_file_path(input_dir, file_path="demo.pdf")
+
+    assert errors == []
+    deleted_names = {Path(p).name for p in deleted}
+    assert "demo.pdf.parsed" in deleted_names
+    assert "demo.pdf.mineru_raw" in deleted_names
+    assert "demo.pdf" in deleted_names
+    assert not parsed_dir.exists()
+    assert not raw_dir.exists()
+    assert not archived_source.exists()
+
+
+def test_delete_file_variants_handles_only_raw_dir(tmp_path: Path) -> None:
+    """A raw bundle without a sidecar (aborted mid-parse) is still deleted."""
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+    parsed_root = input_dir / PARSED_DIR_NAME
+    parsed_root.mkdir()
+
+    raw_dir = parsed_root / "demo.pdf.mineru_raw"
+    raw_dir.mkdir()
+    (raw_dir / "_manifest.json").write_text("{}")
+
+    deleted, errors = delete_file_variants_by_file_path(input_dir, file_path="demo.pdf")
+    assert errors == []
+    assert any("demo.pdf.mineru_raw" in p for p in deleted)
+    assert not raw_dir.exists()
+
+
+def test_delete_file_variants_leaves_unrelated_dirs(tmp_path: Path) -> None:
+    """Directories that don't match the canonical filename are untouched."""
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+    parsed_root = input_dir / PARSED_DIR_NAME
+    parsed_root.mkdir()
+
+    target_raw = parsed_root / "demo.pdf.mineru_raw"
+    target_raw.mkdir()
+    other_raw = parsed_root / "other.pdf.mineru_raw"
+    other_raw.mkdir()
+    other_parsed = parsed_root / "other.pdf.parsed"
+    other_parsed.mkdir()
+
+    deleted, errors = delete_file_variants_by_file_path(input_dir, file_path="demo.pdf")
+    assert errors == []
+    assert not target_raw.exists()
+    assert other_raw.exists(), "siblings for a different basename must survive"
+    assert other_parsed.exists()

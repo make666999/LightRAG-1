@@ -22,13 +22,15 @@ from lightrag.parser.base import ParseContext, ParseResult
 from lightrag.parser.debug import build_debug_rag
 from lightrag.parser.registry import get_parser
 
+from tests.parser.docx._smart_heading_helpers import log_messages as _log_messages
+
 pytestmark = pytest.mark.offline
 
 
-@pytest.fixture(autouse=True)
-def _lightrag_records_reach_caplog(lightrag_caplog):
-    """Tests here assert on ``lightrag`` records through caplog."""
-    yield
+@pytest.fixture
+def clean_smart_heading_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DOCX_SMART_HEADING", raising=False)
+    monkeypatch.delenv("DOCX_SMART_HEADING_MAX_CHARS", raising=False)
 
 
 _STUB_BLOCKS = [
@@ -149,7 +151,9 @@ def test_wants_llm_bridge_gates_on_smart_heading() -> None:
     assert NativeMarkdownParser().wants_llm_bridge({"smart_heading": True}) is False
 
 
-def test_markdown_warns_and_ignores_params(tmp_path, monkeypatch, caplog) -> None:
+def test_markdown_warns_and_ignores_params(
+    tmp_path, monkeypatch, lightrag_caplog
+) -> None:
     """G0-3: a .md routed with smart_heading parses normally, warns once."""
     input_dir = tmp_path / "inputs"
     input_dir.mkdir()
@@ -159,7 +163,7 @@ def test_markdown_warns_and_ignores_params(tmp_path, monkeypatch, caplog) -> Non
     source_path.write_text("# Title\n\nSome body text.\n", encoding="utf-8")
 
     rag = build_debug_rag()
-    with caplog.at_level(logging.WARNING, logger="lightrag"):
+    with lightrag_caplog.at_level(logging.WARNING, logger="lightrag"):
         result = asyncio.run(
             get_parser("native").parse(
                 ParseContext(
@@ -179,7 +183,7 @@ def test_markdown_warns_and_ignores_params(tmp_path, monkeypatch, caplog) -> Non
         result.parse_warnings
         and result.parse_warnings.get("engine_params_ignored") == 1
     )
-    assert any("only apply to .docx" in rec.message for rec in caplog.records), (
+    assert any("only apply to .docx" in msg for msg in _log_messages(lightrag_caplog)), (
         "expected a warn-and-ignore log line"
     )
     # Parsing succeeded and the directive is still persisted verbatim.
@@ -187,7 +191,9 @@ def test_markdown_warns_and_ignores_params(tmp_path, monkeypatch, caplog) -> Non
     assert "Title" in rag.full_docs.data["doc-md"]["content"]
 
 
-def test_markdown_does_not_warn_on_falsy_param(tmp_path, monkeypatch, caplog) -> None:
+def test_markdown_does_not_warn_on_falsy_param(
+    tmp_path, monkeypatch, lightrag_caplog
+) -> None:
     """Review: a blanket opt-out (smart_heading=false) turned nothing on, so a
     .md routed through it must NOT emit the warn-and-ignore noise."""
     input_dir = tmp_path / "inputs"
@@ -198,7 +204,7 @@ def test_markdown_does_not_warn_on_falsy_param(tmp_path, monkeypatch, caplog) ->
     source_path.write_text("# Title\n\nSome body text.\n", encoding="utf-8")
 
     rag = build_debug_rag()
-    with caplog.at_level(logging.WARNING, logger="lightrag"):
+    with lightrag_caplog.at_level(logging.WARNING, logger="lightrag"):
         result = asyncio.run(
             get_parser("native").parse(
                 ParseContext(
@@ -215,7 +221,9 @@ def test_markdown_does_not_warn_on_falsy_param(tmp_path, monkeypatch, caplog) ->
         )
 
     assert not (result.parse_warnings or {}).get("engine_params_ignored")
-    assert not any("only apply to .docx" in rec.message for rec in caplog.records)
+    assert not any(
+        "only apply to .docx" in msg for msg in _log_messages(lightrag_caplog)
+    )
     assert "Title" in rag.full_docs.data["doc-md-off"]["content"]
 
 
@@ -492,3 +500,347 @@ def test_smart_audit_json_uses_lf_line_endings(
     assert b"parse_warnings" in raw  # the audit really was written
     assert b"\n" in raw
     assert b"\r\n" not in raw, "smart_audit.json was written with CRLF"
+
+
+# ---------------------------------------------------------------------------
+# DOCX_SMART_HEADING global default, directive seeding & startup validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param(None, False, id="unset-default-off"),
+        pytest.param("1", True, id="truthy-1"),
+        pytest.param("on", True, id="truthy-on"),
+        pytest.param("Yes", True, id="truthy-Yes"),
+        pytest.param("false", False, id="falsy-false"),
+    ],
+)
+def test_smart_heading_switch_parsing(
+    monkeypatch, clean_smart_heading_env, raw: str | None, expected: bool
+) -> None:
+    from lightrag.parser.routing import smart_heading_default_enabled
+
+    if raw is not None:
+        monkeypatch.setenv("DOCX_SMART_HEADING", raw)
+    assert smart_heading_default_enabled() is expected
+
+
+def test_smart_heading_switch_invalid_raises(
+    monkeypatch, clean_smart_heading_env
+) -> None:
+    from lightrag.parser.routing import (
+        ParserRoutingConfigError,
+        smart_heading_default_enabled,
+    )
+
+    monkeypatch.setenv("DOCX_SMART_HEADING", "maybe")
+    with pytest.raises(ParserRoutingConfigError, match="DOCX_SMART_HEADING"):
+        smart_heading_default_enabled()
+
+
+@pytest.mark.parametrize(
+    ("switch", "filename", "rules", "exp_engine", "exp_params", "exp_encoded"),
+    [
+        pytest.param(
+            "true",
+            "doc.[native].docx",
+            "",
+            "native",
+            {"smart_heading": True},
+            "native(smart_heading=true)",
+            id="seed-injected-native-docx",
+        ),
+        pytest.param(
+            None,
+            "doc.[native].docx",
+            "",
+            "native",
+            {},
+            "native",
+            id="switch-off-bare-encoding",
+        ),
+        pytest.param(
+            "true",
+            "notes.[native].md",
+            "",
+            "native",
+            {},
+            None,
+            id="not-injected-for-md",
+        ),
+        pytest.param(
+            "true",
+            "bundle.textpack",
+            "",
+            "native",
+            {},
+            None,
+            id="not-injected-for-textpack",
+        ),
+        pytest.param(
+            "true",
+            "doc.docx",
+            "",
+            "legacy",
+            {},
+            None,
+            id="not-injected-for-legacy-docx",
+        ),
+        pytest.param(
+            "true",
+            "doc.[native(smart_heading=false)].docx",
+            "",
+            "native",
+            {"smart_heading": False},
+            "native(smart_heading=false)",
+            id="hint-false-overrides-seed",
+        ),
+        pytest.param(
+            "true",
+            "doc.docx",
+            "docx:native(smart_heading=false)",
+            "native",
+            {"smart_heading": False},
+            None,
+            id="rule-false-overrides-seed",
+        ),
+    ],
+)
+def test_smart_heading_directive_seed_and_overrides(
+    monkeypatch,
+    clean_smart_heading_env,
+    switch: str | None,
+    filename: str,
+    rules: str,
+    exp_engine: str,
+    exp_params: dict[str, Any],
+    exp_encoded: str | None,
+) -> None:
+    from lightrag.parser.routing import encode_parse_engine, resolve_parser_directives
+
+    if switch is not None:
+        monkeypatch.setenv("DOCX_SMART_HEADING", switch)
+    d = resolve_parser_directives(filename, parser_rules=rules)
+    assert d.engine == exp_engine
+    assert d.engine_params == exp_params
+    if exp_encoded is not None:
+        assert encode_parse_engine(d.engine, d.engine_params) == exp_encoded
+
+
+@pytest.mark.parametrize(
+    ("switch", "engine", "initial", "filename", "expected"),
+    [
+        pytest.param(
+            "true",
+            "native",
+            {},
+            "a.docx",
+            {"smart_heading": True},
+            id="fills-native-docx",
+        ),
+        pytest.param(
+            "true",
+            "native",
+            {"smart_heading": False},
+            "a.docx",
+            {"smart_heading": False},
+            id="respects-explicit-false",
+        ),
+        pytest.param("true", "native", {}, "notes.md", {}, id="skips-non-docx"),
+        pytest.param("true", "mineru", {}, "a.docx", {}, id="skips-non-native"),
+        pytest.param(None, "native", {}, "a.docx", {}, id="noop-when-switch-off"),
+    ],
+)
+def test_seed_smart_heading_param_chokepoint(
+    monkeypatch,
+    clean_smart_heading_env,
+    switch: str | None,
+    engine: str,
+    initial: dict[str, Any],
+    filename: str,
+    expected: dict[str, Any],
+) -> None:
+    from lightrag.parser.routing import seed_smart_heading_param
+
+    if switch is not None:
+        monkeypatch.setenv("DOCX_SMART_HEADING", switch)
+    params = dict(initial)
+    seed_smart_heading_param(engine, params, filename)
+    assert params == expected
+
+
+@pytest.mark.parametrize(
+    ("switch", "max_chars", "rules", "missing_models"),
+    [
+        pytest.param(None, None, "", ["zh_core_web_sm"], id="disabled-silent"),
+        pytest.param(
+            None,
+            None,
+            "docx:native(smart_heading=false)",
+            ["zh_core_web_sm"],
+            id="rule-false-silent",
+        ),
+        pytest.param(
+            None,
+            None,
+            "md:native(smart_heading=true)",
+            ["zh_core_web_sm"],
+            id="non-docx-rule-silent",
+        ),
+        pytest.param("true", None, "", [], id="enabled-with-models-ok"),
+        pytest.param(None, "2", "", [], id="disabled-ignores-bad-max-chars"),
+    ],
+)
+def test_startup_dependency_check_passing_cases(
+    monkeypatch,
+    clean_smart_heading_env,
+    switch: str | None,
+    max_chars: str | None,
+    rules: str,
+    missing_models: list[str],
+) -> None:
+    from lightrag.parser.docx.smart_heading import nlp
+    from lightrag.parser.routing import validate_smart_heading_dependencies
+
+    if switch is not None:
+        monkeypatch.setenv("DOCX_SMART_HEADING", switch)
+    if max_chars is not None:
+        monkeypatch.setenv("DOCX_SMART_HEADING_MAX_CHARS", max_chars)
+    monkeypatch.setattr(nlp, "missing_spacy_models", lambda: list(missing_models))
+    validate_smart_heading_dependencies(parser_rules=rules)
+
+
+@pytest.mark.parametrize(
+    ("switch", "max_chars", "rules", "missing_models", "exc_kind", "match"),
+    [
+        pytest.param(
+            "true",
+            None,
+            "",
+            ["zh_core_web_sm"],
+            "nlp",
+            "zh_core_web_sm",
+            id="env-on-missing-models",
+        ),
+        pytest.param(
+            None,
+            None,
+            "docx:native(smart_heading=true)",
+            ["en_core_web_sm", "zh_core_web_sm"],
+            "nlp",
+            "lightrag-download-cache",
+            id="explicit-rule-missing-models",
+        ),
+        pytest.param(
+            None,
+            None,
+            "docx:native(smart_heading)",
+            ["zh_core_web_sm"],
+            "nlp",
+            "zh_core_web_sm",
+            id="bare-flag-rule-triggers",
+        ),
+        pytest.param(
+            None,
+            None,
+            "do*:native(smart_heading=true)",
+            ["zh_core_web_sm"],
+            "nlp",
+            "zh_core_web_sm",
+            id="wildcard-rule-triggers",
+        ),
+        pytest.param(
+            "treu",
+            None,
+            "",
+            [],
+            "config",
+            "DOCX_SMART_HEADING",
+            id="invalid-switch-surfaces",
+        ),
+        pytest.param(
+            "true",
+            "2",
+            "",
+            [],
+            "config",
+            "too small",
+            id="enabled-validates-max-chars",
+        ),
+    ],
+)
+def test_startup_dependency_check_error_cases(
+    monkeypatch,
+    clean_smart_heading_env,
+    switch: str | None,
+    max_chars: str | None,
+    rules: str,
+    missing_models: list[str],
+    exc_kind: str,
+    match: str,
+) -> None:
+    from lightrag.parser.docx.smart_heading import nlp
+    from lightrag.parser.routing import (
+        ParserRoutingConfigError,
+        validate_smart_heading_dependencies,
+    )
+
+    if switch is not None:
+        monkeypatch.setenv("DOCX_SMART_HEADING", switch)
+    if max_chars is not None:
+        monkeypatch.setenv("DOCX_SMART_HEADING_MAX_CHARS", max_chars)
+    monkeypatch.setattr(nlp, "missing_spacy_models", lambda: list(missing_models))
+
+    exc_type = nlp.SmartHeadingNLPError if exc_kind == "nlp" else ParserRoutingConfigError
+    with pytest.raises(exc_type, match=match):
+        validate_smart_heading_dependencies(parser_rules=rules)
+
+
+def test_missing_spacy_models_probes(monkeypatch) -> None:
+    from lightrag.parser.docx.smart_heading import nlp
+
+    real_find_spec = nlp.importlib.util.find_spec
+    monkeypatch.setattr(
+        nlp.importlib.util,
+        "find_spec",
+        lambda name, *a, **k: (
+            None if name == "spacy" else real_find_spec(name, *a, **k)
+        ),
+    )
+    assert nlp.missing_spacy_models() == ["en_core_web_sm", "zh_core_web_sm"]
+
+
+def test_missing_spacy_models_reports_uninstalled(monkeypatch) -> None:
+    from lightrag.parser.docx.smart_heading import nlp
+
+    spacy_util = pytest.importorskip("spacy.util")
+    monkeypatch.setattr(spacy_util, "is_package", lambda name: name == "en_core_web_sm")
+    assert nlp.missing_spacy_models() == ["zh_core_web_sm"]
+
+
+def test_max_chars_env_validation(monkeypatch, clean_smart_heading_env) -> None:
+    from lightrag.parser import routing
+    from lightrag.parser.routing import (
+        ParserRoutingConfigError,
+        _validate_smart_heading_max_chars,
+    )
+
+    # Unset and sane values pass silently.
+    _validate_smart_heading_max_chars()
+    for good in ("180", "90", "300"):
+        monkeypatch.setenv("DOCX_SMART_HEADING_MAX_CHARS", good)
+        _validate_smart_heading_max_chars()
+
+    # Usable-but-tiny cap warns without raising.
+    calls: list = []
+    monkeypatch.setattr(routing.logger, "warning", lambda *a, **k: calls.append(a))
+    monkeypatch.setenv("DOCX_SMART_HEADING_MAX_CHARS", "50")
+    _validate_smart_heading_max_chars()
+    assert calls, "expected a warning for a below-title-width cap"
+
+    # Non-integer value raises ParserRoutingConfigError.
+    monkeypatch.setenv("DOCX_SMART_HEADING_MAX_CHARS", "1.5")
+    with pytest.raises(ParserRoutingConfigError, match="DOCX_SMART_HEADING_MAX_CHARS"):
+        _validate_smart_heading_max_chars()

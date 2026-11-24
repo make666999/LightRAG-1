@@ -1,17 +1,18 @@
-"""Tests for ``lightrag/parser/external/docling/cache.py``.
+"""Tests for ``lightrag/parser/external/docling/cache.py`` and ``manifest.py``.
 
-Covers the cache-miss conditions enumerated in the module docstring:
-
+Covers the cache-miss conditions and manifest JSON selection contract:
 - missing / malformed / wrong-engine manifest
 - source size or hash mismatch
-- engine_version / endpoint_signature env mismatch
-- options_signature env mismatch
-- critical-file size / sha256 mismatch
-- non-critical file size mismatch
+- engine_version / endpoint_signature / options_signature env mismatch
+- critical-file sha256 mismatch and non-critical file size mismatch
+- legacy unsigned bundle handling under overrides / VLM pipeline
+- ``select_main_json`` preferred-path and fallback filtering around ``_manifest.json``
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from lightrag.parser.external.docling.cache import (
     snapshot_tunable_env,
 )
 from lightrag.parser.external.docling.client import FIXED_CONSTANTS
+from lightrag.parser.external.docling.manifest import select_main_json
 
 
 pytestmark = pytest.mark.offline
@@ -113,62 +115,111 @@ def test_is_bundle_valid_happy_path(tmp_path: Path, source_file: Path) -> None:
     assert is_bundle_valid(raw, source_file) is True
 
 
-def test_is_bundle_valid_missing_dir(tmp_path: Path, source_file: Path) -> None:
-    assert is_bundle_valid(tmp_path / "ghost", source_file) is False
+def _mut_missing_dir(
+    tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    return tmp_path / "ghost"
 
 
-def test_is_bundle_valid_missing_manifest(tmp_path: Path, source_file: Path) -> None:
+def _mut_missing_manifest(
+    tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     raw = tmp_path / "src.docling_raw"
     raw.mkdir()
     (raw / "src.json").write_text("{}")
-    assert is_bundle_valid(raw, source_file) is False
+    return raw
 
 
-def test_is_bundle_valid_manifest_not_utf8(tmp_path: Path, source_file: Path) -> None:
+def _mut_manifest_not_utf8(
+    tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     raw = _build_valid_bundle(tmp_path, source_file)
     (raw / "_manifest.json").write_bytes(b"\xff\xfe")
-    assert is_bundle_valid(raw, source_file) is False
+    return raw
 
 
-def test_is_bundle_valid_wrong_engine(tmp_path: Path, source_file: Path) -> None:
+def _mut_wrong_engine(
+    tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     raw = _build_valid_bundle(tmp_path, source_file)
     manifest_path = raw / "_manifest.json"
     data = manifest_path.read_text(encoding="utf-8")
     manifest_path.write_text(data.replace('"docling"', '"mineru"'), encoding="utf-8")
-    assert is_bundle_valid(raw, source_file) is False
+    return raw
 
 
-def test_is_bundle_valid_source_size_mismatch(
-    tmp_path: Path, source_file: Path
-) -> None:
+def _mut_source_size(
+    tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     raw = _build_valid_bundle(tmp_path, source_file)
     source_file.write_bytes(source_file.read_bytes() + b"!")
-    assert is_bundle_valid(raw, source_file) is False
+    return raw
 
 
-def test_is_bundle_valid_source_hash_mismatch(
-    tmp_path: Path, source_file: Path
-) -> None:
-    raw = _build_valid_bundle(tmp_path, source_file)
-    # Replace contents with same length but different bytes
-    new = b"Y" * source_file.stat().st_size
-    source_file.write_bytes(new)
-    assert is_bundle_valid(raw, source_file) is False
-
-
-def test_is_bundle_valid_endpoint_change(
+def _mut_source_hash_same_size(
     tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> Path:
+    raw = _build_valid_bundle(tmp_path, source_file)
+    source_file.write_bytes(b"Y" * source_file.stat().st_size)
+    return raw
+
+
+def _mut_endpoint_change(
+    tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     raw = _build_valid_bundle(tmp_path, source_file)
     monkeypatch.setenv("DOCLING_ENDPOINT", "http://other:5001")
-    assert is_bundle_valid(raw, source_file) is False
+    return raw
 
 
-def test_is_bundle_valid_options_signature_change(
+def _mut_options_signature(
     tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> Path:
     raw = _build_valid_bundle(tmp_path, source_file)
     monkeypatch.setenv("DOCLING_FORCE_OCR", "false")
+    return raw
+
+
+def _mut_critical_file_corrupt(
+    tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    raw = _build_valid_bundle(tmp_path, source_file)
+    # Same length, different bytes — defeats size check, sha256 must catch it.
+    current = (raw / "src.json").read_bytes()
+    (raw / "src.json").write_bytes(b"X" * len(current))
+    return raw
+
+
+def _mut_other_file_size(
+    tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    raw = _build_valid_bundle(tmp_path, source_file)
+    (raw / "src.md").write_text("totally different content here that is longer")
+    return raw
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(_mut_missing_dir, id="missing-dir"),
+        pytest.param(_mut_missing_manifest, id="missing-manifest"),
+        pytest.param(_mut_manifest_not_utf8, id="manifest-not-utf8"),
+        pytest.param(_mut_wrong_engine, id="wrong-engine"),
+        pytest.param(_mut_source_size, id="source-size-mismatch"),
+        pytest.param(_mut_source_hash_same_size, id="source-hash-mismatch"),
+        pytest.param(_mut_endpoint_change, id="endpoint-change"),
+        pytest.param(_mut_options_signature, id="options-signature-change"),
+        pytest.param(_mut_critical_file_corrupt, id="critical-file-corrupt"),
+        pytest.param(_mut_other_file_size, id="other-file-size-mismatch"),
+    ],
+)
+def test_is_bundle_valid_rejects_invalid_mutations(
+    tmp_path: Path,
+    source_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate: Callable[[Path, Path, pytest.MonkeyPatch], Path],
+) -> None:
+    raw = mutate(tmp_path, source_file, monkeypatch)
     assert is_bundle_valid(raw, source_file) is False
 
 
@@ -177,9 +228,7 @@ def test_is_bundle_valid_legacy_bundle_misses_with_overrides(
 ) -> None:
     # A legacy bundle predating signature recording (empty options_signature)
     # is leniently accepted with no overrides, but a per-file override
-    # (docling(force_ocr=...)) must force a miss — we cannot prove the bundle
-    # was produced with that override, and silently reusing it would drop the
-    # user's explicit param. Mirrors MinerU, which misses on any absent sig.
+    # (docling(force_ocr=...)) must force a miss.
     raw = _build_valid_bundle(tmp_path, source_file, options_signature="")
     assert is_bundle_valid(raw, source_file) is True
     assert is_bundle_valid(raw, source_file, overrides={"force_ocr": False}) is False
@@ -189,10 +238,7 @@ def test_is_bundle_valid_legacy_bundle_misses_with_overrides(
 def test_is_bundle_valid_legacy_bundle_misses_under_vlm_pipeline(
     tmp_path: Path, source_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # An unsigned legacy bundle can only come from the standard pipeline (every
-    # VLM bundle records a signature). Reusing it under DOCLING_PIPELINE=vlm
-    # would rebuild the sidecar from OCR output and never call the requested
-    # VLM model, so it must miss; under standard it keeps its lenient hit.
+    # An unsigned legacy bundle can only come from the standard pipeline.
     raw = _build_valid_bundle(tmp_path, source_file, options_signature="")
     assert is_bundle_valid(raw, source_file) is True
     monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
@@ -205,45 +251,67 @@ def test_is_bundle_valid_legacy_bundle_misses_under_vlm_pipeline(
 def test_is_bundle_valid_fixed_constants_code_change(
     tmp_path: Path, source_file: Path
 ) -> None:
-    # Simulate a code-only change to one of the fixed pipeline constants
-    # (e.g. image_export_mode flipped from "referenced" to "embedded"
-    # between parse time and validation time). The manifest stores both
-    # the stale constants and a signature computed from them; validation
-    # must compare against current FIXED_CONSTANTS and miss, not against
-    # the manifest's own copy (which would always match).
+    # Validation must compare against current FIXED_CONSTANTS, never rehydrate
+    # stale constants from the manifest's own extras.
     stale_constants = {**FIXED_CONSTANTS, "image_export_mode": "embedded"}
     stale_signature = compute_options_signature(
         tunable_env=snapshot_tunable_env(),
         fixed_constants=stale_constants,
     )
     raw = _build_valid_bundle(tmp_path, source_file, options_signature=stale_signature)
-    # Overwrite the manifest's extras to record the stale constants too —
-    # this is the bug surface: if validation rehydrated from extras, it
-    # would reproduce stale_signature and falsely accept the bundle.
-    import json as _json
-
     mp = raw / "_manifest.json"
-    data = _json.loads(mp.read_text(encoding="utf-8"))
+    data = json.loads(mp.read_text(encoding="utf-8"))
     data["extras"] = {"fixed_constants": stale_constants}
-    mp.write_text(_json.dumps(data), encoding="utf-8")
+    mp.write_text(json.dumps(data), encoding="utf-8")
 
     assert is_bundle_valid(raw, source_file) is False
 
 
-def test_is_bundle_valid_critical_file_corrupt(
-    tmp_path: Path, source_file: Path
+# ---------------------------------------------------------------------------
+# Manifest main-JSON selection (lightrag/parser/external/docling/manifest.py)
+# ---------------------------------------------------------------------------
+
+
+def _touch(path: Path, content: str = "{}") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("source_name", "expected_name"),
+    [
+        pytest.param("report.pdf", "report.json", id="preferred-path-hits"),
+        pytest.param("other.pdf", "report.json", id="fallback-ignores-manifest"),
+    ],
+)
+def test_select_main_json_resolves_bundle_json(
+    tmp_path: Path, source_name: str, expected_name: str
 ) -> None:
-    raw = _build_valid_bundle(tmp_path, source_file)
-    # Corrupt the JSON: same length, different bytes — defeats size check,
-    # so the sha256 path must catch it.
-    current = (raw / "src.json").read_bytes()
-    (raw / "src.json").write_bytes(b"X" * len(current))
-    assert is_bundle_valid(raw, source_file) is False
+    _touch(tmp_path / "report.json")
+    _touch(tmp_path / "_manifest.json", '{"engine":"docling"}')
+    assert select_main_json(tmp_path, Path(source_name)) == tmp_path / expected_name
 
 
-def test_is_bundle_valid_other_file_size_mismatch(
-    tmp_path: Path, source_file: Path
+@pytest.mark.parametrize(
+    ("extra_files", "source_name", "error_match"),
+    [
+        pytest.param((), "report.pdf", "contains no .json file", id="only-manifest"),
+        pytest.param(
+            ("report.json", "extra.json"),
+            "other.pdf",
+            "multiple .json candidates",
+            id="real-ambiguity",
+        ),
+    ],
+)
+def test_select_main_json_errors(
+    tmp_path: Path,
+    extra_files: tuple[str, ...],
+    source_name: str,
+    error_match: str,
 ) -> None:
-    raw = _build_valid_bundle(tmp_path, source_file)
-    (raw / "src.md").write_text("totally different content here that is longer")
-    assert is_bundle_valid(raw, source_file) is False
+    for name in extra_files:
+        _touch(tmp_path / name)
+    _touch(tmp_path / "_manifest.json", '{"engine":"docling"}')
+    with pytest.raises(RuntimeError, match=error_match):
+        select_main_json(tmp_path, Path(source_name))

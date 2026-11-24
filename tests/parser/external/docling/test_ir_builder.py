@@ -1170,3 +1170,51 @@ def test_docling_adapter_kv_form_items_audit_in_split_option(tmp_path: Path) -> 
     ir = DoclingIRBuilder().normalize_from_workdir(raw_dir, document_name="demo.pdf")
     extras = ir.split_option["docling_extras"]
     assert extras == {"key_value_items": 2, "form_items": 1}
+
+
+# ---------------------------------------------------------------------------
+# 13. DoclingParser.validate_ir zero-block failure + VLM hint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("pipeline_env", "vlm_preset", "expect_vlm_hint"),
+    [
+        pytest.param(None, None, False, id="standard-default"),
+        pytest.param("vlm", "minicpm_ocr", True, id="vlm-names-pipeline"),
+        pytest.param("fast", None, False, id="invalid-pipeline-still-zero-blocks"),
+    ],
+)
+def test_docling_validate_ir_zero_blocks_vlm_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pipeline_env: str | None,
+    vlm_preset: str | None,
+    expect_vlm_hint: bool,
+) -> None:
+    from lightrag.parser.external.docling.parser import DoclingParser
+    from lightrag.sidecar.ir import IRDoc
+
+    if pipeline_env is None:
+        monkeypatch.delenv("DOCLING_PIPELINE", raising=False)
+    else:
+        monkeypatch.setenv("DOCLING_PIPELINE", pipeline_env)
+    if vlm_preset is not None:
+        monkeypatch.setenv("DOCLING_VLM_PRESET", vlm_preset)
+
+    empty_ir = IRDoc(
+        document_name="scan.pdf",
+        document_format="pdf",
+        doc_title="",
+        split_option={},
+        blocks=[],
+    )
+    with pytest.raises(ValueError, match="zero blocks") as excinfo:
+        DoclingParser().validate_ir(empty_ir, file_path="scan.pdf", raw_dir=tmp_path)
+
+    message = str(excinfo.value)
+    assert "DOCLING_SERVE_ALLOWED_VLM_PRESETS" not in message
+    if expect_vlm_hint:
+        assert "DOCLING_PIPELINE=vlm" in message
+    else:
+        assert "VLM" not in message
