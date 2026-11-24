@@ -237,33 +237,55 @@ class TestVerifySourceSide:
         assert report.unexpected_node_ids == ["stray"]
         assert report.unexpected_edges == [("a", "stray")]
 
-    def test_edge_property_mismatch(self):
+    @pytest.mark.parametrize(
+        "kind, expected",
+        [
+            pytest.param(
+                "edge_value",
+                [("a", "b", {"weight": 1.0}, {"weight": 99.0})],
+                id="edge_value",
+            ),
+            pytest.param(
+                "node_value",
+                [
+                    (
+                        "a",
+                        {"entity_id": "a", "entity_type": "person"},
+                        {"entity_id": "a", "entity_type": "MUTATED"},
+                    )
+                ],
+                id="node_value",
+            ),
+            pytest.param("node_type_strict", ["a"], id="node_type_strict"),
+            pytest.param("edge_type_strict", [("a", "c")], id="edge_type_strict"),
+        ],
+    )
+    def test_property_mismatch(self, kind, expected):
         source_nodes, source_edges, target_nodes, target_edges = self._clean_migration()
-        target_edges[0] = _edge("a", "b", weight=99.0)
-        report = verify_source_side(
-            source_nodes, source_edges, target_nodes, target_edges
-        )
-        assert not report.ok
-        assert len(report.edge_property_mismatches) == 1
-        key, src_props, tgt_props = report.edge_property_mismatches[0]
-        assert key == ("a", "b")
-        assert src_props == {"weight": 1.0}
-        assert tgt_props == {"weight": 99.0}
+        if kind == "edge_value":
+            target_edges[0] = _edge("a", "b", weight=99.0)
+        elif kind == "node_value":
+            target_nodes[0] = {"id": "a", "entity_id": "a", "entity_type": "MUTATED"}
+        elif kind == "node_type_strict":
+            source_nodes[0]["flag"] = True
+            target_nodes[0]["flag"] = 1
+        elif kind == "edge_type_strict":
+            target_edges[1] = _edge("a", "c", weight=2)  # source has 2.0
 
-    def test_node_property_mismatch(self):
-        source_nodes, source_edges, target_nodes, target_edges = self._clean_migration()
-        target_nodes[0] = {"id": "a", "entity_id": "a", "entity_type": "MUTATED"}
         report = verify_source_side(
             source_nodes, source_edges, target_nodes, target_edges
         )
         assert not report.ok
-        assert report.node_property_mismatches == [
-            (
-                "a",
-                {"entity_id": "a", "entity_type": "person"},
-                {"entity_id": "a", "entity_type": "MUTATED"},
-            )
-        ]
+        if kind == "edge_value":
+            key, src_props, tgt_props = report.edge_property_mismatches[0]
+            assert len(report.edge_property_mismatches) == 1
+            assert (key[0], key[1], src_props, tgt_props) == expected[0]
+        elif kind == "node_value":
+            assert report.node_property_mismatches == expected
+        elif kind == "node_type_strict":
+            assert [m[0] for m in report.node_property_mismatches] == expected
+        else:
+            assert [m[0] for m in report.edge_property_mismatches] == expected
 
     def test_parallel_source_rows_fail_verification_in_both_orders(self):
         # Regression: parallel source rows [a->b w=1, a->b w=2] against a
@@ -313,46 +335,29 @@ class TestVerifySourceSide:
         assert report_fwd == report_rev
         assert not report_fwd.ok
 
-    def test_type_strict_node_property_mismatch(self):
+    @pytest.mark.parametrize(
+        "violation",
+        ["duplicate_node", "equal_reciprocal"],
+    )
+    def test_source_invariant_violation_reported_even_with_equal_payload(
+        self, violation
+    ):
+        """Verify runs the same fail-closed detectors as the plan phase, even
+        when duplicate rows or reciprocals carry byte-equal payloads."""
         source_nodes, source_edges, target_nodes, target_edges = self._clean_migration()
-        source_nodes[0]["flag"] = True
-        target_nodes[0]["flag"] = 1  # dict == would coerce; must be flagged
-        report = verify_source_side(
-            source_nodes, source_edges, target_nodes, target_edges
-        )
-        assert not report.ok
-        assert [m[0] for m in report.node_property_mismatches] == ["a"]
+        if violation == "duplicate_node":
+            source_nodes = source_nodes + [dict(source_nodes[0])]
+        else:
+            source_edges = source_edges + [_edge("b", "a", weight=1.0)]
 
-    def test_type_strict_edge_property_mismatch(self):
-        source_nodes, source_edges, target_nodes, target_edges = self._clean_migration()
-        target_edges[1] = _edge("a", "c", weight=2)  # source has 2.0
         report = verify_source_side(
             source_nodes, source_edges, target_nodes, target_edges
         )
         assert not report.ok
-        assert [m[0] for m in report.edge_property_mismatches] == [("a", "c")]
-
-    def test_duplicate_node_id_reported_even_with_equal_payload(self):
-        # Verify runs the SAME detectors as the plan phase, so a duplicate id
-        # fails it whether or not the payloads agree — per-id maps are
-        # last-write-wins on both sides, so only the raw enumeration can show
-        # that two source rows became one.
-        source_nodes, source_edges, target_nodes, target_edges = self._clean_migration()
-        source_nodes = source_nodes + [dict(source_nodes[0])]  # byte-equal duplicate
-        report = verify_source_side(
-            source_nodes, source_edges, target_nodes, target_edges
-        )
-        assert not report.ok
-        assert report.source_duplicate_node_ids == ["a"]
-
-    def test_reciprocal_reported_even_with_equal_payload(self):
-        source_nodes, source_edges, target_nodes, target_edges = self._clean_migration()
-        source_edges = source_edges + [_edge("b", "a", weight=1.0)]  # equal reciprocal
-        report = verify_source_side(
-            source_nodes, source_edges, target_nodes, target_edges
-        )
-        assert not report.ok
-        assert report.source_reciprocal_pairs == [("a", "b")]
+        if violation == "duplicate_node":
+            assert report.source_duplicate_node_ids == ["a"]
+        else:
+            assert report.source_reciprocal_pairs == [("a", "b")]
 
 
 # ---------------------------------------------------------------------------
@@ -547,39 +552,44 @@ class TestSourceNodeIdentity:
     """A real AGE graph can hold a vertex with no properties (`CREATE (n:base)`),
     which enumerates as {"id": None}. That must be refused, not crashed on."""
 
-    async def test_node_without_identity_is_refused_before_any_write(self):
-        target = PGTableGraphStorage()
-        source = PGGraphStorage([{"id": None}], [])
-        with pytest.raises(MigrationDataError, match="non-string id"):
-            await migrate_graph(source, target)
+    @pytest.mark.parametrize(
+        "nodes, match, force, seed",
+        [
+            pytest.param([{"id": None}], "non-string id", False, None, id="none_id"),
+            pytest.param(
+                [{"id": "alice", "entity_id": "alice"}, {"id": None}],
+                None,
+                False,
+                None,
+                id="mixed_valid_and_none",
+            ),
+            pytest.param(
+                [{"id": "a", "entity_id": "b"}],
+                "disagrees",
+                False,
+                None,
+                id="entity_id_disagrees",
+            ),
+            pytest.param(
+                [{"id": None}],
+                None,
+                True,
+                {"pre": {"entity_id": "pre"}},
+                id="force_mode_refuses_before_drop",
+            ),
+        ],
+    )
+    async def test_invalid_source_node_identity_is_refused(
+        self, nodes, match, force, seed
+    ):
+        target = PGTableGraphStorage(seed_nodes=seed)
+        source = PGGraphStorage(nodes, [])
+        with pytest.raises(MigrationDataError, match=match):
+            await migrate_graph(source, target, force_empty_target=force)
         assert target.calls.count("upsert_nodes_batch") == 0
-
-    async def test_mixed_valid_and_identityless_raises_data_error_not_typeerror(self):
-        # Regression: identity used to be checked after the duplicate scan and
-        # the deterministic sort, so a None id blew up with
-        # "TypeError: '<' not supported between instances of 'NoneType' and
-        # 'str'" — a crash where the operator needed a diagnosis.
-        target = PGTableGraphStorage()
-        source = PGGraphStorage(
-            [{"id": "alice", "entity_id": "alice"}, {"id": None}], []
-        )
-        with pytest.raises(MigrationDataError):
-            await migrate_graph(source, target)
-
-    async def test_entity_id_disagreeing_with_id_is_refused(self):
-        target = PGTableGraphStorage()
-        source = PGGraphStorage([{"id": "a", "entity_id": "b"}], [])
-        with pytest.raises(MigrationDataError, match="disagrees"):
-            await migrate_graph(source, target)
-
-    async def test_force_mode_refuses_identityless_node_before_dropping(self):
-        target = PGTableGraphStorage(seed_nodes={"pre": {"entity_id": "pre"}})
-        source = PGGraphStorage([{"id": None}], [])
-        with pytest.raises(MigrationDataError):
-            await migrate_graph(source, target, force_empty_target=True)
-        assert "drop" not in target.calls
-        assert target.calls.count("upsert_nodes_batch") == 0
-        assert target.nodes == {"pre": {"entity_id": "pre"}}
+        if force:
+            assert "drop" not in target.calls
+            assert target.nodes == seed
 
 
 class TestDetectSelfLoopEdges:
@@ -646,40 +656,35 @@ class TestJsonbRepresentability:
         assert "drop" not in target.calls
         assert target.nodes == {"pre": {"entity_id": "pre"}}
 
-    def test_finds_nan_and_infinities_with_paths(self):
-        offenders = find_non_jsonb_representable(
-            [
-                ("edge x", {"w": float("inf")}),
-                ("node y", {"meta": {"vals": [1.0, float("-inf")]}}),
-                ("node z", {"w": 1.0}),
-            ]
-        )
-        assert [label for label, _ in offenders] == ["edge x", "node y"]
-        assert offenders[0][1] == ["w"]
-        assert offenders[1][1] == ["meta.vals[1]"]
-
-    def test_finds_nul_and_lone_surrogate_strings(self):
-        # jsonb is stored as PostgreSQL text: a NUL is rejected outright
-        # ("\\u0000 cannot be converted to text") and an unpaired surrogate has
-        # no UTF-8 encoding at all, so the driver cannot even send it. Python
-        # str and AGE's agtype both accept them, so a source graph can carry
-        # them all the way to the write.
-        offenders = find_non_jsonb_representable(
-            [
-                ("node nul", {"description": "before\x00after"}),
-                ("edge surrogate", {"meta": {"vals": ["ok", "lone\ud800"]}}),
-            ]
-        )
-        assert offenders == [
-            ("edge surrogate", ["meta.vals[1]"]),
-            ("node nul", ["description"]),
-        ]
-
-    def test_offending_key_is_reported(self):
-        # A key is serialized into the same jsonb document, so a NUL in a key
-        # aborts the write exactly as one in a value does.
-        offenders = find_non_jsonb_representable([("node k", {"bad\x00key": 1})])
-        assert offenders == [("node k", ["bad\x00key"])]
+    @pytest.mark.parametrize(
+        "records, expected",
+        [
+            pytest.param(
+                [
+                    ("edge x", {"w": float("inf")}),
+                    ("node y", {"meta": {"vals": [1.0, float("-inf")]}}),
+                    ("node z", {"w": 1.0}),
+                ],
+                [("edge x", ["w"]), ("node y", ["meta.vals[1]"])],
+                id="nan_and_infinities",
+            ),
+            pytest.param(
+                [
+                    ("node nul", {"description": "before\x00after"}),
+                    ("edge surrogate", {"meta": {"vals": ["ok", "lone\ud800"]}}),
+                ],
+                [("edge surrogate", ["meta.vals[1]"]), ("node nul", ["description"])],
+                id="nul_and_lone_surrogate",
+            ),
+            pytest.param(
+                [("node k", {"bad\x00key": 1})],
+                [("node k", ["bad\x00key"])],
+                id="offending_key",
+            ),
+        ],
+    )
+    def test_finds_non_jsonb_representable_values_and_keys(self, records, expected):
+        assert find_non_jsonb_representable(records) == expected
 
     def test_ordinary_unicode_passes(self):
         # The gate must not become a general non-ASCII filter: everything here
@@ -792,12 +797,25 @@ class TestResolvedWorkspace:
     """POSTGRES_WORKSPACE outranks the constructor argument, so --workspace
     alone does not determine which slice a destructive run acts on."""
 
-    def test_env_override_of_requested_workspace_is_refused(self):
+    @pytest.mark.parametrize(
+        "requested, src_ws, tgt_ws, match",
+        [
+            pytest.param(
+                "staging", "production", "production", "was not named", id="env_override"
+            ),
+            pytest.param(
+                "", "a", "b", "different workspaces", id="divergent_backends"
+            ),
+        ],
+    )
+    def test_check_resolved_workspace_refuses_mismatch(
+        self, requested, src_ws, tgt_ws, match
+    ):
         source = PGGraphStorage([], [])
-        source.workspace = "production"
-        target = PGTableGraphStorage(workspace="production")
-        with pytest.raises(MigrationPreconditionError, match="was not named"):
-            _check_resolved_workspace("staging", source, target)
+        source.workspace = src_ws
+        target = PGTableGraphStorage(workspace=tgt_ws)
+        with pytest.raises(MigrationPreconditionError, match=match):
+            _check_resolved_workspace(requested, source, target)
 
     def test_empty_request_accepts_whatever_the_backends_resolve(self):
         source = PGGraphStorage([], [])
@@ -805,65 +823,78 @@ class TestResolvedWorkspace:
         target = PGTableGraphStorage(workspace="default")
         _check_resolved_workspace("", source, target)
 
-    def test_env_override_is_refused_before_anything_is_constructed(self, monkeypatch):
-        # Regression: the resolved-workspace check could only run AFTER both
-        # storages were initialized, and initialize() is not read-only — it runs
-        # DDL and _normalize_legacy_edges, which deletes and re-inserts edge
-        # rows. Refusing afterwards still mutated the workspace we refused to
-        # touch, so the check has to happen before any connection is opened.
-        monkeypatch.setenv("POSTGRES_WORKSPACE", "production")
-        with pytest.raises(MigrationPreconditionError, match="outranks it"):
-            _precheck_requested_workspace("staging")
-
-    def test_config_ini_workspace_is_refused_like_the_env_var(
-        self, monkeypatch, tmp_path
+    @pytest.mark.parametrize(
+        "env_ws, ini_content, match, forbidden",
+        [
+            pytest.param("production", None, "outranks it", None, id="env_override"),
+            pytest.param(
+                None,
+                "[postgres]\nworkspace = production\n",
+                "config.ini",
+                None,
+                id="config_ini_override",
+            ),
+            pytest.param(
+                "production",
+                "[postgres]\nworkspace = fromfile\n",
+                "POSTGRES_WORKSPACE",
+                "fromfile",
+                id="env_outranks_config_ini",
+            ),
+        ],
+    )
+    def test_precheck_refuses_configured_workspace_override(
+        self, monkeypatch, tmp_path, env_ws, ini_content, match, forbidden
     ):
-        # Regression: the precheck only read POSTGRES_WORKSPACE, but the
-        # backends resolve through PGPostgresDB.get_config, which falls back to
-        # config.ini's [postgres] workspace when the env var is unset. A
-        # checked-in config.ini therefore outranked --workspace with nothing on
-        # screen to suggest it, and initialize() would mutate the wrong slice
-        # before the resolved-workspace backstop could speak.
-        monkeypatch.delenv("POSTGRES_WORKSPACE", raising=False)
-        (tmp_path / "config.ini").write_text(
-            "[postgres]\nworkspace = production\n", encoding="utf-8"
-        )
-        monkeypatch.chdir(tmp_path)  # config.ini is read cwd-relative
-        with pytest.raises(MigrationPreconditionError, match="config.ini") as excinfo:
+        """POSTGRES_WORKSPACE and config.ini [postgres] workspace overrides are
+        refused before any connection opens, with env outranking config.ini."""
+        if ini_content is not None:
+            (tmp_path / "config.ini").write_text(ini_content, encoding="utf-8")
+            monkeypatch.chdir(tmp_path)
+        if env_ws is None:
+            monkeypatch.delenv("POSTGRES_WORKSPACE", raising=False)
+        else:
+            monkeypatch.setenv("POSTGRES_WORKSPACE", env_ws)
+
+        with pytest.raises(MigrationPreconditionError, match=match) as excinfo:
             _precheck_requested_workspace("staging")
         assert "production" in str(excinfo.value)
+        if forbidden is not None:
+            assert forbidden not in str(excinfo.value)
         # Matching or unnamed requests still pass through the same branch.
         _precheck_requested_workspace("production")
         _precheck_requested_workspace("")
 
-    def test_config_ini_without_a_workspace_key_is_ignored(self, monkeypatch, tmp_path):
-        monkeypatch.delenv("POSTGRES_WORKSPACE", raising=False)
-        (tmp_path / "config.ini").write_text(
-            "[postgres]\nhost = localhost\n", encoding="utf-8"
-        )
-        monkeypatch.chdir(tmp_path)
-        _precheck_requested_workspace("staging")
-
-    def test_env_var_outranks_config_ini(self, monkeypatch, tmp_path):
-        # get_config reads os.environ FIRST, so config.ini must not be
-        # consulted (let alone reported) when the env var is set.
-        (tmp_path / "config.ini").write_text(
-            "[postgres]\nworkspace = fromfile\n", encoding="utf-8"
-        )
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("POSTGRES_WORKSPACE", "production")
-        with pytest.raises(
-            MigrationPreconditionError, match="POSTGRES_WORKSPACE"
-        ) as excinfo:
-            _precheck_requested_workspace("staging")
-        assert "fromfile" not in str(excinfo.value)
-
-    def test_precheck_allows_matching_or_unnamed_workspace(self, monkeypatch):
-        monkeypatch.setenv("POSTGRES_WORKSPACE", "production")
-        _precheck_requested_workspace("production")
-        _precheck_requested_workspace("")  # operator named nothing
-        monkeypatch.delenv("POSTGRES_WORKSPACE", raising=False)
-        _precheck_requested_workspace("staging")
+    @pytest.mark.parametrize(
+        "env_ws, ini_content, allowed_requests",
+        [
+            pytest.param(
+                None,
+                "[postgres]\nhost = localhost\n",
+                ("staging",),
+                id="config_ini_without_workspace_key",
+            ),
+            pytest.param(
+                "production",
+                None,
+                ("production", ""),
+                id="matching_or_unnamed_under_env",
+            ),
+            pytest.param(None, None, ("staging",), id="no_override_set"),
+        ],
+    )
+    def test_precheck_allows_compatible_workspace(
+        self, monkeypatch, tmp_path, env_ws, ini_content, allowed_requests
+    ):
+        if ini_content is not None:
+            (tmp_path / "config.ini").write_text(ini_content, encoding="utf-8")
+            monkeypatch.chdir(tmp_path)
+        if env_ws is None:
+            monkeypatch.delenv("POSTGRES_WORKSPACE", raising=False)
+        else:
+            monkeypatch.setenv("POSTGRES_WORKSPACE", env_ws)
+        for req in allowed_requests:
+            _precheck_requested_workspace(req)
 
     def test_cli_refuses_env_override_before_touching_the_factory(
         self, monkeypatch, capsys
@@ -881,13 +912,6 @@ class TestResolvedWorkspace:
             main(["--workspace", "staging"])
         assert excinfo.value.code == 1
         assert "outranks it" in capsys.readouterr().out
-
-    def test_divergent_workspaces_between_backends_are_refused(self):
-        source = PGGraphStorage([], [])
-        source.workspace = "a"
-        target = PGTableGraphStorage(workspace="b")
-        with pytest.raises(MigrationPreconditionError, match="different workspaces"):
-            _check_resolved_workspace("", source, target)
 
 
 class TestMigrationPreconditions:
@@ -935,39 +959,40 @@ class TestMigrationPreconditions:
         assert report.verified
         assert "pre" not in target.nodes
 
-    async def test_parallel_source_rows_fail_before_any_write(self):
+    @pytest.mark.parametrize(
+        "nodes, edges",
+        [
+            pytest.param(
+                [
+                    {"id": "a", "entity_id": "a", "entity_type": "thing"},
+                    {"id": "b", "entity_id": "b", "entity_type": "thing"},
+                ],
+                [_edge("a", "b", w=1), _edge("a", "b", w=2)],
+                id="parallel_edges",
+            ),
+            pytest.param(
+                [
+                    {"id": "a", "entity_id": "a", "p": 1},
+                    {"id": "a", "entity_id": "a", "p": 2},
+                ],
+                [],
+                id="duplicate_divergent_nodes",
+            ),
+            pytest.param(
+                [{"id": "a", "entity_type": "thing"}],
+                [],
+                id="missing_entity_id",
+            ),
+        ],
+    )
+    async def test_invalid_source_data_fails_before_any_write(self, nodes, edges):
         target = PGTableGraphStorage()
-        source = _source(["a", "b"], [_edge("a", "b", w=1), _edge("a", "b", w=2)])
-        with pytest.raises(MigrationDataError):
-            await migrate_graph(source, target)
-        assert "upsert_nodes_batch" not in target.calls
-
-    async def test_duplicate_node_ids_with_divergent_payloads_fail_before_any_write(
-        self,
-    ):
-        # The gate's demonstrated defect: [{id:a,p:1},{id:a,p:2}] previously
-        # migrated "verified" with p:1 silently gone (both the batch writer
-        # and verification collapse per-id last-write-wins).
-        target = PGTableGraphStorage()
-        source = PGGraphStorage(
-            [
-                {"id": "a", "entity_id": "a", "p": 1},
-                {"id": "a", "entity_id": "a", "p": 2},
-            ],
-            [],
-        )
+        source = PGGraphStorage(nodes, edges)
         with pytest.raises(MigrationDataError):
             await migrate_graph(source, target)
         assert "upsert_nodes_batch" not in target.calls
         assert "upsert_edges_batch" not in target.calls
         assert target.nodes == {}
-
-    async def test_node_without_entity_id_fails_before_any_write(self):
-        target = PGTableGraphStorage()
-        source = PGGraphStorage([{"id": "a", "entity_type": "thing"}], [])
-        with pytest.raises(MigrationDataError):
-            await migrate_graph(source, target)
-        assert "upsert_nodes_batch" not in target.calls
 
 
 class TestMigrationSuccess:
@@ -1165,29 +1190,30 @@ class TestCli:
         assert "'verified': True" in out
         assert "'dropped_target_slice': False" in out
 
-    def test_failing_migration_exits_nonzero_without_writes(self, monkeypatch, capsys):
-        # Non-empty target: precondition failure must surface as a non-zero
-        # SystemExit (a shell script must never see success), with no writes.
+    @pytest.mark.parametrize(
+        "fault, expected_snippet",
+        [
+            pytest.param("non_empty_target", "'error':", id="precondition_failure"),
+            pytest.param("edge_batch_write", "'compensated': True", id="write_failure"),
+        ],
+    )
+    def test_cli_failure_exits_nonzero_and_reports(
+        self, monkeypatch, capsys, fault, expected_snippet
+    ):
         source, target = self._fakes()
-        target.nodes["pre"] = {"entity_id": "pre"}
+        if fault == "non_empty_target":
+            target.nodes["pre"] = {"entity_id": "pre"}
+        else:
+            target.fail_edge_batch_after = 0
         _patch_factory(monkeypatch, source, target)
         with pytest.raises(SystemExit) as excinfo:
             main(["--apply"])
         assert excinfo.value.code == 1
-        assert "upsert_nodes_batch" not in target.calls
-        assert target.nodes == {"pre": {"entity_id": "pre"}}
-        assert "'error':" in capsys.readouterr().out
+        assert expected_snippet in capsys.readouterr().out
+        if fault == "non_empty_target":
+            assert "upsert_nodes_batch" not in target.calls
+            assert target.nodes == {"pre": {"entity_id": "pre"}}
         assert source.finalized and target.finalized
-
-    def test_write_failure_exit_code_and_report(self, monkeypatch, capsys):
-        source, target = self._fakes()
-        target.fail_edge_batch_after = 0
-        _patch_factory(monkeypatch, source, target)
-        with pytest.raises(SystemExit) as excinfo:
-            main(["--apply"])
-        assert excinfo.value.code == 1
-        out = capsys.readouterr().out
-        assert "'compensated': True" in out
 
     def test_rejected_pair_exits_nonzero_before_instantiation(
         self, monkeypatch, capsys
@@ -1206,15 +1232,7 @@ class TestCli:
         assert "unsupported migration pair" in capsys.readouterr().out
 
     def test_shared_data_is_initialized_before_any_storage_is_built(self, monkeypatch):
-        """Regression: the CLI must call initialize_share_data() first.
-
-        The graph backends acquire shared-storage locks inside initialize(),
-        which raise "Shared data not initialized. Call initialize_share_data()
-        before using locks!" when it was skipped. Constructing the storage
-        succeeds, so only running the real backend surfaces this — it was found
-        by the manual AGE end-to-end run, not by these fakes. Every other tool
-        in lightrag/tools does the same call, so this pins the convention.
-        """
+        """Regression: the CLI must call initialize_share_data() first."""
         import lightrag.kg.shared_storage as shared_storage
 
         order: list[str] = []
@@ -1248,54 +1266,57 @@ class TestCli:
         )
         assert "build:PGGraphStorage" in order
 
-    def test_workspace_flag_overrides_env(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "argv, expected_ws",
+        [
+            pytest.param(["--workspace", "cli-ws"], "cli-ws", id="flag_overrides_env"),
+            pytest.param([], "env-ws", id="defaults_to_env"),
+        ],
+    )
+    def test_workspace_flag_and_env_resolution(self, monkeypatch, argv, expected_ws):
         source, target = self._fakes()
         ctor_kwargs = _patch_factory(monkeypatch, source, target)
         monkeypatch.setenv("WORKSPACE", "env-ws")
-        main(["--workspace", "cli-ws"])
-        assert ctor_kwargs["PGGraphStorage"]["workspace"] == "cli-ws"
-        assert ctor_kwargs["PGTableGraphStorage"]["workspace"] == "cli-ws"
+        main(argv)
+        assert ctor_kwargs["PGGraphStorage"]["workspace"] == expected_ws
+        assert ctor_kwargs["PGTableGraphStorage"]["workspace"] == expected_ws
 
-    def test_workspace_defaults_to_env(self, monkeypatch):
-        source, target = self._fakes()
-        ctor_kwargs = _patch_factory(monkeypatch, source, target)
-        monkeypatch.setenv("WORKSPACE", "env-ws")
-        main([])
-        assert ctor_kwargs["PGGraphStorage"]["workspace"] == "env-ws"
-
-    def test_force_empty_target_defaults_false_and_dry_run_never_drops(
-        self, monkeypatch, capsys
+    @pytest.mark.parametrize(
+        "argv, expect_drop, expected_snippets",
+        [
+            pytest.param(
+                ["--force-empty-target"],
+                False,
+                (
+                    "'mode': 'dry-run'",
+                    "'target_non_empty': True",
+                    "'would_drop_target_slice': True",
+                ),
+                id="dry_run_never_drops",
+            ),
+            pytest.param(
+                ["--apply", "--force-empty-target"],
+                True,
+                ("'target_non_empty': True", "'dropped_target_slice': True"),
+                id="apply_drops_and_reports",
+            ),
+        ],
+    )
+    def test_force_empty_target_dry_run_vs_apply(
+        self, monkeypatch, capsys, argv, expect_drop, expected_snippets
     ):
         source, target = self._fakes()
         target.nodes["pre"] = {"entity_id": "pre"}
         _patch_factory(monkeypatch, source, target)
-        # Default: refused (exercised above). With the flag, the dry run is
-        # not refused — but it must NOT drop; only the apply run may.
-        main(["--force-empty-target"])
-        assert "drop" not in target.calls
-        assert target.nodes["pre"] == {"entity_id": "pre"}
+        main(argv)
+        assert ("drop" in target.calls) is expect_drop
+        if not expect_drop:
+            assert target.nodes["pre"] == {"entity_id": "pre"}
         out = capsys.readouterr().out
-        assert "'mode': 'dry-run'" in out
-        # The preview must disclose the destructive consequence of apply.
-        assert "'target_non_empty': True" in out
-        assert "'would_drop_target_slice': True" in out
-
-    def test_apply_force_reports_dropped_slice(self, monkeypatch, capsys):
-        source, target = self._fakes()
-        target.nodes["pre"] = {"entity_id": "pre"}
-        _patch_factory(monkeypatch, source, target)
-        main(["--apply", "--force-empty-target"])
-        assert "drop" in target.calls
-        out = capsys.readouterr().out
-        assert "'target_non_empty': True" in out
-        assert "'dropped_target_slice': True" in out
+        for snippet in expected_snippets:
+            assert snippet in out
 
     def test_storage_init_failure_reports_and_finalizes(self, monkeypatch, capsys):
-        # DB-unreachable analogue: initialize of the SECOND storage fails.
-        # rebuild_vdb precedent: report + non-zero exit, no raw traceback.
-        # Both the fully-built source (via the finally) and the partially
-        # built target (best-effort finalize inside the builder) must be
-        # released.
         source, _ = self._fakes()
 
         class FailingInitTarget(PGTableGraphStorage):
@@ -1312,17 +1333,12 @@ class TestCli:
         assert target.finalized
 
     async def test_dry_run_migration_rejects_non_empty_target(self):
-        # Library-level twin of the CLI default-refusal path.
         source, target = self._fakes()
         target.nodes["pre"] = {"entity_id": "pre"}
         with pytest.raises(MigrationPreconditionError):
             await dry_run_migration(source, target)
 
     def test_cli_import_is_offline_safe(self):
-        # The offline CI does not install asyncpg: importing the module —
-        # CLI entry point included — must not pull it in. Subprocess keeps
-        # the probe independent of whatever the surrounding test session
-        # already imported.
         import lightrag
 
         repo_root = Path(lightrag.__file__).resolve().parents[1]
@@ -1333,3 +1349,193 @@ class TestCli:
             "assert 'asyncpg' not in sys.modules, 'CLI import pulled asyncpg'\n"
         )
         subprocess.run([sys.executable, "-c", code], check=True, cwd=repo_root)
+
+
+# ---------------------------------------------------------------------------
+# Integration tests against real NetworkXStorage
+# ---------------------------------------------------------------------------
+
+_NX_NODES: dict[str, dict[str, str]] = {
+    "alice": {"entity_id": "alice", "entity_type": "person", "description": "plain"},
+    'He said "hi"': {"entity_id": 'He said "hi"', "entity_type": "quote"},
+    "한국": {"entity_id": "한국", "entity_type": "국가", "description": "유니코드"},
+    "loop": {"entity_id": "loop", "entity_type": "thing"},
+}
+_NX_EDGES: list[tuple[str, str, dict[str, str]]] = [
+    ("한국", "alice", {"weight": "1.0", "description": "unicode endpoint"}),
+    ('He said "hi"', "alice", {"weight": "2.0", "source_id": "chunk-1"}),
+]
+
+
+@pytest.fixture
+def allow_networkx_pair(monkeypatch):
+    """Extend the pair allowlist for this test only — never the shipped one."""
+    import lightrag.tools.migrate_graph_storage as mgs
+
+    monkeypatch.setattr(
+        mgs,
+        "ALLOWED_MIGRATION_PAIRS",
+        mgs.ALLOWED_MIGRATION_PAIRS | {("NetworkXStorage", "NetworkXStorage")},
+    )
+
+
+async def _nx_never_embed(*_args, **_kwargs):
+    raise RuntimeError("graph migration tests never embed")
+
+
+async def _nx_storage(tmp_path, namespace: str):
+    from lightrag.kg.networkx_impl import NetworkXStorage
+    from lightrag.kg.shared_storage import initialize_share_data
+    from lightrag.utils import EmbeddingFunc
+
+    initialize_share_data()
+    storage = NetworkXStorage(
+        namespace=namespace,
+        workspace="ws",
+        global_config={"working_dir": str(tmp_path)},
+        embedding_func=EmbeddingFunc(embedding_dim=1, func=_nx_never_embed),
+    )
+    await storage.initialize()
+    return storage
+
+
+async def _nx_seeded_source(tmp_path):
+    source = await _nx_storage(tmp_path, "migration_src")
+    await source.upsert_nodes_batch(
+        [(node_id, dict(props)) for node_id, props in _NX_NODES.items()]
+    )
+    await source.upsert_edges_batch(
+        [(src, tgt, dict(props)) for src, tgt, props in _NX_EDGES]
+    )
+    return source
+
+
+def _nx_node_map(nodes: list[dict]) -> dict[str, dict]:
+    return {n["id"]: {k: v for k, v in n.items() if k != "id"} for n in nodes}
+
+
+def _nx_canonical_edge_map(edges: list[dict]) -> dict[tuple[str, str], dict]:
+    return {
+        canonicalize_edge(e["source"], e["target"]): {
+            k: v for k, v in e.items() if k not in ("source", "target")
+        }
+        for e in edges
+    }
+
+
+class TestRealRoundTrip:
+    @pytest.mark.usefixtures("allow_networkx_pair")
+    async def test_round_trip_preserves_graph(self, tmp_path):
+        source = await _nx_seeded_source(tmp_path)
+        target = await _nx_storage(tmp_path, "migration_tgt")
+
+        report = await migrate_graph(source, target)
+
+        assert report.verified
+        assert report.verification is not None and report.verification.ok
+        assert report.node_count == len(_NX_NODES)
+        assert report.edge_count == len(_NX_EDGES)
+        assert _nx_node_map(await target.get_all_nodes()) == _nx_node_map(
+            await source.get_all_nodes()
+        )
+        assert _nx_canonical_edge_map(await target.get_all_edges()) == (
+            _nx_canonical_edge_map(await source.get_all_edges())
+        )
+        assert set(_nx_node_map(await source.get_all_nodes())) == set(_NX_NODES)
+
+    @pytest.mark.usefixtures("allow_networkx_pair")
+    async def test_self_loop_in_source_is_refused_and_writes_nothing(self, tmp_path):
+        source = await _nx_seeded_source(tmp_path)
+        await source.upsert_edge("loop", "loop", {"weight": "3.0"})
+        target = await _nx_storage(tmp_path, "migration_tgt")
+
+        with pytest.raises(MigrationDataError, match="self-loop"):
+            await migrate_graph(source, target)
+
+        assert await target.get_all_nodes() == []
+        assert await target.get_all_edges() == []
+
+    @pytest.mark.usefixtures("allow_networkx_pair")
+    async def test_non_empty_real_target_rejected(self, tmp_path):
+        source = await _nx_seeded_source(tmp_path)
+        target = await _nx_storage(tmp_path, "migration_tgt")
+        await target.upsert_nodes_batch([("pre", {"entity_id": "pre"})])
+        with pytest.raises(MigrationPreconditionError):
+            await migrate_graph(source, target)
+        assert set(_nx_node_map(await target.get_all_nodes())) == {"pre"}
+
+    @pytest.mark.usefixtures("allow_networkx_pair")
+    async def test_attributeless_source_node_fails_closed(self, tmp_path):
+        source = await _nx_storage(tmp_path, "migration_src")
+        await source.upsert_nodes_batch([("a", {"entity_id": "a"})])
+        await source.upsert_edges_batch([("a", "ghost", {"weight": "1"})])
+        target = await _nx_storage(tmp_path, "migration_tgt")
+        with pytest.raises(MigrationDataError):
+            await migrate_graph(source, target)
+        assert await target.get_all_nodes() == []
+
+
+class TestRealCompensation:
+    @pytest.mark.usefixtures("allow_networkx_pair")
+    async def test_edge_batch_failure_compensates_on_real_target(
+        self, tmp_path, monkeypatch
+    ):
+        source = await _nx_seeded_source(tmp_path)
+        target = await _nx_storage(tmp_path, "migration_tgt")
+        other = await _nx_storage(tmp_path, "migration_other")
+        await other.upsert_nodes_batch([("keep", {"entity_id": "keep"})])
+
+        real_upsert_edges = target.upsert_edges_batch
+
+        async def failing_upsert_edges(edges):
+            await real_upsert_edges(edges[:1])
+            raise RuntimeError("injected failure after first edge")
+
+        removed_nodes: list[str] = []
+        removed_edges: list[tuple[str, str]] = []
+        real_remove_nodes = target.remove_nodes
+        real_remove_edges = target.remove_edges
+
+        async def recording_remove_nodes(nodes):
+            removed_nodes.extend(nodes)
+            await real_remove_nodes(nodes)
+
+        async def recording_remove_edges(edges):
+            removed_edges.extend(edges)
+            await real_remove_edges(edges)
+
+        monkeypatch.setattr(target, "upsert_edges_batch", failing_upsert_edges)
+        monkeypatch.setattr(target, "remove_nodes", recording_remove_nodes)
+        monkeypatch.setattr(target, "remove_edges", recording_remove_edges)
+
+        with pytest.raises(MigrationWriteError) as excinfo:
+            await migrate_graph(source, target)
+        report = excinfo.value.report
+        assert report.compensated
+        assert removed_nodes == report.written_node_ids == sorted(_NX_NODES)
+        assert removed_edges == report.written_edge_keys
+        assert await target.get_all_nodes() == []
+        assert await target.get_all_edges() == []
+        assert set(_nx_node_map(await other.get_all_nodes())) == {"keep"}
+
+    @pytest.mark.usefixtures("allow_networkx_pair")
+    async def test_node_batch_failure_absent_ids_are_noops(self, tmp_path, monkeypatch):
+        source = await _nx_seeded_source(tmp_path)
+        target = await _nx_storage(tmp_path, "migration_tgt")
+
+        real_upsert_nodes = target.upsert_nodes_batch
+
+        async def failing_upsert_nodes(nodes):
+            await real_upsert_nodes(nodes[:1])
+            raise RuntimeError("injected failure after first node")
+
+        monkeypatch.setattr(target, "upsert_nodes_batch", failing_upsert_nodes)
+
+        with pytest.raises(MigrationWriteError) as excinfo:
+            await migrate_graph(source, target)
+        report = excinfo.value.report
+        assert report.compensated
+        assert report.compensation_error is None
+        assert await target.get_all_nodes() == []
+        assert await target.get_all_edges() == []
+

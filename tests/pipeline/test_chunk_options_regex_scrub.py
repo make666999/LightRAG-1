@@ -17,13 +17,13 @@ import asyncio
 import logging
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from lightrag import LightRAG
 from lightrag.constants import DEFAULT_SENTENCE_SPLIT_REGEX
-from lightrag.utils import EmbeddingFunc, Tokenizer, TokenizerInterface
 from lightrag.utils_pipeline import apply_trusted_sentence_split_regex
+
+from ._fakes import make_lightrag, mock_json_llm
 
 pytestmark = pytest.mark.offline
 
@@ -132,31 +132,14 @@ def test_audit_line_bounds_the_untrusted_pattern(lightrag_log_records):
     assert len(message) < 600
 
 
-class _SimpleTokenizerImpl(TokenizerInterface):
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(t) for t in tokens)
-
-
-async def _mock_embedding(texts: list[str]) -> np.ndarray:
-    return np.full((len(texts), 32), 0.1, dtype=np.float32)
-
-
-async def _mock_llm(prompt, **kwargs):
-    return '{"name":"x","summary":"s","detail_description":"d"}'
-
-
 def _new_rag(tmp_path: Path) -> LightRAG:
-    return LightRAG(
-        working_dir=str(tmp_path),
+    return make_lightrag(
+        tmp_path,
+        subdir=None,
         workspace=f"regex-scrub-{tmp_path.name}",
-        llm_model_func=_mock_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=32, max_token_size=4096, func=_mock_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        llm_model_func=mock_json_llm,
+        embedding_dim=32,
+        max_token_size=4096,
     )
 
 

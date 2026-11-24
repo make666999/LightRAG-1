@@ -28,7 +28,7 @@ from lightrag.operate import (
     _truncate_entity_identifier,
 )
 from lightrag.utils import normalize_entity_name
-from tests.utils.test_normalize_entity_name_quoted_chinese import (
+from tests.utils.test_entity_normalization import (
     _name_before_the_second_pass,
 )
 

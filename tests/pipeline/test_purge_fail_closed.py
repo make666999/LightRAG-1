@@ -27,30 +27,34 @@ local so each file states the state it depends on.
 
 from __future__ import annotations
 
-import asyncio
-from contextlib import asynccontextmanager
-
 import pytest
-import lightrag.operate as operate_module
 
 from lightrag import LightRAG
 from lightrag.constants import (
-    GRAPH_FIELD_SEP,
-    KG_PURGE_METADATA_KEY,
     KG_PURGE_PHASE_ANCHORS_PENDING,
     KG_PURGE_PHASE_COMPLETED,
     KG_PURGE_PHASE_DERIVED_COMMITTED,
     KG_PURGE_PHASE_PREPARED,
     KG_WRITE_STATE_GRAPH_MUTATION_STARTED,
-    KG_WRITE_STATE_METADATA_KEY,
     KG_WRITE_STATE_PRE_GRAPH,
 )
 from lightrag.exceptions import (
     KGPurgeOperationConflictError,
     RecoveryAnchorMissingError,
-    StorageRecordNotFoundError,
 )
 from lightrag.utils_pipeline import make_kg_purge_operation_id
+
+from ._fakes import (
+    PurgeDocStatusDouble as _DocStatus,
+    PurgeGraphDouble as _Graph,
+    PurgeKVDouble as _KV,
+    make_purge_journal as _journal,
+    make_purge_node as _node,
+    make_purge_pipeline_status as _status,
+    make_purge_rag as _make_rag,
+    make_purge_status_row as _status_row,
+    patch_storage_keyed_lock_noop,
+)
 
 pytestmark = pytest.mark.offline
 
@@ -59,183 +63,7 @@ DOC = "d1"
 
 @pytest.fixture(autouse=True)
 def _storage_keyed_lock_noop(monkeypatch):
-    @asynccontextmanager
-    async def _noop_lock(*args, **kwargs):
-        yield
-
-    monkeypatch.setattr(operate_module, "get_storage_keyed_lock", _noop_lock)
-
-
-class _KV:
-    def __init__(self, data: dict | None = None):
-        self.data = dict(data or {})
-        self.deleted: list[str] = []
-        self.upserted: list[dict] = []
-
-    async def get_by_id(self, key):
-        return self.data.get(key)
-
-    async def get_by_ids(self, keys):
-        return [self.data.get(k) for k in keys]
-
-    async def upsert(self, data):
-        self.upserted.append(dict(data))
-        self.data.update(data)
-
-    async def delete(self, ids):
-        self.deleted.extend(ids)
-        for k in ids:
-            self.data.pop(k, None)
-
-    async def index_done_callback(self):
-        pass
-
-
-class _DocStatus(_KV):
-    async def update_doc_status_fields(self, doc_id, fields, *, missing_ok=False):
-        existing = self.data.get(doc_id)
-        if existing is None:
-            if missing_ok:
-                return
-            raise StorageRecordNotFoundError(doc_id)
-        self.data[doc_id] = {**existing, **fields}
-
-    def journal(self, doc_id: str = DOC) -> dict | None:
-        return (
-            (self.data.get(doc_id) or {}).get("metadata", {}).get(KG_PURGE_METADATA_KEY)
-        )
-
-
-class _Vdb:
-    def __init__(self):
-        self.deleted: list[str] = []
-        self.data: dict = {}
-
-    async def delete(self, ids):
-        self.deleted.extend(ids)
-        for key in ids:
-            self.data.pop(key, None)
-
-    async def upsert(self, data):
-        self.data.update(data)
-
-    async def index_done_callback(self):
-        pass
-
-
-class _Graph:
-    def __init__(self, nodes: dict | None = None, edges: dict | None = None):
-        self.nodes = dict(nodes or {})
-        self.edges = dict(edges or {})
-        self.removed_nodes: list[str] = []
-        self.removed_edges: list[tuple[str, str]] = []
-        self.reads: list[str] = []
-
-    async def get_nodes_batch(self, names):
-        self.reads.append("get_nodes_batch")
-        return {n: dict(self.nodes[n]) if n in self.nodes else None for n in names}
-
-    async def get_edges_batch(self, pairs):
-        self.reads.append("get_edges_batch")
-        out = {}
-        for p in pairs:
-            s, t = p["src"], p["tgt"]
-            edge = self.edges.get((s, t)) or self.edges.get((t, s))
-            out[(s, t)] = dict(edge) if edge else None
-        return out
-
-    async def get_nodes_edges_batch(self, names):
-        self.reads.append("get_nodes_edges_batch")
-        return {n: [] for n in names}
-
-    async def remove_nodes(self, names):
-        self.removed_nodes.extend(names)
-        for n in names:
-            self.nodes.pop(n, None)
-
-    async def remove_edges(self, pairs):
-        self.removed_edges.extend(pairs)
-        for s, t in pairs:
-            self.edges.pop((s, t), None)
-            self.edges.pop((t, s), None)
-
-
-def _node(name: str, sources: list[str]) -> dict:
-    return {
-        "entity_id": name,
-        "description": name,
-        "source_id": GRAPH_FIELD_SEP.join(sources),
-        "entity_type": "X",
-        "file_path": "f",
-    }
-
-
-def _status_row(
-    *,
-    write_state: str | None = None,
-    purge_journal: dict | None = None,
-    patch_journal: dict | None = None,
-) -> dict:
-    metadata: dict = {}
-    if write_state is not None:
-        metadata[KG_WRITE_STATE_METADATA_KEY] = write_state
-    if purge_journal is not None:
-        metadata[KG_PURGE_METADATA_KEY] = purge_journal
-    if patch_journal is not None:
-        metadata["custom_chunk_patch"] = patch_journal
-    return {"status": "processed", "chunks_list": [], "metadata": metadata}
-
-
-def _journal(phase: str, chunk_ids: list[str], *, doc_id: str = DOC) -> dict:
-    return {
-        "schema_version": 1,
-        "operation_id": make_kg_purge_operation_id(doc_id, chunk_ids),
-        "phase": phase,
-        "chunk_count": len(chunk_ids),
-        "updated_at": 0,
-    }
-
-
-def _make_rag(
-    *,
-    graph: _Graph | None = None,
-    full_entities: _KV | None = None,
-    full_relations: _KV | None = None,
-    entity_chunks: _KV | None = None,
-    doc_status: _DocStatus | None = None,
-) -> LightRAG:
-    rag = LightRAG.__new__(LightRAG)
-    rag.chunk_entity_relation_graph = graph if graph is not None else _Graph()
-    rag.full_entities = full_entities if full_entities is not None else _KV()
-    rag.full_relations = full_relations if full_relations is not None else _KV()
-    rag.entity_chunks = entity_chunks if entity_chunks is not None else _KV()
-    rag.relation_chunks = _KV()
-    rag.chunks_vdb = _Vdb()
-    rag.entities_vdb = _Vdb()
-    rag.relationships_vdb = _Vdb()
-    rag.text_chunks = _KV()
-    rag.llm_response_cache = _KV()
-    rag.doc_status = (
-        doc_status if doc_status is not None else _DocStatus({DOC: _status_row()})
-    )
-
-    async def _noop_insert_done(*args, **kwargs):
-        return None
-
-    rag._insert_done = _noop_insert_done
-    rag._build_global_config = lambda: {
-        "llm_model_max_async": 1,
-        "max_source_ids_per_entity": 100,
-        "max_source_ids_per_relation": 100,
-        "source_ids_limit_method": "KEEP",
-        "max_file_paths": 100,
-        "file_path_more_placeholder": "more",
-    }
-    return rag
-
-
-def _status():
-    return {"latest_message": "", "history_messages": []}, asyncio.Lock()
+    patch_storage_keyed_lock_noop(monkeypatch)
 
 
 def _assert_nothing_deleted(rag: LightRAG) -> None:

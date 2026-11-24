@@ -497,19 +497,22 @@ class TestSummary:
         assert "relation_chunks state" in tool.unreadable_items(summary)
         assert "full_docs" in out and "has data" in out
 
-    async def test_a_server_kv_namespace_outage_refuses_the_run(
-        self, tmp_path, stub_baselines, monkeypatch
+    @pytest.mark.parametrize(
+        "label",
+        ["full_entities", "text_chunks"],
+    )
+    async def test_a_server_kv_outage_refuses_the_run(
+        self, tmp_path, stub_baselines, label
     ):
-        """The kind rule reaches the other KV namespaces too: a server
-        backend that cannot answer for ``full_entities`` will not serve its
-        drop either, so the run is refused before anything is dropped."""
+        """The kind rule reaches every KV namespace: a server backend that
+        cannot answer ``iter_rows`` refuses the run instead of rendering EMPTY."""
         tool = make_tool(tmp_path)
         tool.storage_names["kv"] = "RedisKVStorage"
-        tool.storages["full_entities"].iter_rows = rows_stream(
-            error=ConnectionError("redis down")
-        )
+        kv = tool.storages[label]
+        kv.is_empty = AsyncMock(return_value=True)
+        kv.iter_rows = rows_stream(error=ConnectionError("redis down"))
 
-        with pytest.raises(clear_storage.RemoteBackendUnavailableError):
+        with pytest.raises(RemoteBackendUnavailableError):
             await tool.collect_summary()
 
     async def test_a_workspace_override_in_effect_is_named(
@@ -546,34 +549,41 @@ class TestSummary:
         assert "resolved to workspace(s)" in out
         assert "other" in out and "qdrant-legacy" in out
 
-    async def test_a_backend_default_sentinel_is_not_flagged_as_an_override(
-        self, tmp_path, stub_baselines, capsys
+    @pytest.mark.parametrize(
+        "workspace, overrides, expect_flagged",
+        [
+            pytest.param(
+                "",
+                {
+                    "doc_status": "default",
+                    "text_chunks": "_",
+                    "chunk_entity_relation_graph": "base",
+                },
+                False,
+                id="empty_workspace_sentinels_not_flagged",
+            ),
+            pytest.param(
+                "ws",
+                {"doc_status": "default"},
+                True,
+                id="named_workspace_default_sentinel_flagged",
+            ),
+        ],
+    )
+    async def test_backend_default_sentinel_workspace_flagging(
+        self, tmp_path, stub_baselines, capsys, workspace, overrides, expect_flagged
     ):
-        """Under an empty WORKSPACE, PostgreSQL writes ``"default"`` and Redis
-        doc-status ``"_"`` back onto ``workspace``. That IS the default
-        workspace; warning about it on every such deployment would teach the
-        operator to ignore the line when a real override is in effect."""
-        tool = make_tool(tmp_path, workspace="")
-        tool.storages["doc_status"].workspace = "default"
-        tool.storages["text_chunks"].workspace = "_"
-        # Neo4j and Memgraph substitute ``"base"`` for an empty workspace.
-        tool.storages["chunk_entity_relation_graph"].workspace = "base"
+        """Default aliases (``default``, ``_``, ``base``) are unflagged only
+        under an empty WORKSPACE; under a named one they indicate a different
+        workspace."""
+        tool = make_tool(tmp_path, workspace=workspace)
+        for label, resolved in overrides.items():
+            tool.storages[label].workspace = resolved
 
         tool.print_summary(await tool.collect_summary())
 
-        assert "resolved to workspace(s)" not in capsys.readouterr().out
-
-    async def test_a_default_sentinel_under_a_named_workspace_is_flagged(
-        self, tmp_path, stub_baselines, capsys
-    ):
-        """The aliases apply only to an empty WORKSPACE: under a named one, a
-        storage on ``default`` is on a different workspace."""
-        tool = make_tool(tmp_path, workspace="ws")
-        tool.storages["doc_status"].workspace = "default"
-
-        tool.print_summary(await tool.collect_summary())
-
-        assert "resolved to workspace(s)" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert ("resolved to workspace(s)" in out) is expect_flagged
 
     async def test_an_unreadable_count_on_a_file_backed_store_is_shown_not_zero(
         self, tmp_path, stub_baselines, capsys
@@ -639,40 +649,35 @@ class TestSummary:
 
         assert (await tool.collect_summary())["total_docs"] == 7
 
-    async def test_an_empty_page_under_a_positive_strict_count_refuses_on_a_server(
-        self, tmp_path, stub_baselines
+    @pytest.mark.parametrize(
+        "backend",
+        [
+            pytest.param("RedisDocStatusStorage", id="server_refuses"),
+            pytest.param(None, id="local_unreadable"),
+        ],
+    )
+    async def test_an_empty_page_under_a_positive_strict_count(
+        self, tmp_path, stub_baselines, backend
     ):
-        """``RedisDocStatusStorage`` / ``OpenSearchDocStatusStorage.get_docs_paginated``
-        catch backend errors and return ``([], 0)``. If the outage begins
-        after the strict counts, that would show as zero recent documents and
-        permit the confirmation; instead the contradiction is read as the
-        swallowed failure and, on a server backend, refuses the run."""
+        """A swallowed ``([], 0)`` page when strict counts are positive refuses
+        on a server backend and marks recent UNREADABLE locally."""
         tool = make_tool(tmp_path, counts={DocStatus.PROCESSED: 3})
-        tool.storage_names["doc_status"] = "RedisDocStatusStorage"
+        if backend is not None:
+            tool.storage_names["doc_status"] = backend
 
         async def swallowed(**kwargs):
             return [], 0
 
         tool.storages["doc_status"].get_docs_paginated = swallowed
 
-        with pytest.raises(RemoteBackendUnavailableError):
-            await tool.collect_summary()
-
-    async def test_an_empty_page_under_a_positive_strict_count_is_unreadable_locally(
-        self, tmp_path, stub_baselines
-    ):
-        tool = make_tool(tmp_path, counts={DocStatus.PROCESSED: 3})
-
-        async def swallowed(**kwargs):
-            return [], 0
-
-        tool.storages["doc_status"].get_docs_paginated = swallowed
-
-        summary = await tool.collect_summary()
-
-        assert isinstance(summary["recent"], Unreadable)
-        assert summary["total_docs"] == 3
-        assert "most recently updated documents" in tool.unreadable_items(summary)
+        if backend is not None:
+            with pytest.raises(RemoteBackendUnavailableError):
+                await tool.collect_summary()
+        else:
+            summary = await tool.collect_summary()
+            assert isinstance(summary["recent"], Unreadable)
+            assert summary["total_docs"] == 3
+            assert "most recently updated documents" in tool.unreadable_items(summary)
 
     async def test_an_empty_page_under_zero_strict_counts_is_simply_empty(
         self, tmp_path, stub_baselines, capsys
@@ -733,18 +738,6 @@ class TestSummary:
         assert "Text chunks: has data" in plain(capsys.readouterr().out)
         kv.is_empty.assert_not_called()
 
-    async def test_a_server_kv_outage_refuses_the_run(self, tmp_path, stub_baselines):
-        """The fix-proof for the kind rule on this read: the outage reaches
-        ``_read`` as a raise and refuses, instead of rendering as EMPTY."""
-        tool = make_tool(tmp_path)
-        tool.storage_names["kv"] = "RedisKVStorage"
-        kv = tool.storages["text_chunks"]
-        kv.is_empty = AsyncMock(return_value=True)
-        kv.iter_rows = rows_stream(error=ConnectionError("redis down"))
-
-        with pytest.raises(RemoteBackendUnavailableError):
-            await tool.collect_summary()
-
     async def test_a_backend_without_enumeration_cannot_prove_emptiness(
         self, tmp_path, stub_baselines
     ):
@@ -778,11 +771,26 @@ class TestSummary:
             capsys.readouterr().out
         )
 
-    async def test_a_graph_with_entities_but_no_relations_says_so(
-        self, tmp_path, stub_baselines
+    @pytest.mark.parametrize(
+        "edge_error",
+        [
+            pytest.param(None, id="no_edges"),
+            pytest.param("capability_error", id="without_iter_edges"),
+        ],
+    )
+    async def test_a_graph_with_entities_only_reports_has_entities(
+        self, tmp_path, stub_baselines, edge_error
     ):
+        """Entities with empty edges or unimplemented ``iter_edges`` report
+        ``has entities`` rather than failing or degrading to UNREADABLE."""
+        from lightrag.exceptions import StorageCapabilityError
+
         tool = make_tool(tmp_path)
-        tool.storages["chunk_entity_relation_graph"].iter_edges = edges_stream([])
+        tool.storages["chunk_entity_relation_graph"].iter_edges = (
+            edges_stream(error=StorageCapabilityError("no edge enumeration"))
+            if edge_error
+            else edges_stream([])
+        )
 
         assert (await tool.collect_summary())["graph"] == "has entities"
 
@@ -802,91 +810,84 @@ class TestSummary:
 
         assert (await tool.collect_summary())["graph"] == "EMPTY"
 
-    async def test_a_backend_without_iter_edges_still_reports_its_entities(
-        self, tmp_path, stub_baselines
+    @pytest.mark.parametrize(
+        "backend, error",
+        [
+            pytest.param(
+                "Neo4JStorage", ConnectionError("neo4j down"), id="server_refuses"
+            ),
+            pytest.param(
+                None, OSError("graphml unreadable"), id="local_unreadable"
+            ),
+        ],
+    )
+    async def test_a_graph_read_failure_refuses_server_or_marks_local_unreadable(
+        self, tmp_path, stub_baselines, backend, error
     ):
-        """``iter_edges`` is fail-closed on a backend that never implemented
-        it. The entity half already proves the graph holds data, which is what
-        the confirmation turns on, so the run neither aborts nor degrades the
-        whole line to UNREADABLE."""
-        from lightrag.exceptions import StorageCapabilityError
-
+        """Server graph outage refuses the run; local unreadable graph renders
+        UNREADABLE without aborting."""
         tool = make_tool(tmp_path)
-        tool.storages["chunk_entity_relation_graph"].iter_edges = edges_stream(
-            error=StorageCapabilityError("no edge enumeration")
-        )
-
-        assert (await tool.collect_summary())["graph"] == "has entities"
-
-    async def test_a_server_graph_outage_refuses_the_run(
-        self, tmp_path, stub_baselines
-    ):
-        """The kind rule on the graph read: Neo4j down is a run refused with
-        nothing dropped, never a graph rendered as EMPTY."""
-        tool = make_tool(tmp_path)
-        tool.storage_names["graph"] = "Neo4JStorage"
+        if backend is not None:
+            tool.storage_names["graph"] = backend
         tool.storages["chunk_entity_relation_graph"].get_popular_labels = AsyncMock(
-            side_effect=ConnectionError("neo4j down")
+            side_effect=error
         )
 
-        with pytest.raises(RemoteBackendUnavailableError):
-            await tool.collect_summary()
+        if backend is not None:
+            with pytest.raises(RemoteBackendUnavailableError):
+                await tool.collect_summary()
+        else:
+            summary = await tool.collect_summary()
+            assert isinstance(summary["graph"], Unreadable)
+            assert "knowledge graph state" in tool.unreadable_items(summary)
 
-    async def test_a_local_graph_that_cannot_be_read_is_unreadable_not_fatal(
-        self, tmp_path, stub_baselines
+    @pytest.mark.parametrize(
+        "label, check_prompt_output",
+        [
+            pytest.param("full_docs", True, id="full_docs_named_in_last_warning"),
+            pytest.param("text_chunks", False, id="text_chunks_named_once_not_twice"),
+        ],
+    )
+    async def test_a_storage_that_did_not_open_is_named_once_in_the_last_warning(
+        self, tmp_path, stub_baselines, capsys, label, check_prompt_output
     ):
+        """A storage that never opened appears exactly once in
+        ``unreadable_items`` and is printed directly above the prompt."""
         tool = make_tool(tmp_path)
-        tool.storages["chunk_entity_relation_graph"].get_popular_labels = AsyncMock(
-            side_effect=OSError("graphml unreadable")
-        )
-
-        summary = await tool.collect_summary()
-
-        assert isinstance(summary["graph"], Unreadable)
-        assert "knowledge graph state" in tool.unreadable_items(summary)
-
-    async def test_a_storage_that_did_not_open_is_named_in_the_last_warning(
-        self, tmp_path, stub_baselines, capsys
-    ):
-        """``full_docs`` has no summary line of its own, so a corrupt one used
-        to appear only in a one-line warning at the top of a summary dozens of
-        lines long -- never in the list printed directly above the prompt."""
-        tool = make_tool(tmp_path)
-        tool.storages["full_docs"] = None
-        tool.unavailable["full_docs"] = "JSONDecodeError: bad file"
+        tool.storages[label] = None
+        tool.unavailable[label] = "JSONDecodeError: bad file"
 
         summary = await tool.collect_summary()
         items = tool.unreadable_items(summary)
         tool.print_summary(summary)
 
-        assert "full_docs (did not open)" in items
-        out = capsys.readouterr().out
-        assert "1 item(s) above could not be read" in out
-        assert "full_docs (did not open)" in out.split("could not be read")[1]
+        assert items == [f"{label} (did not open)"]
+        if check_prompt_output:
+            out = capsys.readouterr().out
+            assert "1 item(s) above could not be read" in out
+            assert f"{label} (did not open)" in out.split("could not be read")[1]
 
-    async def test_a_storage_that_did_not_open_is_named_once_not_twice(
-        self, tmp_path, stub_baselines
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            pytest.param("bad_value", id="unparseable_value"),
+            pytest.param("not_a_mapping", id="malformed_outer_record"),
+        ],
+    )
+    async def test_a_malformed_baseline_is_unreadable_not_fatal(
+        self, tmp_path, monkeypatch, mode
     ):
-        """Every value derived from a storage that never opened is Unreadable
-        for that one reason, so naming both pads the list with restatements of
-        its own first entry."""
-        tool = make_tool(tmp_path)
-        tool.storages["text_chunks"] = None
-        tool.unavailable["text_chunks"] = "JSONDecodeError: bad file"
-
-        items = tool.unreadable_items(await tool.collect_summary())
-
-        assert items == ["text_chunks (did not open)"]
-
-    async def test_a_baseline_row_that_does_not_parse_is_unreadable_not_fatal(
-        self, tmp_path, monkeypatch
-    ):
-        """``delete_workspace_configuration`` deletes by key without reading
-        the value, so a row the clear will remove anyway must not block it."""
+        """Malformed baseline rows (inner value or outer non-mapping) render as
+        UNREADABLE rather than blocking the clear that deletes them by key."""
+        from lightrag.exceptions import ConfigurationRecordMalformedError
 
         async def read_config_row_strict(config, key):
             if key.endswith("/chunks"):
-                return {"value": "not-a-dict", "workspace": "ws", "_id": key}
+                if mode == "bad_value":
+                    return {"value": "not-a-dict", "workspace": "ws", "_id": key}
+                raise ConfigurationRecordMalformedError(
+                    f"configuration record {key!r} is not a mapping: 'garbage'"
+                )
             return None
 
         monkeypatch.setattr(
@@ -918,50 +919,23 @@ class TestSummary:
         with pytest.raises(RemoteBackendUnavailableError):
             await tool.collect_summary()
 
-    async def test_a_baseline_record_that_is_not_a_row_is_unreadable_not_fatal(
-        self, tmp_path, monkeypatch
-    ):
-        """Damage at the OUTER depth, the mirror of the test above it: the
-        key maps to a string rather than to a row, so ``from_row`` is never
-        reached. The store answered and can still delete the record by key,
-        so this is corruption the clear removes -- it used to refuse the run
-        with nothing deleted, in the one situation the tool exists for."""
-        from lightrag.exceptions import ConfigurationRecordMalformedError
-
-        async def read_config_row_strict(config, key):
-            if key.endswith("/chunks"):
-                raise ConfigurationRecordMalformedError(
-                    f"configuration record {key!r} is not a mapping: 'garbage'"
-                )
-            return None
-
-        monkeypatch.setattr(
-            clear_storage, "read_config_row_strict", read_config_row_strict
-        )
-        tool = make_tool(tmp_path)
-
-        summary = await tool.collect_summary()
-
-        assert isinstance(summary["baselines"]["chunks"], Unreadable)
-        assert "chunks embedding baseline" in tool.unreadable_items(summary)
-
 
 class TestInputDirResolution:
     """``DocumentManager`` keeps a named workspace's uploads under
     ``INPUT_DIR/<workspace>``; the tool must delete THOSE, not the default
     workspace's files one level up."""
 
-    def test_a_named_workspace_uses_its_subdirectory(self, tmp_path):
+    @pytest.mark.parametrize(
+        "workspace, rel_suffix",
+        [("ws1", "ws1"), ("", "")],
+        ids=["named_workspace", "default_workspace"],
+    )
+    def test_workspace_input_dir_resolution(self, tmp_path, workspace, rel_suffix):
         tool = ClearTool()
-        tool.workspace = "ws1"
-        base = str(tmp_path / "inputs")
-        assert tool.resolve_input_dir(base) == str(tmp_path / "inputs" / "ws1")
-
-    def test_the_default_workspace_uses_the_base_directory(self, tmp_path):
-        tool = ClearTool()
-        tool.workspace = ""
-        base = str(tmp_path / "inputs")
-        assert tool.resolve_input_dir(base) == str(tmp_path / "inputs")
+        tool.workspace = workspace
+        base = tmp_path / "inputs"
+        expected = base / rel_suffix if rel_suffix else base
+        assert tool.resolve_input_dir(str(base)) == str(expected)
 
     def test_a_traversing_workspace_name_is_refused(self, tmp_path):
         tool = ClearTool()
@@ -993,14 +967,11 @@ class TestKindRule:
             "QdrantVectorDBStorage",
             "MilvusVectorDBStorage",
             "OpenSearchVectorDBStorage",
+            "SomeCustomStorage",  # unknown backend treated conservatively as server
         ],
     )
-    def test_server_backends(self, name):
+    def test_server_and_unknown_backends(self, name):
         assert is_server_backed(name) is True
-
-    def test_an_unknown_backend_is_treated_as_a_server(self):
-        """Refusing a run is recoverable; a partial clear is not."""
-        assert is_server_backed("SomeCustomStorage") is True
 
 
 # ---------------------------------------------------------------------------
@@ -1103,27 +1074,18 @@ class TestSiblingModelContainers:
         assert "ws_chunks_model_a_8d" in out
         assert "owner not recorded" in out
 
-    async def test_a_refused_vector_target_is_not_asked_for_its_siblings(
-        self, tmp_path, stub_baselines
+    @pytest.mark.parametrize(
+        "attr, reason",
+        [
+            pytest.param("refused_vdbs", "another vector space", id="refused_vdb"),
+            pytest.param("unavailable", "corrupt snapshot", id="unopened_storage"),
+        ],
+    )
+    async def test_a_refused_or_unopened_vector_target_is_not_asked_for_its_siblings(
+        self, tmp_path, stub_baselines, capsys, attr, reason
     ):
         tool = make_tool(tmp_path)
-        tool.refused_vdbs["chunks_vdb"] = "another vector space"
-        listing = AsyncMock(return_value=["ws_chunks_model_a_8d"])
-        tool.storages["chunks_vdb"].unvouched_sibling_containers = listing
-
-        summary = await tool.collect_summary()
-
-        listing.assert_not_called()
-        assert summary["unvouched_siblings"] == {}
-
-    async def test_a_storage_that_did_not_open_is_not_asked_for_its_siblings(
-        self, tmp_path, stub_baselines, capsys
-    ):
-        """Only a file-backed storage fails to open and still gets here, and
-        those have no siblings: a line saying theirs could not be read would
-        be about nothing."""
-        tool = make_tool(tmp_path)
-        tool.unavailable["chunks_vdb"] = "corrupt snapshot"
+        getattr(tool, attr)["chunks_vdb"] = reason
         listing = AsyncMock(return_value=["ws_chunks_model_a_8d"])
         tool.storages["chunks_vdb"].unvouched_sibling_containers = listing
 
@@ -1132,7 +1094,8 @@ class TestSiblingModelContainers:
 
         listing.assert_not_called()
         assert summary["unvouched_siblings"] == {}
-        assert "other models' containers" not in plain(capsys.readouterr().out)
+        if attr == "unavailable":
+            assert "other models' containers" not in plain(capsys.readouterr().out)
 
     async def test_an_unreadable_sibling_listing_is_named_above_the_prompt(
         self, tmp_path, stub_baselines, capsys
@@ -1478,77 +1441,97 @@ class TestSetup:
         for label in DATA_STORAGE_LABELS:
             fakes[label].initialize.assert_not_awaited()
 
-    async def test_a_server_backend_that_cannot_open_refuses_the_run(
-        self, tmp_path, monkeypatch, capsys
+    @pytest.mark.parametrize(
+        "stage, label, category, backend, error, expected_msg",
+        [
+            pytest.param(
+                "open",
+                "entities_vdb",
+                "vector",
+                "QdrantVectorDBStorage",
+                ConnectionError("vector backend down"),
+                "vector backend down",
+                id="server_cannot_open",
+            ),
+            pytest.param(
+                "construct",
+                "doc_status",
+                "doc_status",
+                "PGDocStatusStorage",
+                ConnectionError("cannot resolve host"),
+                "refuses the run",
+                id="server_cannot_construct",
+            ),
+        ],
+    )
+    async def test_a_server_backend_construct_or_open_failure_refuses_the_run(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+        stage,
+        label,
+        category,
+        backend,
+        error,
+        expected_msg,
     ):
-        """Clearing the others would leave the unreachable one populated."""
+        """A server backend that fails to construct or open refuses the run so
+        clearing the others never leaves the unreachable one populated."""
         fakes = openable_fakes()
-        fakes["entities_vdb"].initialize = AsyncMock(
-            side_effect=ConnectionError("vector backend down")
-        )
+        if stage == "open":
+            fakes[label].initialize = AsyncMock(side_effect=error)
+        else:
+            fakes[label] = error
         tool = ClearTool()
-        names = {**FILE_BACKED_NAMES, "vector": "QdrantVectorDBStorage"}
+        names = {**FILE_BACKED_NAMES, category: backend}
         setup_tool_on_fakes(tool, tmp_path, monkeypatch, fakes, names=names)
 
         assert await tool.setup_storages() is False
         out = capsys.readouterr().out
         assert "refuses the run" in out
-        assert "vector backend down" in out
+        assert expected_msg in out
 
-    async def test_a_file_backed_storage_that_cannot_open_is_dropped_anyway(
-        self, tmp_path, monkeypatch, capsys
+    @pytest.mark.parametrize(
+        "stage",
+        [
+            pytest.param("open", id="corrupt_open_still_dropped"),
+            pytest.param("construct", id="corrupt_construct_is_failed_drop"),
+        ],
+    )
+    async def test_file_backed_construct_or_open_failure_outcome(
+        self, tmp_path, monkeypatch, capsys, stage
     ):
-        """A corrupt local file is data the operator is deleting: shown,
-        marked unavailable, and still handed to ``drop()``."""
+        """A file-backed storage failing ``initialize`` is marked unavailable
+        and still dropped; one failing construction has no instance to drop and
+        is reported as a failed drop."""
         fakes = openable_fakes()
-        fakes["text_chunks"].initialize = AsyncMock(
-            side_effect=ValueError("Expecting value: line 2 column 1")
-        )
+        if stage == "open":
+            label = "text_chunks"
+            fakes[label].initialize = AsyncMock(
+                side_effect=ValueError("Expecting value: line 2 column 1")
+            )
+        else:
+            label = "chunk_entity_relation_graph"
+            fakes[label] = SyntaxError("syntax error: line 1")
+
         tool = ClearTool()
         setup_tool_on_fakes(tool, tmp_path, monkeypatch, fakes)
 
         assert await tool.setup_storages() is True
-        assert list(tool.unavailable) == ["text_chunks"]
-        assert "will be dropped anyway" in capsys.readouterr().out
-
+        assert label in tool.unavailable
         outcome = await tool.drop_all()
 
-        fakes["text_chunks"].drop.assert_awaited_once()
-        assert outcome.all_succeeded
-
-    async def test_a_storage_that_cannot_be_constructed_is_a_failed_drop(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        """NetworkX parses its file in the constructor, so a corrupt GraphML
-        leaves no instance to drop. Reported as a failed drop -- the records
-        stay, the exit is non-zero -- never silently skipped."""
-        fakes = openable_fakes()
-        fakes["chunk_entity_relation_graph"] = SyntaxError("syntax error: line 1")
-        tool = ClearTool()
-        setup_tool_on_fakes(tool, tmp_path, monkeypatch, fakes)
-
-        assert await tool.setup_storages() is True
-        assert tool.storages["chunk_entity_relation_graph"] is None
-        assert "chunk_entity_relation_graph" in tool.unavailable
-
-        outcome = await tool.drop_all()
-
-        failed = dict(outcome.failed)
-        assert "not constructed" in failed["chunk_entity_relation_graph"]
-        assert "by hand" in failed["chunk_entity_relation_graph"]
-        assert len(outcome.succeeded) == 10
-
-    async def test_a_server_backend_that_cannot_be_constructed_refuses_the_run(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        fakes = openable_fakes()
-        fakes["doc_status"] = ConnectionError("cannot resolve host")
-        tool = ClearTool()
-        names = {**FILE_BACKED_NAMES, "doc_status": "PGDocStatusStorage"}
-        setup_tool_on_fakes(tool, tmp_path, monkeypatch, fakes, names=names)
-
-        assert await tool.setup_storages() is False
-        assert "refuses the run" in capsys.readouterr().out
+        if stage == "open":
+            assert "will be dropped anyway" in capsys.readouterr().out
+            fakes[label].drop.assert_awaited_once()
+            assert outcome.all_succeeded
+        else:
+            assert tool.storages[label] is None
+            failed = dict(outcome.failed)
+            assert "not constructed" in failed[label]
+            assert "by hand" in failed[label]
+            assert len(outcome.succeeded) == 10
 
     async def test_the_storages_receive_the_server_factory_embedding_function(
         self, tmp_path, monkeypatch

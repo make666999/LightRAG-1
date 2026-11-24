@@ -35,6 +35,13 @@ from lightrag.kg.networkx_impl import NetworkXStorage
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 from lightrag.utils import VectorStorageConsistencyError, make_relation_chunk_key
 
+from ._fakes import (
+    DeferredTrackingKV as _DeferredKVStorage,
+    ImmediateTrackingKV as _KVStorage,
+    InjectedBackendError as _Boom,
+    TrackingVectorDouble as _VectorStorage,
+)
+
 pytestmark = pytest.mark.offline
 
 SOURCE = "ATLAS"
@@ -50,93 +57,6 @@ def _shared_data():
     initialize_share_data()
     yield
     finalize_share_data()
-
-
-class _Boom(RuntimeError):
-    """Injected backend failure."""
-
-
-class _KVStorage:
-    """Immediate-write KV double: a delete is durable before the next await."""
-
-    def __init__(self, tag):
-        self.tag = tag
-        self.records: dict = {}
-        self.timeline: list = []
-        self.delete_error: BaseException | None = None
-
-    async def get_by_id(self, key):
-        return self.records.get(key)
-
-    async def get_by_ids(self, keys):
-        return [self.records.get(key) for key in keys]
-
-    async def upsert(self, data):
-        self.timeline.append(("upsert", self.tag, sorted(data)))
-        self.records.update(data)
-
-    async def delete(self, ids):
-        # Yield before recording anything: a real RPC-backed store round-trips
-        # here, so this is the suspension point at which a pending cancellation
-        # is delivered. Without it the double would swallow every cancellation
-        # aimed at the retirement step and `TestCancellationDoesNotStrandRows`
-        # could not tell a protected cleanup from an unprotected one.
-        await asyncio.sleep(0)
-        if self.delete_error is not None:
-            raise self.delete_error
-        self.timeline.append(("delete", self.tag, sorted(ids)))
-        for key in ids:
-            self.records.pop(key, None)
-
-    async def index_done_callback(self):
-        await asyncio.sleep(0)
-
-    async def is_empty(self):
-        return not self.records
-
-
-class _VectorStorage:
-    def __init__(self, global_config):
-        self.global_config = global_config
-        self.delete_error: BaseException | None = None
-
-    async def upsert(self, data):
-        pass
-
-    async def delete(self, ids):
-        # A real vector store round-trips here; the yield makes this a genuine
-        # await between the graph work around it.
-        await asyncio.sleep(0)
-        if self.delete_error is not None:
-            raise self.delete_error
-
-    async def delete_entity(self, entity_name):
-        pass
-
-    async def delete_entity_relation(self, entity_name):
-        pass
-
-    async def index_done_callback(self):
-        await asyncio.sleep(0)
-
-
-class _DeferredKVStorage(_KVStorage):
-    """The default JsonKVStorage's durability: upsert touches memory only.
-
-    ``records`` is the shared in-memory view every process sees; ``persisted``
-    is what a restart would find. Only ``index_done_callback`` moves one to the
-    other, which is what makes the ordering against the graph commit observable
-    at all -- with the immediate-write double above, every write is already on
-    "disk" and the window cannot exist.
-    """
-
-    def __init__(self, tag):
-        super().__init__(tag)
-        self.persisted: dict = {}
-
-    async def index_done_callback(self):
-        await asyncio.sleep(0)
-        self.persisted = {key: dict(value) for key, value in self.records.items()}
 
 
 class _ImmediateWriteGraph:

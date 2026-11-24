@@ -10,6 +10,7 @@ deleted anchor is rebuilt from the surviving consistent snapshots. See
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import os
@@ -24,6 +25,7 @@ import pytest
 from lightrag import LightRAG
 from lightrag import config_anchor as ca
 from lightrag import config_store as cs
+from lightrag.config_store import create_configuration_storage
 from lightrag.config_shards import (
     RESERVED_WORKSPACE_NAMES,
     discover_shards,
@@ -1375,3 +1377,122 @@ async def test_a_damaged_member_snapshot_must_leave_before_the_rebind(tmp_path):
         os.unlink(ca.anchor_path(str(tmp_path)))
     await _start_and_stop(tmp_path, "teamalpha")
     assert _anchor(tmp_path).members == ("teamalpha",)
+
+
+# ---------------------------------------------------------------------------
+# Multi-instance sharing of JSON configuration snapshots (in-process)
+# ---------------------------------------------------------------------------
+
+
+def _sharing_config_storage(working_dir, workspace=""):
+    async def _func(texts, **kwargs):
+        return np.zeros((len(texts), 4), dtype=np.float32)
+
+    return create_configuration_storage(
+        JsonKVStorage,
+        global_config={
+            "working_dir": str(working_dir),
+            "workspace": workspace,
+            "embedding_batch_num": 1,
+        },
+        embedding_func=EmbeddingFunc(embedding_dim=4, func=_func, model_name="bge-m3"),
+    )
+
+
+def _sharing_config_file(working_dir, workspace=""):
+    base = working_dir / workspace if workspace else working_dir
+    return base / "kv_workspace_config.json"
+
+
+async def test_two_tenants_in_one_process_read_and_write_their_own_rows(tmp_path):
+    """Concurrent use by two workspaces, the way the contract intends it:
+    two snapshots, two in-memory namespaces, no row crosses over."""
+    first = _sharing_config_storage(tmp_path, "tenant-a")
+    second = _sharing_config_storage(tmp_path, "tenant-b")
+    assert first._file_name != second._file_name
+    await asyncio.gather(first.initialize(), second.initialize())
+
+    await asyncio.gather(
+        first.upsert({"tenant-a/embedding_baseline.entities": {"value": {"m": "A"}}}),
+        second.upsert({"tenant-b/embedding_baseline.entities": {"value": {"m": "B"}}}),
+    )
+
+    mine, theirs = await asyncio.gather(
+        first.get_by_id("tenant-a/embedding_baseline.entities"),
+        second.get_by_id("tenant-b/embedding_baseline.entities"),
+    )
+    assert mine["value"] == {"m": "A"}
+    assert theirs["value"] == {"m": "B"}
+
+    # Separate snapshots: neither sees the other's row, in memory or on disk.
+    assert (await first.get_by_id("tenant-b/embedding_baseline.entities")) is None
+    assert (await second.get_by_id("tenant-a/embedding_baseline.entities")) is None
+
+    await asyncio.gather(first.index_done_callback(), second.index_done_callback())
+    await asyncio.gather(first.finalize(), second.finalize())
+
+    assert sorted(
+        json.loads(_sharing_config_file(tmp_path, "tenant-a").read_text())
+    ) == ["tenant-a/embedding_baseline.entities"]
+    assert sorted(
+        json.loads(_sharing_config_file(tmp_path, "tenant-b").read_text())
+    ) == ["tenant-b/embedding_baseline.entities"]
+
+
+async def test_one_holder_leaving_does_not_empty_the_snapshot(tmp_path):
+    """A hold is per instance; the snapshot outlives any one of its holders."""
+    first = _sharing_config_storage(tmp_path, "tenant")
+    second = _sharing_config_storage(tmp_path, "tenant")
+    await first.initialize()
+    await second.initialize()
+
+    await first.upsert({"tenant-a/embedding_baseline.entities": {"value": {"m": "A"}}})
+    await first.index_done_callback()
+    await first.finalize()
+
+    still_there = await second.get_by_id("tenant-a/embedding_baseline.entities")
+    assert still_there is not None, "the surviving instance lost the snapshot"
+
+    await second.upsert({"tenant-b/embedding_baseline.entities": {"value": {"m": "B"}}})
+    await second.index_done_callback()
+    await second.finalize()
+
+    persisted = json.loads(_sharing_config_file(tmp_path, "tenant").read_text())
+    assert sorted(persisted) == [
+        "tenant-a/embedding_baseline.entities",
+        "tenant-b/embedding_baseline.entities",
+    ]
+
+
+async def test_a_restart_reads_back_both_tenants(tmp_path):
+    """Every instance gone, then new ones: each file is the source of truth
+    for its own workspace, and only for it."""
+    first = _sharing_config_storage(tmp_path, "tenant-a")
+    second = _sharing_config_storage(tmp_path, "tenant-b")
+    await first.initialize()
+    await second.initialize()
+    await first.upsert({"tenant-a/embedding_baseline.entities": {"value": {"m": "A"}}})
+    await second.upsert({"tenant-b/embedding_baseline.entities": {"value": {"m": "B"}}})
+    await first.index_done_callback()
+    await second.index_done_callback()
+    await first.finalize()
+    await second.finalize()
+
+    restarted_a = _sharing_config_storage(tmp_path, "tenant-a")
+    restarted_b = _sharing_config_storage(tmp_path, "tenant-b")
+    await restarted_a.initialize()
+    await restarted_b.initialize()
+    try:
+        assert (
+            await restarted_a.get_by_id("tenant-a/embedding_baseline.entities")
+        ) is not None
+        assert (
+            await restarted_b.get_by_id("tenant-b/embedding_baseline.entities")
+        ) is not None
+        assert (
+            await restarted_a.get_by_id("tenant-b/embedding_baseline.entities")
+        ) is None
+    finally:
+        await restarted_a.finalize()
+        await restarted_b.finalize()
+

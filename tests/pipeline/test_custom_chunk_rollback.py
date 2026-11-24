@@ -10,9 +10,6 @@ deterministic fake — same harness as test_custom_chunk_patch.py.
 
 from __future__ import annotations
 
-from uuid import uuid4
-
-import numpy as np
 import pytest
 
 import lightrag.lightrag as lightrag_module
@@ -20,51 +17,25 @@ import lightrag.operate as operate_module
 from lightrag import LightRAG
 from lightrag.base import DocStatus
 from lightrag.operate import KGRebuildReport
-from lightrag.utils import (
-    LLM_TRUNCATION_METADATA_KEY,
-    EmbeddingFunc,
-    Tokenizer,
-    TruncatedResponse,
-)
+from lightrag.utils import LLM_TRUNCATION_METADATA_KEY, TruncatedResponse
 from lightrag.utils_pipeline import (
     CUSTOM_CHUNK_PATCH_METADATA_KEY,
     KG_RECOVERY_WARNINGS_METADATA_KEY,
     make_custom_chunk_id,
 )
 
+from ._fakes import build_initialized_rag
+
 pytestmark = pytest.mark.offline
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*args, **kwargs) -> str:
-    return "ok"
-
-
 async def _build_rag(tmp_path, **overrides) -> LightRAG:
-    rag = LightRAG(
-        working_dir=str(tmp_path / "wd"),
-        workspace=f"ccroll-{uuid4().hex[:8]}",
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+    return await build_initialized_rag(
+        tmp_path,
+        workspace_prefix="ccroll",
         max_parallel_insert=1,
         **overrides,
     )
-    await rag.initialize_storages()
-    return rag
 
 
 def _fake_extraction(rag, monkeypatch):

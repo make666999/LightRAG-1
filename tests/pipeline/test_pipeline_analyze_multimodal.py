@@ -22,64 +22,38 @@ Covers the contract introduced by the LR2 multimodal rewrite:
 
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
 import json
 import logging
-import struct
-import zlib
 from pathlib import Path
 
-import numpy as np
 import pytest
 
-from lightrag import LightRAG, ROLES, RoleLLMConfig
-from lightrag.exceptions import MultimodalAnalysisError, PipelineCancelledException
-from lightrag.utils import (
-    EmbeddingFunc,
-    LLM_TRUNCATION_METADATA_KEY,
-    Tokenizer,
+from lightrag import ROLES, LightRAG, RoleLLMConfig
+from lightrag.constants import (
+    DEFAULT_MM_IMAGE_MIN_PIXEL,
+    MM_ANALYSIS_ITEM_CONCURRENCY_FACTOR,
 )
+from lightrag.exceptions import MultimodalAnalysisError, PipelineCancelledException
+from lightrag.pipeline import _vlm_image_budget_limits
+from lightrag.utils import LLM_TRUNCATION_METADATA_KEY
 
+from ._fakes import (
+    PNG_BYTES,
+    make_lightrag,
+    make_png_bytes,
+    shutdown_role_workers,
+)
 
 pytestmark = pytest.mark.offline
 
-
-def _png_bytes(width: int, height: int) -> bytes:
-    """Build a minimal but parser-accepted PNG with the given dimensions."""
-    signature = b"\x89PNG\r\n\x1a\n"
-    ihdr_payload = struct.pack(">II", width, height) + b"\x08\x06\x00\x00\x00"
-    ihdr_crc = zlib.crc32(b"IHDR" + ihdr_payload).to_bytes(4, "big")
-    ihdr = struct.pack(">I", len(ihdr_payload)) + b"IHDR" + ihdr_payload + ihdr_crc
-    idat_raw = b"\x00" * (width * height * 4 + height)
-    idat_compressed = zlib.compress(idat_raw)
-    idat_crc = zlib.crc32(b"IDAT" + idat_compressed).to_bytes(4, "big")
-    idat = (
-        struct.pack(">I", len(idat_compressed)) + b"IDAT" + idat_compressed + idat_crc
-    )
-    iend = b"\x00\x00\x00\x00IEND\xaeB`\x82"
-    return signature + ihdr + idat + iend
-
-
-PNG_BYTES = _png_bytes(64, 64)
-TINY_PNG_BYTES = _png_bytes(8, 8)
+TINY_PNG_BYTES = make_png_bytes(8, 8)
 TINY_JPEG_BYTES = base64.b64decode(
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U"
     "HRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAAIAAgBAREA"
     "/8QAFAABAAAAAAAAAAAAAAAAAAAAB//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8Af3//2Q=="
 )
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _mock_embedding(texts: list[str]) -> np.ndarray:
-    return np.random.rand(len(texts), 8)
 
 
 def _make_vlm_mock(call_log: list[dict]):
@@ -115,27 +89,30 @@ def _build_rag(
     vlm_process_enable: bool = True,
     vlm_func=None,
     extract_func=None,
+    vlm_max_async: int | None = None,
+    enable_llm_cache_for_entity_extract: bool = True,
+    workspace_prefix: str = "vlm-pipeline",
 ) -> LightRAG:
     role_configs = {}
     for spec in ROLES:
         if spec.name == "vlm" and vlm_func is not None:
-            role_configs[spec.name] = RoleLLMConfig(func=vlm_func)
+            vlm_kwargs = {"func": vlm_func}
+            if vlm_max_async is not None:
+                vlm_kwargs["max_async"] = vlm_max_async
+            role_configs[spec.name] = RoleLLMConfig(**vlm_kwargs)
         elif spec.name == "extract" and extract_func is not None:
             role_configs[spec.name] = RoleLLMConfig(func=extract_func)
         else:
             role_configs[spec.name] = RoleLLMConfig()
     base_func = vlm_func or extract_func
-    return LightRAG(
-        working_dir=str(tmp_path),
-        workspace=f"vlm-pipeline-{tmp_path.name}",
+    return make_lightrag(
+        tmp_path,
+        subdir=None,
+        workspace=f"{workspace_prefix}-{tmp_path.name}",
         llm_model_func=base_func,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8,
-            max_token_size=1024,
-            func=_mock_embedding,
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        max_token_size=1024,
         vlm_process_enable=vlm_process_enable,
+        enable_llm_cache_for_entity_extract=enable_llm_cache_for_entity_extract,
         role_llm_configs=role_configs,
     )
 
@@ -648,6 +625,7 @@ async def test_invalid_vlm_response_hard_fails(tmp_path):
         payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
         item = payload["drawings"]["im-001"]
         assert item["llm_analyze_result"]["status"] == "failure"
+        assert "missing or invalid field" in item["llm_analyze_result"]["message"]
     finally:
         await rag.finalize_storages()
 
@@ -1118,27 +1096,12 @@ async def test_analysis_cache_respects_disabled_flag(tmp_path):
     to sidecar item.llm_cache_list — otherwise document deletion would try
     to clean up cache entries that were never written."""
     call_log: list[dict] = []
-    rag = LightRAG(
-        working_dir=str(tmp_path),
-        workspace=f"vlm-pipeline-cache-{tmp_path.name}",
-        llm_model_func=_make_vlm_mock(call_log),
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8,
-            max_token_size=1024,
-            func=_mock_embedding,
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+    rag = _build_rag(
+        tmp_path,
         vlm_process_enable=True,
-        # Disable the analysis cache (same flag handle_cache uses for mode="default").
+        vlm_func=_make_vlm_mock(call_log),
         enable_llm_cache_for_entity_extract=False,
-        role_llm_configs={
-            spec.name: (
-                RoleLLMConfig(func=_make_vlm_mock(call_log))
-                if spec.name == "vlm"
-                else RoleLLMConfig()
-            )
-            for spec in ROLES
-        },
+        workspace_prefix="vlm-pipeline-cache",
     )
     await rag.initialize_storages()
     try:
@@ -2537,3 +2500,328 @@ async def test_analyze_rewrite_keeps_lf_line_endings(
         assert b"\r\n" not in raw, "analyze rewrote the sidecar with CRLF"
     finally:
         await rag.finalize_storages()
+
+
+# ---------------------------------------------------------------------------
+# Per-sidecar item concurrency, sibling failure propagation, and child drain
+# ---------------------------------------------------------------------------
+
+_CONCURRENCY_VLM_MAX_ASYNC = 1
+_CONCURRENCY_ITEM_COUNT = 12
+
+
+async def _ok_vlm_delayed(prompt, **kwargs):
+    await asyncio.sleep(0.005)
+    return json.dumps({"name": "fig", "type": "Chart", "description": "ok"})
+
+
+def _build_concurrency_rag(tmp_path: Path) -> LightRAG:
+    return _build_rag(
+        tmp_path,
+        vlm_process_enable=True,
+        vlm_func=_ok_vlm_delayed,
+        vlm_max_async=_CONCURRENCY_VLM_MAX_ASYNC,
+        enable_llm_cache_for_entity_extract=True,
+        workspace_prefix="mm-items",
+    )
+
+
+def _write_drawings_batch(tmp_path: Path, count: int) -> tuple[dict, Path]:
+    parsed_dir = tmp_path / "parsed"
+    parsed_dir.mkdir()
+    blocks_path = parsed_dir / "doc.blocks.jsonl"
+    blocks_path.write_text(
+        json.dumps({"type": "meta", "doc_id": "doc-1"}) + "\n", encoding="utf-8"
+    )
+    drawings = {}
+    for idx in range(count):
+        image = parsed_dir / f"im-{idx:02d}.png"
+        image.write_bytes(PNG_BYTES)
+        drawings[f"im-{idx:02d}"] = {"caption": f"figure {idx}", "path": str(image)}
+    sidecar_path = parsed_dir / "doc.drawings.json"
+    sidecar_path.write_text(json.dumps({"drawings": drawings}), encoding="utf-8")
+    return {"blocks_path": str(blocks_path)}, sidecar_path
+
+
+def _write_tables_batch(tmp_path: Path, count: int) -> tuple[dict, Path]:
+    parsed_dir = tmp_path / "parsed"
+    parsed_dir.mkdir()
+    blocks_path = parsed_dir / "doc.blocks.jsonl"
+    blocks_path.write_text(
+        json.dumps({"type": "meta", "doc_id": "doc-1"}) + "\n", encoding="utf-8"
+    )
+    tables = {
+        f"tb-{idx:02d}": {
+            "caption": f"table {idx}",
+            "format": "html",
+            "content": f"<table><tr><td>cell {idx}</td></tr></table>",
+        }
+        for idx in range(count)
+    }
+    sidecar_path = parsed_dir / "doc.tables.json"
+    sidecar_path.write_text(json.dumps({"tables": tables}), encoding="utf-8")
+    return {"blocks_path": str(blocks_path)}, sidecar_path
+
+
+def _mm_pipeline_status() -> tuple[dict, asyncio.Lock]:
+    return (
+        {
+            "busy": True,
+            "history_messages": [],
+            "latest_message": "",
+            "cancellation_requested": False,
+        },
+        asyncio.Lock(),
+    )
+
+
+async def _run_analyze_with_status(
+    rag: LightRAG, parsed_data: dict, *, process_options: str = "i"
+) -> dict:
+    status, lock = _mm_pipeline_status()
+    return await asyncio.wait_for(
+        rag.analyze_multimodal(
+            doc_id="doc-1",
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options=process_options,
+            pipeline_status=status,
+            pipeline_status_lock=lock,
+        ),
+        timeout=30.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cache_reads_are_bounded_by_role_concurrency(tmp_path):
+    rag = _build_concurrency_rag(tmp_path)
+    await rag.initialize_storages()
+    try:
+        parsed_data, sidecar_path = _write_drawings_batch(
+            tmp_path, _CONCURRENCY_ITEM_COUNT
+        )
+        cache = rag.llm_response_cache
+        original_get = cache.get_by_id
+        in_flight = {"now": 0, "peak": 0}
+
+        async def tracking_get(key):
+            in_flight["now"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+            try:
+                await asyncio.sleep(0.01)
+                return await original_get(key)
+            finally:
+                in_flight["now"] -= 1
+
+        cache.get_by_id = tracking_get
+
+        result = await _run_analyze_with_status(rag, parsed_data)
+
+        assert result.get("multimodal_processed") is True
+        assert (
+            _CONCURRENCY_ITEM_COUNT
+            > _CONCURRENCY_VLM_MAX_ASYNC * MM_ANALYSIS_ITEM_CONCURRENCY_FACTOR
+        )
+        assert in_flight["peak"] == (
+            _CONCURRENCY_VLM_MAX_ASYNC * MM_ANALYSIS_ITEM_CONCURRENCY_FACTOR
+        ), in_flight
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        assert all(
+            item["llm_analyze_result"]["status"] == "success"
+            for item in payload["drawings"].values()
+        )
+    finally:
+        await shutdown_role_workers(rag)
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_op", ["get_by_id", "upsert"])
+async def test_unexpected_cache_error_fails_analysis_with_root_cause(
+    tmp_path, failing_op
+):
+    rag = _build_concurrency_rag(tmp_path)
+    await rag.initialize_storages()
+    try:
+        parsed_data, sidecar_path = _write_drawings_batch(
+            tmp_path, _CONCURRENCY_ITEM_COUNT
+        )
+        cache = rag.llm_response_cache
+        original = getattr(cache, failing_op)
+        calls = {"n": 0}
+
+        async def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("Too many connections")
+            await asyncio.sleep(0.01)
+            return await original(*args, **kwargs)
+
+        setattr(cache, failing_op, flaky)
+
+        with pytest.raises(MultimodalAnalysisError) as excinfo:
+            await _run_analyze_with_status(rag, parsed_data)
+
+        assert "Too many connections" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        results = {
+            item_id: item["llm_analyze_result"]
+            for item_id, item in payload["drawings"].items()
+        }
+        failed = [
+            item_id
+            for item_id, r in results.items()
+            if r["status"] == "failure" and "Too many connections" in r["message"]
+        ]
+        assert len(failed) == 1
+        assert f"drawings/{failed[0]}" in str(excinfo.value)
+        cancelled = [
+            r["message"]
+            for r in results.values()
+            if r["status"] == "failure" and r["message"].startswith("cancelled")
+        ]
+        assert cancelled
+        assert all(f"sibling drawings/{failed[0]} failed" in m for m in cancelled)
+    finally:
+        await shutdown_role_workers(rag)
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_table_error_names_item_like_its_own_errors(tmp_path):
+    """Wrapped error and sibling markers spell ``table/<id>``, never ``tables/<id>``."""
+    rag = _build_concurrency_rag(tmp_path)
+    await rag.initialize_storages()
+    try:
+        parsed_data, sidecar_path = _write_tables_batch(
+            tmp_path, _CONCURRENCY_ITEM_COUNT
+        )
+        cache = rag.llm_response_cache
+        original_get = cache.get_by_id
+        calls = {"n": 0}
+
+        async def flaky_get(key):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("Too many connections")
+            await asyncio.sleep(0.01)
+            return await original_get(key)
+
+        cache.get_by_id = flaky_get
+
+        with pytest.raises(MultimodalAnalysisError) as excinfo:
+            await _run_analyze_with_status(rag, parsed_data, process_options="t")
+
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        results = {
+            item_id: item["llm_analyze_result"]
+            for item_id, item in payload["tables"].items()
+        }
+        failed = [
+            item_id
+            for item_id, r in results.items()
+            if r["status"] == "failure" and "Too many connections" in r["message"]
+        ]
+        assert len(failed) == 1, results
+        message = str(excinfo.value)
+        assert message.startswith(f"table/{failed[0]}: unexpected error: "), message
+        assert "RuntimeError" in message
+        cancelled = [
+            r["message"]
+            for r in results.values()
+            if r["message"].startswith("cancelled")
+        ]
+        assert cancelled, results
+        assert all(
+            m == f"cancelled (sibling table/{failed[0]} failed)" for m in cancelled
+        )
+        assert not any("tables/" in r["message"] for r in results.values()), results
+    finally:
+        await shutdown_role_workers(rag)
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_external_cancel_drains_multimodal_tasks(tmp_path, monkeypatch):
+    """External cancellation drains all spawned table-analysis child tasks before returning."""
+    monkeypatch.setenv("MAX_EXTRACT_INPUT_TOKENS", "999999")
+    prior_tasks = asyncio.all_tasks()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    children = []
+    writes = []
+
+    async def extract(*args, **kwargs):
+        children.append(asyncio.current_task())
+        entered.set()
+        await release.wait()
+        writes.append("late analysis")
+        return json.dumps({"name": "table", "description": "result"})
+
+    blocks = tmp_path / "doc.blocks.jsonl"
+    blocks.write_text(json.dumps({"type": "meta", "doc_id": "doc"}) + "\n")
+    sidecar = tmp_path / "doc.tables.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "tables": {
+                    f"t{i}": {"format": "html", "content": "<table>x</table>"}
+                    for i in range(3)
+                }
+            }
+        )
+    )
+    rag = make_lightrag(tmp_path, workspace_prefix="cancel-mm", max_parallel_insert=1)
+    await rag.initialize_storages()
+    extract_state = rag._role_llm_states["extract"]
+    original_extract = extract_state.wrapped
+    extract_state.wrapped = extract
+    try:
+        parent = asyncio.create_task(
+            rag.analyze_multimodal(
+                "doc", "doc.pdf", {"blocks_path": str(blocks)}, process_options="t"
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        parent.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await parent
+        assert all(task.done() for task in children)
+        release.set()
+        await asyncio.sleep(0.05)
+        assert writes == []
+    finally:
+        release.set()
+        remaining = asyncio.all_tasks() - prior_tasks
+        for task in remaining:
+            task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
+        extract_state.wrapped = original_extract
+        await shutdown_role_workers(rag)
+        await rag.finalize_storages()
+
+
+# ---------------------------------------------------------------------------
+# VLM image budget environment parsing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("env_value", ["", "  "])
+def test_empty_vlm_image_envs_fall_back(
+    env_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLM_MAX_IMAGE_BYTES", env_value)
+    monkeypatch.setenv("VLM_MIN_IMAGE_PIXEL", env_value)
+    max_b, min_p = _vlm_image_budget_limits()
+    assert max_b == 5 * 1024 * 1024
+    assert min_p == DEFAULT_MM_IMAGE_MIN_PIXEL
+
+
+def test_valid_vlm_image_envs_are_honored(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLM_MAX_IMAGE_BYTES", str(1024 * 1024))
+    monkeypatch.setenv("VLM_MIN_IMAGE_PIXEL", "128")
+    max_b, min_p = _vlm_image_budget_limits()
+    assert max_b == 1024 * 1024
+    assert min_p == 128

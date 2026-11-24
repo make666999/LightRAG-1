@@ -16,9 +16,7 @@ backend flush is exercised — this is pure lightrag.py logic.
 from __future__ import annotations
 
 import asyncio
-from uuid import uuid4
 
-import numpy as np
 import pytest
 
 from lightrag import LightRAG
@@ -27,7 +25,8 @@ from lightrag.exceptions import (
     ReferencesIntactFlushError,
     flush_may_have_lost_reference,
 )
-from lightrag.utils import EmbeddingFunc, Tokenizer
+
+from ._fakes import build_initialized_rag, noop_llm
 
 pytestmark = pytest.mark.offline
 
@@ -38,34 +37,13 @@ def _lightrag_records_reach_caplog(lightrag_caplog):
     yield
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _mock_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _noop_llm(*args, **kwargs) -> str:  # pragma: no cover - never invoked
-    return ""
-
-
 async def _make_rag(tmp_path) -> LightRAG:
-    rag = LightRAG(
-        working_dir=str(tmp_path / "wd"),
-        workspace=f"insdone-{uuid4().hex[:8]}",
-        llm_model_func=_noop_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=1024, func=_mock_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+    return await build_initialized_rag(
+        tmp_path,
+        workspace_prefix="insdone",
+        llm_model_func=noop_llm,
+        max_token_size=1024,
     )
-    await rag.initialize_storages()
-    return rag
 
 
 _UNSET = object()

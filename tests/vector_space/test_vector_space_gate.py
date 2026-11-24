@@ -443,34 +443,25 @@ class TestEmptyContainerGate:
 
         await _run(graph, FakeVectorStorage(rows=[]), FakeEmbedding(), rebuilding=True)
 
-    async def test_an_unfinished_ingest_is_not_refused(self):
-        """A graph ahead of the vector store, while a document is still in
-        flight, is a residue that HEALS -- an interrupted ingest, a batch that
-        will be retried. Refusing here would block the very process whose next
-        run repairs it (AGENTS.md, *Consistency without transactions*)."""
+    @pytest.mark.parametrize(
+        "processed, unfinished",
+        [
+            pytest.param(0, 1, id="only_unfinished"),
+            pytest.param(5, 1, id="processed_and_unfinished"),
+        ],
+    )
+    async def test_unfinished_work_is_not_refused(self, processed, unfinished):
+        """A graph ahead of the vector store while a document is still in flight
+        is a residue that HEALS (even when older PROCESSED rows also exist,
+        because high-degree nodes from an interrupted batch fill the sample).
+        Refusing here would block the retry that repairs it."""
         graph = FakeGraph(labels=["Alice", "Bob"])
 
         await _run(
             graph,
             FakeVectorStorage(rows=[]),
             FakeEmbedding(),
-            doc_status=FakeDocStatus(processed=0, unfinished=1),
-        )
-
-    async def test_unfinished_work_anywhere_does_not_refuse(self):
-        """A PROCESSED row says nothing about THESE entities. The graph is
-        ranked by degree, so an ingest that crashed after writing a batch of
-        well-connected nodes but before their vector upserts fills the whole
-        sample with rows that never had vectors -- while an older, unrelated
-        PROCESSED document supplies the "evidence" to refuse on. That refuses
-        the retry that would have healed it."""
-        graph = FakeGraph(labels=["Alice", "Bob"])
-
-        await _run(
-            graph,
-            FakeVectorStorage(rows=[]),
-            FakeEmbedding(),
-            doc_status=FakeDocStatus(processed=5, unfinished=1),
+            doc_status=FakeDocStatus(processed=processed, unfinished=unfinished),
         )
 
     async def test_an_admin_only_workspace_still_refuses(self):
@@ -534,22 +525,21 @@ class TestEmptyContainerGate:
 
         assert (vdb.empty_reads, vdb.reads) == (1, 0)
 
-    async def test_a_raising_is_empty_does_not_refuse(self):
-        """The whole point of the fail-loud contract: a backend that could not
-        read the container says so, and a raise is never evidence of
-        emptiness."""
-        vdb = FakeVectorStorage(rows=[], empty_error=RuntimeError("cluster down"))
-
-        await _run(FakeGraph(labels=["Alice"]), vdb, FakeEmbedding())
-
-    async def test_a_backend_that_cannot_answer_is_skipped(self):
-        """``StorageCapabilityError`` is the fail-closed default on the base
-        class. A backend that never implemented ``is_empty`` is one the gate
-        cannot question -- which is where every backend stood before it
-        existed."""
-        vdb = FakeVectorStorage(
-            rows=[], empty_error=StorageCapabilityError("not supported")
-        )
+    @pytest.mark.parametrize(
+        "empty_error",
+        [
+            pytest.param(RuntimeError("cluster down"), id="runtime_error"),
+            pytest.param(
+                StorageCapabilityError("not supported"), id="capability_error"
+            ),
+        ],
+    )
+    async def test_unreadable_or_unsupported_is_empty_does_not_refuse(
+        self, empty_error
+    ):
+        """A fail-loud ``is_empty`` error (transport outage or unimplemented
+        ``StorageCapabilityError``) is never evidence of emptiness."""
+        vdb = FakeVectorStorage(rows=[], empty_error=empty_error)
 
         await _run(FakeGraph(labels=["Alice"]), vdb, FakeEmbedding())
 
@@ -624,30 +614,29 @@ class TestUnfinishedWorkExemption:
     per-container. An unfinished document explains the missing vectors for the
     objects THAT document produces, and nothing else."""
 
-    async def test_unfinished_work_does_not_exempt_admin_built_entities(self):
-        """``acreate_entity`` stamps ``source_id="manual_creation"`` and writes
-        no doc-status row. No pipeline run will ever recreate such an object, so
-        an unrelated PENDING document must not excuse its empty container --
-        otherwise those entities are silently unretrievable forever."""
+    @pytest.mark.parametrize(
+        "source_id",
+        [
+            pytest.param("manual_creation", id="manual_creation"),
+            pytest.param("", id="empty_source_id"),
+        ],
+    )
+    async def test_unfinished_work_does_not_exempt_documentless_entities(
+        self, source_id
+    ):
+        """Admin writers stamp ``source_id="manual_creation"`` or ``""`` and
+        write no doc-status row. No pipeline run will ever recreate such an
+        object, so an unrelated PENDING document must not excuse its empty
+        container."""
         with pytest.raises(VectorStorageEmptyError) as excinfo:
             await _run(
-                FakeGraph(labels=["Manual"], source_id="manual_creation"),
+                FakeGraph(labels=["Manual"], source_id=source_id),
                 FakeVectorStorage(rows=[]),
                 FakeEmbedding(),
                 doc_status=FakeDocStatus(processed=5, unfinished=1),
             )
 
         assert excinfo.value.vdb_name == "entities"
-
-    async def test_an_empty_source_id_counts_as_documentless(self):
-        """The other shape the admin writers leave behind."""
-        with pytest.raises(VectorStorageEmptyError):
-            await _run(
-                FakeGraph(labels=["Manual"], source_id=""),
-                FakeVectorStorage(rows=[]),
-                FakeEmbedding(),
-                doc_status=FakeDocStatus(processed=5, unfinished=1),
-            )
 
     async def test_unfinished_work_does_not_exempt_admin_built_relations(self):
         """Edges carry ``source_id`` too, and ``iter_edges`` yields the whole
@@ -1245,33 +1234,29 @@ class TestAdoptionProbe:
 
         assert vdb.adopted == 0
 
-    async def test_a_sample_without_vectors_is_inconclusive(self):
-        row = _entity_row()
-        vdb = FakeVectorStorage(rows=[row], vectors={}, pending=True)
-        embedding = FakeEmbedding([1.0, 0.0])
-
-        await _run(FakeGraph(labels=["Alice"]), vdb, embedding)
-
-        assert embedding.calls == 0
-        assert vdb.adopted == 0
-
-    async def test_a_sample_without_content_is_inconclusive(self):
-        row = _entity_row()
-        row["content"] = "   "
+    @pytest.mark.parametrize(
+        "content, has_vector, vector_read_error",
+        [
+            pytest.param("Alice is an engineer.", False, None, id="missing_vectors"),
+            pytest.param("   ", True, None, id="blank_content"),
+            pytest.param(
+                "Alice is an engineer.",
+                False,
+                RuntimeError("timeout"),
+                id="unreadable_vectors",
+            ),
+        ],
+    )
+    async def test_missing_or_unreadable_sample_is_inconclusive(
+        self, content, has_vector, vector_read_error
+    ):
+        row = _entity_row(content=content)
+        vectors = {row["id"]: [1.0, 0.0]} if has_vector else {}
         vdb = FakeVectorStorage(
-            rows=[row], vectors={row["id"]: [1.0, 0.0]}, pending=True
-        )
-        embedding = FakeEmbedding([1.0, 0.0])
-
-        await _run(FakeGraph(labels=["Alice"]), vdb, embedding)
-
-        assert embedding.calls == 0
-        assert vdb.adopted == 0
-
-    async def test_unreadable_vectors_are_inconclusive(self):
-        row = _entity_row()
-        vdb = FakeVectorStorage(
-            rows=[row], pending=True, vector_read_error=RuntimeError("timeout")
+            rows=[row],
+            vectors=vectors,
+            pending=True,
+            vector_read_error=vector_read_error,
         )
         embedding = FakeEmbedding([1.0, 0.0])
 
@@ -1294,22 +1279,22 @@ class TestAdoptionProbe:
         assert embedding.calls == 0
         assert vdb.adopted == 0
 
-    async def test_a_denied_marker_write_does_not_fail_startup(self):
-        graph, vdb, embedding = self._setup([1.0, 0.0], [1.0, 0.0], adopt_result=False)
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            pytest.param({"adopt_result": False}, id="denied"),
+            pytest.param(
+                {"adopt_error": RuntimeError("disk full")}, id="raising"
+            ),
+        ],
+    )
+    async def test_adopt_failure_does_not_fail_startup(self, kwargs):
+        """A denied or raising ``adopt_vector_space`` call never fails startup."""
+        graph, vdb, embedding = self._setup([1.0, 0.0], [1.0, 0.0], **kwargs)
 
         await _run(graph, vdb, embedding)
 
         assert vdb.adopted == 1
-
-    async def test_a_raising_adopt_does_not_fail_startup(self):
-        """``adopt_vector_space`` is contracted never to raise; the caller
-        still refuses to let a backend that breaks that contract take the
-        process down."""
-        graph, vdb, embedding = self._setup(
-            [1.0, 0.0], [1.0, 0.0], adopt_error=RuntimeError("disk full")
-        )
-
-        await _run(graph, vdb, embedding)
 
     async def test_each_store_is_adopted_only_on_its_own_evidence(self):
         """The three vector targets share an embedding_func but NOT a history.

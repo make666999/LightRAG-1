@@ -25,9 +25,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from uuid import uuid4
 
-import numpy as np
 import pytest
 
 from lightrag import LightRAG
@@ -36,39 +34,14 @@ from lightrag.exceptions import IndexFlushError, ReferencesIntactFlushError
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.parser.registry import parser_specs_snapshot
 from lightrag.pipeline import _BatchRunContext
-from lightrag.utils import EmbeddingFunc, Tokenizer
+
+from ._fakes import build_initialized_rag
 
 pytestmark = pytest.mark.offline
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*args, **kwargs) -> str:
-    return "ok"
-
-
 async def _build_rag(tmp_path) -> LightRAG:
-    rag = LightRAG(
-        working_dir=str(tmp_path / "wd"),
-        workspace=f"flushorder-{uuid4().hex[:8]}",
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
-    )
-    await rag.initialize_storages()
-    return rag
+    return await build_initialized_rag(tmp_path, workspace_prefix="flushorder")
 
 
 def _make_status_doc(doc_id: str) -> DocProcessingStatus:

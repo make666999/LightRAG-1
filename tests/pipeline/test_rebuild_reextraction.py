@@ -7,30 +7,17 @@ that answers from markers in the chunk text, so cache keys, ``llm_cache_list``
 and the purge journal behave as in production.
 """
 
-from uuid import uuid4
-
-import numpy as np
 import pytest
 
 from lightrag import LightRAG
-from lightrag.kg.shared_storage import get_namespace_data
 from lightrag.base import DocStatus
 from lightrag.constants import GRAPH_FIELD_SEP
-from lightrag.utils import EmbeddingFunc, Tokenizer, compute_mdhash_id
+from lightrag.kg.shared_storage import get_namespace_data
+from lightrag.utils import compute_mdhash_id
+
+from ._fakes import build_initialized_rag
 
 pytestmark = pytest.mark.offline
-
-
-class _Characters:
-    def encode(self, content):
-        return [ord(c) for c in content]
-
-    def decode(self, tokens):
-        return "".join(chr(c) for c in tokens)
-
-
-async def _embed(texts):
-    return np.ones((len(texts), 8))
 
 
 # Paragraph marker -> records the stub returns for the initial extraction.
@@ -102,18 +89,16 @@ class _StubLLM:
         raise AssertionError(f"unexpected LLM prompt: {source[:200]!r}")
 
 
-async def _make_rag(tmp_path, llm: _StubLLM, **kwargs) -> LightRAG:
-    rag = LightRAG(
-        working_dir=str(tmp_path),
-        workspace=f"reextract_{uuid4().hex}",
+async def _make_rag(tmp_path, llm, **kwargs) -> LightRAG:
+    return await build_initialized_rag(
+        tmp_path,
+        subdir=None,
+        workspace_prefix="reextract",
         llm_model_func=llm,
-        embedding_func=EmbeddingFunc(embedding_dim=8, func=_embed),
-        tokenizer=Tokenizer("characters", _Characters()),
+        tokenizer_name="characters",
         max_parallel_insert=1,
         **{"entity_extract_max_gleaning": 0, **kwargs},
     )
-    await rag.initialize_storages()
-    return rag
 
 
 async def _insert(rag: LightRAG, *doc_ids: str) -> None:
@@ -622,5 +607,87 @@ async def test_validator_failure_during_reextraction_is_revalidated_on_retry(
         assert any("SHARED paragraph" in text for text in validator.calls)
         foo = await rag.chunk_entity_relation_graph.get_node("Foo")
         assert foo["description"] == "Foo shared fact [checked]"
+    finally:
+        await rag.finalize_storages()
+
+
+# ---------------------------------------------------------------------------
+# Shared extraction cache rows across documents (from test_rebuild_shared_cache_rows)
+# ---------------------------------------------------------------------------
+
+_SHARED_ROW_FACTS = {
+    "SHARED": "Foo shared fact",
+    "AONLY": "Foo fact from A",
+    "BONLY": "Foo fact from B",
+}
+
+_SHARED_ROW_DOCS = {
+    "doc-a": "SHARED paragraph about Foo.\n\nAONLY paragraph about Foo.",
+    "doc-b": "SHARED paragraph about Foo.\n\nBONLY paragraph about Foo.",
+}
+
+
+async def _shared_row_stub_llm(
+    prompt, system_prompt=None, history_messages=None, **kwargs
+):
+    for marker, fact in _SHARED_ROW_FACTS.items():
+        if f"{marker} paragraph" in prompt:
+            return (
+                f"entity<|#|>Foo<|#|>concept<|#|>{fact}\n"
+                f"entity<|#|>Bar<|#|>concept<|#|>Bar seen with {marker}\n"
+                f"relation<|#|>Foo<|#|>Bar<|#|>linked<|#|>Foo links Bar in {marker}\n"
+                "<|COMPLETE|>"
+            )
+    raise AssertionError(f"unexpected LLM prompt: {prompt[:200]!r}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted,survivor", [("doc-a", "doc-b"), ("doc-b", "doc-a")])
+async def test_shared_row_survives_deletion_of_its_first_writer(
+    tmp_path, deleted, survivor
+):
+    """Deletion rebuild attributes a shared cache row via ``llm_cache_list``, not ``chunk_id``."""
+    rag = await _make_rag(tmp_path, _shared_row_stub_llm)
+    try:
+        # doc-a is always ingested first, so its chunk is the shared row's writer.
+        for doc_id in ("doc-a", "doc-b"):
+            await rag.ainsert(
+                _SHARED_ROW_DOCS[doc_id],
+                split_by_character="\n\n",
+                split_by_character_only=True,
+                ids=[doc_id],
+                file_paths=[f"{doc_id}.txt"],
+            )
+
+        all_chunks: dict[str, dict] = {}
+        for doc_id in ("doc-a", "doc-b"):
+            all_chunks.update(await _chunks(rag, doc_id))
+
+        shared_rows = {
+            key
+            for chunk in all_chunks.values()
+            if "SHARED" in chunk["content"]
+            for key in chunk["llm_cache_list"]
+        }
+        assert len(shared_rows) == 1, "both shared chunks must reference one row"
+
+        surviving_chunks = set(await _chunks(rag, survivor))
+        result = await rag.adelete_by_doc_id(deleted)
+        assert result.status == "success"
+
+        survivor_fact = _SHARED_ROW_FACTS["AONLY" if survivor == "doc-a" else "BONLY"]
+        deleted_fact = _SHARED_ROW_FACTS["AONLY" if deleted == "doc-a" else "BONLY"]
+
+        foo = await rag.chunk_entity_relation_graph.get_node("Foo")
+        assert _SHARED_ROW_FACTS["SHARED"] in foo["description"]
+        assert survivor_fact in foo["description"]
+        assert deleted_fact not in foo["description"]
+        assert foo["file_path"].split(GRAPH_FIELD_SEP) == [f"{survivor}.txt"]
+        assert set(foo["source_id"].split(GRAPH_FIELD_SEP)) == surviving_chunks
+
+        edge = await rag.chunk_entity_relation_graph.get_edge("Foo", "Bar")
+        assert "Foo links Bar in SHARED" in edge["description"]
+        assert set(edge["source_id"].split(GRAPH_FIELD_SEP)) == surviving_chunks
+        assert edge["file_path"].split(GRAPH_FIELD_SEP) == [f"{survivor}.txt"]
     finally:
         await rag.finalize_storages()

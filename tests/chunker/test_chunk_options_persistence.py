@@ -25,8 +25,10 @@ import numpy as np
 import pytest
 
 from lightrag import LightRAG, ROLES, RoleLLMConfig
-from lightrag.constants import DEFAULT_R_SEPARATORS
+from lightrag.constants import DEFAULT_CHUNK_P_SIZE, DEFAULT_R_SEPARATORS
 from lightrag.utils import EmbeddingFunc, Tokenizer, TokenizerInterface
+
+pytestmark = pytest.mark.offline
 
 
 class _SimpleTokenizerImpl(TokenizerInterface):
@@ -555,14 +557,103 @@ def test_legacy_env_is_final_fallback(tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.offline
-def test_p_strategy_uses_dedicated_chunk_size_env(tmp_path, monkeypatch):
-    """``CHUNK_P_SIZE`` must give P its own ``chunk_token_size``,
-    decoupled from the global ``CHUNK_SIZE`` shared by F/R/V."""
-    monkeypatch.setenv("CHUNK_SIZE", "1200")
-    monkeypatch.setenv("CHUNK_P_SIZE", "999")
-
+@pytest.mark.parametrize(
+    "env_vars, ctor_size, addon_params, runtime_chunker, caller_chunk_options, expected_size",
+    [
+        pytest.param(
+            {"CHUNK_SIZE": "1200", "CHUNK_P_SIZE": "999"},
+            None,
+            None,
+            None,
+            None,
+            999,
+            id="dedicated_env",
+        ),
+        pytest.param(
+            {"CHUNK_P_SIZE": None, "CHUNK_SIZE": None},
+            333,
+            None,
+            None,
+            None,
+            DEFAULT_CHUNK_P_SIZE,
+            id="unset_env_uses_default",
+        ),
+        pytest.param(
+            {"CHUNK_P_SIZE": None, "CHUNK_SIZE": None},
+            333,
+            {"chunker": {"paragraph_semantic": {}}},
+            None,
+            None,
+            DEFAULT_CHUNK_P_SIZE,
+            id="partial_addon_uses_default",
+        ),
+        pytest.param(
+            {"CHUNK_P_SIZE": "4096", "CHUNK_SIZE": None},
+            333,
+            {"chunker": {"paragraph_semantic": {}}},
+            None,
+            None,
+            4096,
+            id="partial_addon_picks_up_env",
+        ),
+        pytest.param(
+            {"CHUNK_P_SIZE": "4096", "CHUNK_SIZE": None},
+            333,
+            None,
+            {"paragraph_semantic": {}},
+            None,
+            4096,
+            id="runtime_mutation_picks_up_env",
+        ),
+        pytest.param(
+            {"CHUNK_P_SIZE": "4096", "CHUNK_SIZE": None},
+            333,
+            None,
+            None,
+            {"chunk_token_size": 333, "paragraph_semantic": {}},
+            4096,
+            id="caller_chunk_options_picks_up_env",
+        ),
+        pytest.param(
+            {"CHUNK_P_SIZE": "4096", "CHUNK_SIZE": None},
+            None,
+            None,
+            None,
+            {"paragraph_semantic": {"chunk_token_size": 8192}},
+            8192,
+            id="caller_chunk_options_explicit_wins",
+        ),
+        pytest.param(
+            {"CHUNK_P_SIZE": None, "CHUNK_SIZE": None},
+            None,
+            {"chunker": {"paragraph_semantic": {"chunk_token_size": 4096}}},
+            None,
+            None,
+            4096,
+            id="addon_params_explicit_wins",
+        ),
+    ],
+)
+def test_p_strategy_chunk_size_precedence(
+    tmp_path,
+    monkeypatch,
+    env_vars,
+    ctor_size,
+    addon_params,
+    runtime_chunker,
+    caller_chunk_options,
+    expected_size,
+):
+    """P-strategy ``chunk_token_size`` precedence: explicit caller/addon_params
+    > ``CHUNK_P_SIZE`` env > ``DEFAULT_CHUNK_P_SIZE`` (never silently inherits
+    global ``CHUNK_SIZE`` or ``LightRAG(chunk_token_size=...)``)."""
     import lightrag.chunker as chunker_pkg
+
+    for key, value in env_vars.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
 
     captured: dict = {}
 
@@ -574,345 +665,39 @@ def test_p_strategy_uses_dedicated_chunk_size_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(chunker_pkg, "chunking_by_paragraph_semantic", _p_spy)
 
+    rag_kwargs: dict = {}
+    if ctor_size is not None:
+        rag_kwargs["chunk_token_size"] = ctor_size
+    if addon_params is not None:
+        rag_kwargs["addon_params"] = addon_params
+
+    enqueue_kwargs: dict = {}
+    if caller_chunk_options is not None:
+        enqueue_kwargs["chunk_options"] = caller_chunk_options
+
     async def _run():
-        rag = _new_rag(tmp_path)
+        rag = _new_rag(tmp_path, **rag_kwargs)
         await rag.initialize_storages()
         try:
+            if runtime_chunker is not None:
+                rag.addon_params["chunker"] = runtime_chunker
             await rag.apipeline_enqueue_documents(
                 "stand-in body for paragraph-semantic chunker",
                 file_paths="ctor.[native-P].txt",
                 track_id="track-p-size",
                 process_options="P",
+                **enqueue_kwargs,
             )
             await rag.apipeline_process_enqueue_documents()
         finally:
             await rag.finalize_storages()
 
     asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 999, (
-        "P chunker must receive CHUNK_P_SIZE-derived chunk_token_size, "
-        f"not the global CHUNK_SIZE; got {captured!r}"
+    assert captured.get("chunk_token_size") == expected_size, (
+        f"Expected P chunk_token_size={expected_size}; got {captured!r}"
     )
-    # And the dispatcher must not double-pass chunk_token_size as kwarg.
+    # Dispatcher must not double-pass chunk_token_size as kwarg.
     assert "chunk_token_size" not in captured["kwargs"]
-
-
-@pytest.mark.offline
-def test_p_strategy_defaults_to_dedicated_size_when_env_unset(tmp_path, monkeypatch):
-    """When ``CHUNK_P_SIZE`` is unset, P uses ``DEFAULT_CHUNK_P_SIZE``
-    rather than inheriting the global ``CHUNK_SIZE`` or
-    ``LightRAG(chunk_token_size=…)``.  Paragraph-semantic merging needs
-    more headroom than the global default to keep related paragraphs
-    together; silently inheriting the smaller global ceiling defeats
-    the strategy's purpose."""
-    from lightrag.constants import DEFAULT_CHUNK_P_SIZE
-
-    monkeypatch.delenv("CHUNK_P_SIZE", raising=False)
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _p_spy(tokenizer, content, chunk_token_size, *, blocks_path=None, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_paragraph_semantic", _p_spy)
-
-    async def _run():
-        # Pass an explicit ctor chunk_token_size that differs from the
-        # P default — proves P is decoupled from the global chain.
-        rag = _new_rag(tmp_path, chunk_token_size=333)
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "fallback body",
-                file_paths="ctor.[native-P].txt",
-                track_id="track-p-fallback",
-                process_options="P",
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == DEFAULT_CHUNK_P_SIZE
-
-
-@pytest.mark.offline
-def test_p_strategy_default_size_survives_partial_addon_params(tmp_path, monkeypatch):
-    """When the caller hands in a partial ``addon_params['chunker']``
-    that lacks ``paragraph_semantic.chunk_token_size``,
-    ``normalize_addon_params`` does NOT re-run ``default_chunker_config``,
-    so the slot would silently fall back to the top-level resolved
-    chunk size in the pipeline.  ``_apply_chunk_size_overlay`` backfills
-    ``DEFAULT_CHUNK_P_SIZE`` as the last guard."""
-    from lightrag.constants import DEFAULT_CHUNK_P_SIZE
-
-    monkeypatch.delenv("CHUNK_P_SIZE", raising=False)
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _p_spy(tokenizer, content, chunk_token_size, *, blocks_path=None, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_paragraph_semantic", _p_spy)
-
-    async def _run():
-        rag = _new_rag(
-            tmp_path,
-            chunk_token_size=333,
-            addon_params={"chunker": {"paragraph_semantic": {}}},
-        )
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "partial addon body",
-                file_paths="ctor.[native-P].txt",
-                track_id="track-p-partial",
-                process_options="P",
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == DEFAULT_CHUNK_P_SIZE, (
-        "P chunker must use DEFAULT_CHUNK_P_SIZE even when caller passes "
-        "a partial addon_params chunker dict; got "
-        f"{captured.get('chunk_token_size')!r}"
-    )
-
-
-@pytest.mark.offline
-def test_p_strategy_partial_addon_params_still_picks_up_env(tmp_path, monkeypatch):
-    """When the caller hands in a partial ``addon_params['chunker']``
-    that lacks ``paragraph_semantic.chunk_token_size`` AND
-    ``CHUNK_P_SIZE`` env IS set, the overlay must pick up the env
-    value rather than skipping straight to ``DEFAULT_CHUNK_P_SIZE``.
-
-    Precedence: explicit addon_params > CHUNK_P_SIZE env >
-    DEFAULT_CHUNK_P_SIZE.  Without env-aware backfill the partial-
-    addon-params path silently ignores deployment .env settings."""
-    monkeypatch.setenv("CHUNK_P_SIZE", "4096")
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _p_spy(tokenizer, content, chunk_token_size, *, blocks_path=None, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_paragraph_semantic", _p_spy)
-
-    async def _run():
-        rag = _new_rag(
-            tmp_path,
-            chunk_token_size=333,
-            addon_params={"chunker": {"paragraph_semantic": {}}},
-        )
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "partial addon body with env",
-                file_paths="ctor.[native-P].txt",
-                track_id="track-p-partial-env",
-                process_options="P",
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 4096, (
-        "Partial addon_params must not mask CHUNK_P_SIZE env; got "
-        f"{captured.get('chunk_token_size')!r}"
-    )
-
-
-@pytest.mark.offline
-def test_p_strategy_runtime_chunker_mutation_picks_up_env(tmp_path, monkeypatch):
-    """Runtime mutation via ``rag.addon_params["chunker"] = {...}``
-    triggers ``ObservableAddonParams.__setitem__`` which only marks
-    addon_params dirty — it does NOT re-run
-    ``_apply_chunk_size_overlay``.  ``resolve_chunk_options`` is the
-    last chokepoint and must backfill P's chunk_token_size from
-    ``CHUNK_P_SIZE`` env (or ``DEFAULT_CHUNK_P_SIZE``) when the
-    mutation left the slot empty.
-
-    Without that backfill, P silently inherits the top-level
-    ``chunk_token_size`` (here ``333``) — the exact failure mode the
-    dedicated default exists to prevent."""
-    monkeypatch.setenv("CHUNK_P_SIZE", "4096")
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _p_spy(tokenizer, content, chunk_token_size, *, blocks_path=None, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_paragraph_semantic", _p_spy)
-
-    async def _run():
-        rag = _new_rag(tmp_path, chunk_token_size=333)
-        await rag.initialize_storages()
-        try:
-            # Subscript assignment — bypasses _apply_chunk_size_overlay.
-            rag.addon_params["chunker"] = {"paragraph_semantic": {}}
-            await rag.apipeline_enqueue_documents(
-                "runtime mutation body",
-                file_paths="ctor.[native-P].txt",
-                track_id="track-p-runtime",
-                process_options="P",
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 4096, (
-        "Runtime chunker mutation must not let P inherit the top-level "
-        f"chunk_token_size; got {captured.get('chunk_token_size')!r}"
-    )
-
-
-@pytest.mark.offline
-def test_p_strategy_caller_chunk_options_picks_up_env(tmp_path, monkeypatch):
-    """``apipeline_enqueue_documents(..., chunk_options=...)`` skips
-    ``resolve_chunk_options`` and goes through ``slim_chunk_options``
-    directly.  The P backfill must still kick in there so an
-    explicit ``chunk_options`` that omits the P slot does not let P
-    fall back to the top-level ``chunk_token_size``."""
-    monkeypatch.setenv("CHUNK_P_SIZE", "4096")
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _p_spy(tokenizer, content, chunk_token_size, *, blocks_path=None, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_paragraph_semantic", _p_spy)
-
-    async def _run():
-        rag = _new_rag(tmp_path, chunk_token_size=333)
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "caller chunk_options body",
-                file_paths="ctor.[native-P].txt",
-                track_id="track-p-caller-chunkopts",
-                process_options="P",
-                # Explicit kwarg path — bypasses resolve_chunk_options.
-                # Also includes a top-level chunk_token_size to verify
-                # P does NOT inherit it.
-                chunk_options={
-                    "chunk_token_size": 333,
-                    "paragraph_semantic": {},
-                },
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 4096, (
-        "P must not inherit caller-supplied top-level chunk_token_size; "
-        f"got {captured.get('chunk_token_size')!r}"
-    )
-
-
-@pytest.mark.offline
-def test_p_strategy_caller_chunk_options_respects_explicit_p_size(
-    tmp_path, monkeypatch
-):
-    """Caller-supplied ``chunk_options`` carrying an explicit
-    ``paragraph_semantic.chunk_token_size`` must win over both env
-    and ``DEFAULT_CHUNK_P_SIZE``."""
-    monkeypatch.setenv("CHUNK_P_SIZE", "4096")
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _p_spy(tokenizer, content, chunk_token_size, *, blocks_path=None, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_paragraph_semantic", _p_spy)
-
-    async def _run():
-        rag = _new_rag(tmp_path)
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "caller chunk_options explicit P size body",
-                file_paths="ctor.[native-P].txt",
-                track_id="track-p-caller-explicit",
-                process_options="P",
-                chunk_options={
-                    "paragraph_semantic": {"chunk_token_size": 8192},
-                },
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 8192
-
-
-@pytest.mark.offline
-def test_p_strategy_respects_explicit_addon_params_chunk_size(tmp_path, monkeypatch):
-    """``setdefault`` must not clobber an explicit
-    ``paragraph_semantic.chunk_token_size`` the caller did provide."""
-    monkeypatch.delenv("CHUNK_P_SIZE", raising=False)
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _p_spy(tokenizer, content, chunk_token_size, *, blocks_path=None, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_paragraph_semantic", _p_spy)
-
-    async def _run():
-        rag = _new_rag(
-            tmp_path,
-            addon_params={
-                "chunker": {"paragraph_semantic": {"chunk_token_size": 4096}}
-            },
-        )
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "explicit addon body",
-                file_paths="ctor.[native-P].txt",
-                track_id="track-p-explicit",
-                process_options="P",
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 4096
 
 
 @pytest.mark.offline
@@ -1245,299 +1030,182 @@ def test_a_plain_mapping_is_not_corrected_but_is_still_bounded_downstream():
     )
 
 
-@pytest.mark.offline
-def test_r_strategy_uses_dedicated_chunk_size_env(tmp_path, monkeypatch):
-    """``CHUNK_R_SIZE`` must give R its own ``chunk_token_size``,
-    decoupled from the global ``CHUNK_SIZE`` shared by F/V."""
-    monkeypatch.setenv("CHUNK_SIZE", "1200")
-    monkeypatch.setenv("CHUNK_R_SIZE", "777")
-
+@pytest.mark.parametrize(
+    "strategy, target_attr, is_async, file_path, env_vars, ctor_size, caller_chunk_options, expected_size, expected_overlap",
+    [
+        pytest.param(
+            "R",
+            "chunking_by_recursive_character",
+            False,
+            "ctor.[native-R].txt",
+            {"CHUNK_SIZE": "1200", "CHUNK_R_SIZE": "777"},
+            None,
+            None,
+            777,
+            None,
+            id="r_dedicated_env",
+        ),
+        pytest.param(
+            "R",
+            "chunking_by_recursive_character",
+            False,
+            "ctor.[native-R].txt",
+            {"CHUNK_R_SIZE": None, "CHUNK_SIZE": None},
+            444,
+            None,
+            444,
+            None,
+            id="r_fallback_global",
+        ),
+        pytest.param(
+            "V",
+            "chunking_by_semantic_vector",
+            True,
+            "ctor.[native-V].txt",
+            {"CHUNK_SIZE": "1200", "CHUNK_V_SIZE": "2500"},
+            None,
+            None,
+            2500,
+            None,
+            id="v_dedicated_env",
+        ),
+        pytest.param(
+            "V",
+            "chunking_by_semantic_vector",
+            True,
+            "ctor.[native-V].txt",
+            {"CHUNK_V_SIZE": None, "CHUNK_SIZE": None},
+            555,
+            None,
+            555,
+            None,
+            id="v_fallback_global",
+        ),
+        pytest.param(
+            "F",
+            "chunking_by_fixed_token",
+            False,
+            "ctor-f.txt",
+            {"CHUNK_SIZE": "1200"},
+            None,
+            {
+                "chunk_token_size": 1200,
+                "fixed_token": {
+                    "chunk_token_size": 333,
+                    "chunk_overlap_token_size": 7,
+                    "split_by_character": None,
+                    "split_by_character_only": False,
+                },
+            },
+            333,
+            7,
+            id="f_subdict_override",
+        ),
+        pytest.param(
+            "F",
+            "chunking_by_fixed_token",
+            False,
+            "ctor-f.txt",
+            {"CHUNK_SIZE": None},
+            456,
+            None,
+            456,
+            None,
+            id="f_fallback_top_level",
+        ),
+        pytest.param(
+            "F",
+            "chunking_by_fixed_token",
+            False,
+            "ctor-f.txt",
+            {"CHUNK_F_SIZE": "640", "CHUNK_SIZE": None},
+            999,
+            None,
+            640,
+            None,
+            id="f_env_wins_over_ctor",
+        ),
+    ],
+)
+def test_rvf_strategy_chunk_size_precedence(
+    tmp_path,
+    monkeypatch,
+    strategy,
+    target_attr,
+    is_async,
+    file_path,
+    env_vars,
+    ctor_size,
+    caller_chunk_options,
+    expected_size,
+    expected_overlap,
+):
+    """R/V/F strategy ``chunk_token_size`` precedence: explicit sub-dict >
+    strategy env (``CHUNK_{F,R,V}_SIZE``) > legacy ctor/global ``CHUNK_SIZE``."""
     import lightrag.chunker as chunker_pkg
+
+    for key, value in env_vars.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
 
     captured: dict = {}
 
-    def _r_spy(tokenizer, content, chunk_token_size, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        captured["kwargs"] = dict(kwargs)
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
+    if is_async:
 
-    monkeypatch.setattr(chunker_pkg, "chunking_by_recursive_character", _r_spy)
+        async def _spy(
+            tokenizer, content, chunk_token_size, *, embedding_func=None, **kwargs
+        ):
+            captured["chunk_token_size"] = chunk_token_size
+            captured["kwargs"] = dict(kwargs)
+            return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
 
-    async def _run():
-        rag = _new_rag(tmp_path)
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "stand-in body for recursive-character chunker",
-                file_paths="ctor.[native-R].txt",
-                track_id="track-r-size",
-                process_options="R",
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
+    else:
 
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 777, (
-        "R chunker must receive CHUNK_R_SIZE-derived chunk_token_size, "
-        f"not the global CHUNK_SIZE; got {captured!r}"
+        def _spy(tokenizer, content, chunk_token_size, **kwargs):
+            captured["chunk_token_size"] = chunk_token_size
+            captured["kwargs"] = dict(kwargs)
+            return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
+
+    monkeypatch.setattr(chunker_pkg, target_attr, _spy)
+
+    rag_kwargs = {"chunk_token_size": ctor_size} if ctor_size is not None else {}
+    enqueue_kwargs = (
+        {"chunk_options": caller_chunk_options}
+        if caller_chunk_options is not None
+        else {}
     )
-    # Dispatcher must not double-pass chunk_token_size as kwarg.
-    assert "chunk_token_size" not in captured["kwargs"]
-
-
-@pytest.mark.offline
-def test_r_strategy_falls_back_to_global_chunk_size(tmp_path, monkeypatch):
-    """When ``CHUNK_R_SIZE`` is unset and no per-doc R override is
-    supplied, R inherits the top-level ``chunk_token_size`` resolved
-    from the standard chain (here: ``LightRAG(chunk_token_size=…)``)."""
-    monkeypatch.delenv("CHUNK_R_SIZE", raising=False)
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _r_spy(tokenizer, content, chunk_token_size, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_recursive_character", _r_spy)
 
     async def _run():
-        rag = _new_rag(tmp_path, chunk_token_size=444)
+        rag = _new_rag(tmp_path, **rag_kwargs)
         await rag.initialize_storages()
         try:
             await rag.apipeline_enqueue_documents(
-                "fallback body",
-                file_paths="ctor.[native-R].txt",
-                track_id="track-r-fallback",
-                process_options="R",
+                f"stand-in body for {strategy} chunker",
+                file_paths=file_path,
+                track_id=f"track-{strategy.lower()}-size",
+                process_options=strategy,
+                **enqueue_kwargs,
             )
             await rag.apipeline_process_enqueue_documents()
         finally:
             await rag.finalize_storages()
 
     asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 444
-
-
-@pytest.mark.offline
-def test_v_strategy_uses_dedicated_chunk_size_env(tmp_path, monkeypatch):
-    """``CHUNK_V_SIZE`` must give V its own ``chunk_token_size`` advisory
-    ceiling, decoupled from the global ``CHUNK_SIZE`` shared by F/R."""
-    monkeypatch.setenv("CHUNK_SIZE", "1200")
-    monkeypatch.setenv("CHUNK_V_SIZE", "2500")
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    async def _v_spy(
-        tokenizer, content, chunk_token_size, *, embedding_func=None, **kwargs
-    ):
-        captured["chunk_token_size"] = chunk_token_size
-        captured["kwargs"] = dict(kwargs)
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_semantic_vector", _v_spy)
-
-    async def _run():
-        rag = _new_rag(tmp_path)
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "stand-in body for semantic-vector chunker",
-                file_paths="ctor.[native-V].txt",
-                track_id="track-v-size",
-                process_options="V",
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 2500, (
-        "V chunker must receive CHUNK_V_SIZE-derived chunk_token_size, "
-        f"not the global CHUNK_SIZE; got {captured!r}"
+    assert captured.get("chunk_token_size") == expected_size, (
+        f"Expected {strategy} chunk_token_size={expected_size}; got {captured!r}"
     )
-    # Dispatcher must not double-pass chunk_token_size as kwarg.
+    # Dispatcher must pop chunk_token_size so it isn't double-passed as kwarg.
     assert "chunk_token_size" not in captured["kwargs"]
+    if expected_overlap is not None:
+        assert captured["kwargs"]["chunk_overlap_token_size"] == expected_overlap
 
 
-@pytest.mark.offline
-def test_v_strategy_falls_back_to_global_chunk_size(tmp_path, monkeypatch):
-    """When ``CHUNK_V_SIZE`` is unset and no per-doc V override is
-    supplied, V inherits the top-level ``chunk_token_size`` resolved
-    from the standard chain (here: ``LightRAG(chunk_token_size=…)``)."""
-    monkeypatch.delenv("CHUNK_V_SIZE", raising=False)
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    async def _v_spy(
-        tokenizer, content, chunk_token_size, *, embedding_func=None, **kwargs
-    ):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_semantic_vector", _v_spy)
-
-    async def _run():
-        rag = _new_rag(tmp_path, chunk_token_size=555)
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "fallback body",
-                file_paths="ctor.[native-V].txt",
-                track_id="track-v-fallback",
-                process_options="V",
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 555
-
-
-@pytest.mark.offline
-def test_f_strategy_honors_subdict_chunk_size(tmp_path, monkeypatch):
-    """After the F cleanup, F honors a per-doc
-    ``fixed_token.chunk_token_size`` override (caller-supplied
-    chunk_options) instead of being locked to the top-level/global size —
-    matching R/V/P. Pre-cleanup this slot could not exist: ``**f_opts``
-    would collide with the positional ``chunk_token_size`` and TypeError.
-    """
-    monkeypatch.setenv("CHUNK_SIZE", "1200")
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _f_spy(tokenizer, content, chunk_token_size, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        captured["kwargs"] = dict(kwargs)
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_fixed_token", _f_spy)
-
-    custom_options = {
-        # top-level global fallback — must be overridden by the sub-dict
-        "chunk_token_size": 1200,
-        "fixed_token": {
-            "chunk_token_size": 333,
-            "chunk_overlap_token_size": 7,
-            "split_by_character": None,
-            "split_by_character_only": False,
-        },
-    }
-
-    async def _run():
-        rag = _new_rag(tmp_path)
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "stand-in body for fixed-token chunker",
-                file_paths="ctor-f.txt",
-                track_id="track-f-size",
-                process_options="F",
-                chunk_options=custom_options,
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 333, (
-        "F chunker must receive the fixed_token.chunk_token_size override, "
-        f"not the top-level/global size; got {captured!r}"
-    )
-    # Dispatcher must pop it so it isn't also splatted as a kwarg (TypeError).
-    assert "chunk_token_size" not in captured["kwargs"]
-    assert captured["kwargs"]["chunk_overlap_token_size"] == 7
-
-
-@pytest.mark.offline
-def test_f_strategy_falls_back_to_top_level_size(tmp_path, monkeypatch):
-    """When the F sub-dict carries no ``chunk_token_size``, F still inherits
-    the top-level resolved size (here from ``LightRAG(chunk_token_size=…)``) —
-    the cleanup must not regress the existing global-size fallback."""
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _f_spy(tokenizer, content, chunk_token_size, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_fixed_token", _f_spy)
-
-    async def _run():
-        rag = _new_rag(tmp_path, chunk_token_size=456)
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "fallback body",
-                file_paths="ctor-f.txt",
-                track_id="track-f-fallback",
-                process_options="F",
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 456
-
-
-@pytest.mark.offline
-def test_f_strategy_env_size_wins_over_legacy_ctor_field(tmp_path, monkeypatch):
-    """Specificity-ordered precedence: ``CHUNK_F_SIZE`` (strategy env, tier 2)
-    beats the strategy-agnostic legacy constructor field (tier 3)."""
-    monkeypatch.setenv("CHUNK_F_SIZE", "640")
-    monkeypatch.delenv("CHUNK_SIZE", raising=False)
-
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    def _f_spy(tokenizer, content, chunk_token_size, **kwargs):
-        captured["chunk_token_size"] = chunk_token_size
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_fixed_token", _f_spy)
-
-    async def _run():
-        rag = _new_rag(tmp_path, chunk_token_size=999)
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "precedence body",
-                file_paths="ctor-f.txt",
-                track_id="track-f-prec",
-                process_options="F",
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-    assert captured.get("chunk_token_size") == 640
-
-
-@pytest.mark.offline
 def test_ainsert_legacy_path_honors_f_size_env(tmp_path, monkeypatch):
-    """``rag.ainsert()`` intentionally does NOT pass a ``process_options``
-    selector, so it runs the legacy ``chunking_func`` branch (preserving any
-    user-supplied chunking_func).  That branch must still honor ``CHUNK_F_SIZE``
-    (i.e. ``fixed_token.chunk_token_size``) instead of only the global
-    ``CHUNK_SIZE`` — otherwise the SDK path would silently ignore it.
-    """
+    """``rag.ainsert()`` runs the legacy ``chunking_func`` branch and must still
+    honor ``CHUNK_F_SIZE`` (``fixed_token.chunk_token_size``) over global
+    ``CHUNK_SIZE``."""
     monkeypatch.setenv("CHUNK_SIZE", "1200")
     monkeypatch.setenv("CHUNK_F_SIZE", "640")
 
@@ -1556,7 +1224,6 @@ def test_ainsert_legacy_path_honors_f_size_env(tmp_path, monkeypatch):
 
     async def _run():
         rag = _new_rag(tmp_path)
-        # Override the legacy 6-arg chunking_func to observe the size it gets.
         rag.chunking_func = _chunking_func_spy
         await rag.initialize_storages()
         try:
@@ -1571,57 +1238,61 @@ def test_ainsert_legacy_path_honors_f_size_env(tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.offline
-def test_partial_chunker_config_still_picks_up_size_env(tmp_path, monkeypatch):
-    """A partial ``addon_params['chunker']`` skips ``default_chunker_config``
-    (``normalize_addon_params`` only defaults the whole ``chunker`` key when
-    absent), so ``_apply_chunk_size_overlay`` must mirror the strategy
-    size-env seeding — otherwise ``CHUNK_F_SIZE`` / ``CHUNK_R_SIZE`` /
-    ``CHUNK_V_SIZE`` are silently ignored for partial configs.
-    """
-    monkeypatch.setenv("CHUNK_F_SIZE", "640")
-    monkeypatch.setenv("CHUNK_R_SIZE", "777")
-    monkeypatch.setenv("CHUNK_V_SIZE", "888")
+@pytest.mark.parametrize(
+    "env_vars, partial_chunker, expected_sizes, absent_slots, extra_check",
+    [
+        pytest.param(
+            {"CHUNK_F_SIZE": "640", "CHUNK_R_SIZE": "777", "CHUNK_V_SIZE": "888"},
+            {"fixed_token": {"split_by_character": "\n"}},
+            {"fixed_token": 640, "recursive_character": 777, "semantic_vector": 888},
+            (),
+            ("fixed_token", "split_by_character", "\n"),
+            id="backfills_size_envs",
+        ),
+        pytest.param(
+            {"CHUNK_F_SIZE": "640"},
+            {"fixed_token": {"chunk_token_size": 320}},
+            {"fixed_token": 320},
+            (),
+            None,
+            id="explicit_size_beats_env",
+        ),
+        pytest.param(
+            {"CHUNK_F_SIZE": None, "CHUNK_R_SIZE": None},
+            {"recursive_character": {"separators": ["X"]}},
+            {},
+            ("recursive_character", "fixed_token"),
+            None,
+            id="no_env_leaves_slot_absent",
+        ),
+    ],
+)
+def test_partial_chunker_config_size_env_resolution(
+    tmp_path,
+    monkeypatch,
+    env_vars,
+    partial_chunker,
+    expected_sizes,
+    absent_slots,
+    extra_check,
+):
+    """Partial ``addon_params['chunker']`` backfills strategy size envs unless
+    explicitly supplied, and leaves slots absent when no size env is set."""
+    for key, value in env_vars.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
 
-    # Partial config: only F's split_by_character is supplied; every
-    # chunk_token_size slot is absent and must be backfilled from env.
-    rag = _new_rag(
-        tmp_path,
-        addon_params={"chunker": {"fixed_token": {"split_by_character": "\n"}}},
-    )
+    rag = _new_rag(tmp_path, addon_params={"chunker": partial_chunker})
     chunker = rag.addon_params["chunker"]
-    assert chunker["fixed_token"]["chunk_token_size"] == 640
-    # Explicit caller value preserved alongside the env-backfilled size.
-    assert chunker["fixed_token"]["split_by_character"] == "\n"
-    assert chunker["recursive_character"]["chunk_token_size"] == 777
-    assert chunker["semantic_vector"]["chunk_token_size"] == 888
-
-
-@pytest.mark.offline
-def test_partial_chunker_config_explicit_size_beats_env(tmp_path, monkeypatch):
-    """An explicit ``fixed_token.chunk_token_size`` in a partial config wins
-    over ``CHUNK_F_SIZE`` (tier 1 > tier 2)."""
-    monkeypatch.setenv("CHUNK_F_SIZE", "640")
-    rag = _new_rag(
-        tmp_path,
-        addon_params={"chunker": {"fixed_token": {"chunk_token_size": 320}}},
-    )
-    assert rag.addon_params["chunker"]["fixed_token"]["chunk_token_size"] == 320
-
-
-@pytest.mark.offline
-def test_partial_chunker_config_no_size_env_leaves_slot_absent(tmp_path, monkeypatch):
-    """Without a size env, the slot stays absent so the strategy inherits the
-    top-level chunk_token_size at consumption time (no behavior change)."""
-    monkeypatch.delenv("CHUNK_F_SIZE", raising=False)
-    monkeypatch.delenv("CHUNK_R_SIZE", raising=False)
-    rag = _new_rag(
-        tmp_path,
-        addon_params={"chunker": {"recursive_character": {"separators": ["X"]}}},
-    )
-    chunker = rag.addon_params["chunker"]
-    assert "chunk_token_size" not in chunker["recursive_character"]
-    assert "chunk_token_size" not in chunker["fixed_token"]
+    for slot, expected in expected_sizes.items():
+        assert chunker[slot]["chunk_token_size"] == expected
+    for slot in absent_slots:
+        assert "chunk_token_size" not in chunker[slot]
+    if extra_check is not None:
+        slot, key, value = extra_check
+        assert chunker[slot][key] == value
 
 
 # --------------------------------------------------------------------------- #
@@ -1630,7 +1301,6 @@ def test_partial_chunker_config_no_size_env_leaves_slot_absent(tmp_path, monkeyp
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.offline
 def test_drop_references_env_snapshotted_but_knobs_not(tmp_path, monkeypatch):
     """``CHUNK_P_DROP_REFERENCES`` flows into the persisted snapshot and reaches
     the chunker even on a partial ``addon_params`` (runtime-mutation path that
@@ -1655,8 +1325,6 @@ def test_drop_references_env_snapshotted_but_knobs_not(tmp_path, monkeypatch):
         rag = _new_rag(tmp_path)
         await rag.initialize_storages()
         try:
-            # Runtime mutation bypasses _apply_chunk_size_overlay, so this
-            # exercises the slim_chunk_options chokepoint.
             rag.addon_params["chunker"] = {"paragraph_semantic": {}}
             await rag.apipeline_enqueue_documents(
                 "drop references body",
@@ -1674,22 +1342,17 @@ def test_drop_references_env_snapshotted_but_knobs_not(tmp_path, monkeypatch):
     row = asyncio.run(_run())
     assert row is not None
     p_opts = row["chunk_options"]["paragraph_semantic"]
-    # Switch is snapshotted ...
     assert p_opts.get("drop_references") is True
-    # ... but the detection knobs are NOT.
     assert "references_tail_n" not in p_opts
     assert "references_headings" not in p_opts
-    # The switch reaches the chunker; the knobs do not (chunker reads env).
     assert captured.get("drop_references") is True
     assert "references_tail_n" not in captured
     assert "references_headings" not in captured
 
 
-@pytest.mark.offline
 def test_explicit_drop_references_false_overrides_env_true(tmp_path, monkeypatch):
     """An explicit ``drop_references=False`` in a caller-supplied
-    ``chunk_options`` wins over ``CHUNK_P_DROP_REFERENCES=true`` (setdefault
-    in ``slim_chunk_options`` never clobbers a present value)."""
+    ``chunk_options`` wins over ``CHUNK_P_DROP_REFERENCES=true``."""
     monkeypatch.setenv("CHUNK_P_DROP_REFERENCES", "true")
 
     import lightrag.chunker as chunker_pkg
@@ -1708,7 +1371,6 @@ def test_explicit_drop_references_false_overrides_env_true(tmp_path, monkeypatch
         await rag.initialize_storages()
         try:
             opts = resolve_chunk_options(rag.addon_params, process_options="P")
-            # Env put drop_references=True here; explicit override to False.
             assert opts["paragraph_semantic"]["drop_references"] is True
             opts["paragraph_semantic"]["drop_references"] = False
             await rag.apipeline_enqueue_documents(
@@ -1726,27 +1388,38 @@ def test_explicit_drop_references_false_overrides_env_true(tmp_path, monkeypatch
     assert captured.get("drop_references") is False
 
 
-@pytest.mark.offline
 def test_chunk_opts_metadata_records_only_drop_rf():
     """``_format_chunking_params`` renders ``drop_references`` under the short
-    ``drop_rf`` alias (what lands in ``doc_status.metadata['chunk_opts']``) and
-    never the env-only detection knobs."""
+    ``drop_rf`` alias and never the env-only detection knobs."""
     from lightrag.pipeline import _format_chunking_params
 
     line = _format_chunking_params(2000, {"drop_references": True})
     assert "drop_rf=True" in line
-    assert "drop_references" not in line  # aliased, not the verbose name
+    assert "drop_references" not in line
     assert "rf_tail" not in line and "rf_heads" not in line
 
 
-@pytest.mark.offline
-def test_v_strategy_forwards_embedding_request_bounds(tmp_path, monkeypatch):
-    """The dispatcher must hand V the deployment's embedding request bounds.
-
-    ``chunking_by_semantic_vector`` defaults these when unset, so a missing
-    forward would silently substitute the library defaults for whatever the
-    deployment configured — and nothing else would notice.
-    """
+@pytest.mark.parametrize(
+    "caller_chunk_options",
+    [
+        pytest.param(None, id="forwarded_from_deployment"),
+        pytest.param(
+            {
+                "semantic_vector": {
+                    "embedding_batch_num": 999,
+                    "embedding_max_async": 999,
+                }
+            },
+            id="discards_colliding_addon_keys",
+        ),
+    ],
+)
+def test_v_strategy_embedding_request_bounds(
+    tmp_path, monkeypatch, caller_chunk_options
+):
+    """The dispatcher forwards deployment ``embedding_batch_num`` /
+    ``embedding_max_async`` to V and discards any same-named keys in the V
+    addon slot so they neither override nor collide with keyword dispatch."""
     import lightrag.chunker as chunker_pkg
 
     captured: dict = {}
@@ -1758,6 +1431,12 @@ def test_v_strategy_forwards_embedding_request_bounds(tmp_path, monkeypatch):
         return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
 
     monkeypatch.setattr(chunker_pkg, "chunking_by_semantic_vector", _v_spy)
+
+    enqueue_kwargs = (
+        {"chunk_options": caller_chunk_options}
+        if caller_chunk_options is not None
+        else {}
+    )
 
     async def _run():
         rag = _new_rag(tmp_path, embedding_batch_num=7, embedding_func_max_async=5)
@@ -1768,6 +1447,7 @@ def test_v_strategy_forwards_embedding_request_bounds(tmp_path, monkeypatch):
                 file_paths="bounds.[native-V].txt",
                 track_id="track-v-bounds",
                 process_options="V",
+                **enqueue_kwargs,
             )
             await rag.apipeline_process_enqueue_documents()
         finally:
@@ -1775,59 +1455,8 @@ def test_v_strategy_forwards_embedding_request_bounds(tmp_path, monkeypatch):
 
     asyncio.run(_run())
 
-    kwargs = captured["kwargs"]
-    assert kwargs.get("embedding_batch_num") == 7
-    assert kwargs.get("embedding_max_async") == 5
-
-
-@pytest.mark.offline
-def test_v_strategy_discards_addon_embedding_bounds(tmp_path, monkeypatch):
-    """A same-named key in the V addon slot must not collide with the forward.
-
-    These two are deployment config, not per-doc chunk params. The HTTP model
-    rejects extras, but ``addon_params['chunker']['semantic_vector']`` is
-    free-form SDK input and a persisted snapshot outlives schema changes — so
-    without popping them first, ``**v_opts`` would raise "got multiple values
-    for keyword argument" instead of chunking the document.
-    """
-    import lightrag.chunker as chunker_pkg
-
-    captured: dict = {}
-
-    async def _v_spy(
-        tokenizer, content, chunk_token_size, *, embedding_func=None, **kwargs
-    ):
-        captured["kwargs"] = dict(kwargs)
-        return [{"tokens": 5, "content": "stub", "chunk_order_index": 0}]
-
-    monkeypatch.setattr(chunker_pkg, "chunking_by_semantic_vector", _v_spy)
-
-    async def _run():
-        rag = _new_rag(tmp_path, embedding_batch_num=7, embedding_func_max_async=5)
-        await rag.initialize_storages()
-        try:
-            await rag.apipeline_enqueue_documents(
-                "stand-in body for semantic-vector chunker",
-                file_paths="collide.[native-V].txt",
-                track_id="track-v-collide",
-                process_options="V",
-                chunk_options={
-                    "semantic_vector": {
-                        "embedding_batch_num": 999,
-                        "embedding_max_async": 999,
-                    }
-                },
-            )
-            await rag.apipeline_process_enqueue_documents()
-        finally:
-            await rag.finalize_storages()
-
-    asyncio.run(_run())
-
-    # The chunker ran at all (a duplicate keyword would have aborted the
-    # document), and the global deployment config still wins: the addon
-    # values were discarded, not honored.
     assert "kwargs" in captured, "the V chunker was never dispatched"
     kwargs = captured["kwargs"]
     assert kwargs.get("embedding_batch_num") == 7
     assert kwargs.get("embedding_max_async") == 5
+

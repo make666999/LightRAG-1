@@ -10,10 +10,13 @@ from lightrag.chunker.paragraph_semantic import (
     _glue_heading_only_blocks,
     _is_heading_only,
     _merge_small_blocks,
+    _split_long_block,
     chunking_by_paragraph_semantic,
 )
 from lightrag.exceptions import BlocksSidecarCorruptError
 from lightrag.utils import Tokenizer, TokenizerInterface
+
+pytestmark = pytest.mark.offline
 
 
 class _CharTokenizer(TokenizerInterface):
@@ -1054,3 +1057,273 @@ def test_heading_only_with_first_table_child_not_separated_by_stage_d():
     chunk_with_table = next(b for b in final if _TABLE_FIRST in b["content"])
     assert "## 2.4" in chunk_with_table["content"]
     assert "### 2.4.1" in chunk_with_table["content"]
+
+
+# --------------------------------------------------------------------------- #
+# AnchorSplit / _split_long_block regression tests
+# --------------------------------------------------------------------------- #
+
+
+def _write_split_blocks_jsonl(tmp_path, rows: list[dict]) -> str:
+    path = tmp_path / "doc.blocks.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def test_split_long_block_short_lead_then_huge_does_not_recurse():
+    tokenizer = _make_tokenizer()
+    paragraphs = [
+        {"text": "Short lead anchor."},
+        {"text": "x" * 4000},
+    ]
+
+    blocks = _split_long_block(
+        paragraphs,
+        heading="Heading",
+        parent_headings=[],
+        level=2,
+        table_chunk_role="none",
+        tokenizer=tokenizer,
+        target_max=1000,
+        target_ideal=750,
+    )
+
+    assert len(blocks) > 1
+    assert all(b["tokens"] <= 1000 for b in blocks)
+    assert all(b["heading"] == "Heading" for b in blocks)
+
+
+def test_split_long_block_no_anchor_pack_accounts_for_separator():
+    tokenizer = _make_tokenizer()
+    paragraphs = [
+        {"text": "a" * 101},
+        {"text": "b" * 101},
+    ]
+
+    blocks = _split_long_block(
+        paragraphs,
+        heading="Heading",
+        parent_headings=[],
+        level=2,
+        table_chunk_role="none",
+        tokenizer=tokenizer,
+        target_max=202,
+        target_ideal=150,
+    )
+
+    assert blocks, "expected at least one sub-block"
+    assert all(b["tokens"] <= 202 for b in blocks), [b["tokens"] for b in blocks]
+
+
+def test_split_long_block_single_paragraph_oversized_is_character_split():
+    tokenizer = _make_tokenizer()
+    paragraphs = [{"text": "x" * 4000}]
+
+    blocks = _split_long_block(
+        paragraphs,
+        heading="Heading",
+        parent_headings=[],
+        level=2,
+        table_chunk_role="none",
+        tokenizer=tokenizer,
+        target_max=1000,
+        target_ideal=750,
+    )
+
+    assert len(blocks) > 1, "single oversized paragraph must be split, not kept whole"
+    assert all(b["tokens"] <= 1000 for b in blocks), [b["tokens"] for b in blocks]
+    assert all(b["heading"] == "Heading" for b in blocks)
+
+
+def test_split_long_block_character_fallback_keeps_configured_overlap(monkeypatch):
+    tokenizer = _make_tokenizer()
+    captured: dict[str, int] = {}
+
+    def fake_chunker(
+        tokenizer,
+        content,
+        chunk_token_size: int = 1200,
+        *,
+        chunk_overlap_token_size: int = 100,
+        separators=None,
+    ):
+        captured["chunk_overlap_token_size"] = chunk_overlap_token_size
+        step = max(chunk_token_size - chunk_overlap_token_size, 1)
+        tokens = tokenizer.encode(content)
+        chunks = []
+        for start in range(0, len(tokens), step):
+            piece = tokenizer.decode(tokens[start : start + chunk_token_size])
+            chunks.append(
+                {
+                    "tokens": len(tokenizer.encode(piece)),
+                    "content": piece,
+                    "chunk_order_index": len(chunks),
+                }
+            )
+        return chunks
+
+    import lightrag.chunker.recursive_character as rc_mod
+
+    monkeypatch.setattr(rc_mod, "chunking_by_recursive_character", fake_chunker)
+
+    blocks = _split_long_block(
+        [{"text": "x" * 260}],
+        heading="Heading",
+        parent_headings=[],
+        level=2,
+        table_chunk_role="none",
+        tokenizer=tokenizer,
+        target_max=100,
+        target_ideal=75,
+        chunk_overlap_token_size=25,
+    )
+
+    assert captured["chunk_overlap_token_size"] == 25
+    assert len(blocks) > 1
+    assert blocks[0]["content"][-25:] == blocks[1]["content"][:25]
+
+
+def test_split_long_block_uses_later_short_anchor():
+    tokenizer = _make_tokenizer()
+    paragraphs = [
+        {"text": "x" * 1500},
+        {"text": "Mid anchor."},
+        {"text": "y" * 1500},
+    ]
+
+    blocks = _split_long_block(
+        paragraphs,
+        heading="Heading",
+        parent_headings=[],
+        level=2,
+        table_chunk_role="none",
+        tokenizer=tokenizer,
+        target_max=1000,
+        target_ideal=750,
+    )
+
+    assert len(blocks) >= 2
+    assert any(b["heading"] == "Mid anchor." for b in blocks)
+
+
+def test_public_chunking_keeps_unsplit_heading_without_part_suffix(tmp_path):
+    tokenizer = _make_tokenizer()
+    blocks_path = _write_split_blocks_jsonl(
+        tmp_path,
+        [
+            {
+                "type": "content",
+                "heading": "Heading",
+                "parent_headings": [],
+                "level": 2,
+                "content": "short body",
+            }
+        ],
+    )
+
+    chunks = chunking_by_paragraph_semantic(
+        tokenizer,
+        "short body",
+        chunk_token_size=100,
+        blocks_path=blocks_path,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0]["heading"]["heading"] == "Heading"
+
+
+def test_public_chunking_adds_part_suffixes_for_anchor_split(tmp_path):
+    tokenizer = _make_tokenizer()
+    body = "\n".join(["x" * 800, "Mid anchor.", "y" * 800])
+    blocks_path = _write_split_blocks_jsonl(
+        tmp_path,
+        [
+            {
+                "type": "content",
+                "heading": "Heading",
+                "parent_headings": [],
+                "level": 2,
+                "content": body,
+            }
+        ],
+    )
+
+    chunks = chunking_by_paragraph_semantic(
+        tokenizer,
+        body,
+        chunk_token_size=1000,
+        blocks_path=blocks_path,
+        chunk_overlap_token_size=0,
+    )
+
+    assert [chunk["heading"]["heading"] for chunk in chunks] == [
+        "Heading [part 1]",
+        "Mid anchor. [part 2]",
+    ]
+    assert all(
+        all("[part " not in parent for parent in chunk["heading"]["parent_headings"])
+        for chunk in chunks
+    )
+
+
+def test_public_chunking_adds_part_suffixes_for_long_text_fallback(
+    tmp_path, monkeypatch
+):
+    tokenizer = _make_tokenizer()
+
+    def fake_chunker(
+        tokenizer,
+        content,
+        chunk_token_size: int = 1200,
+        *,
+        chunk_overlap_token_size: int = 100,
+        separators=None,
+    ):
+        tokens = tokenizer.encode(content)
+        chunks = []
+        for start in range(0, len(tokens), chunk_token_size):
+            piece = tokenizer.decode(tokens[start : start + chunk_token_size])
+            chunks.append(
+                {
+                    "tokens": len(tokenizer.encode(piece)),
+                    "content": piece,
+                    "chunk_order_index": len(chunks),
+                }
+            )
+        return chunks
+
+    import lightrag.chunker.recursive_character as rc_mod
+
+    monkeypatch.setattr(rc_mod, "chunking_by_recursive_character", fake_chunker)
+
+    body = "z" * 260
+    blocks_path = _write_split_blocks_jsonl(
+        tmp_path,
+        [
+            {
+                "type": "content",
+                "heading": "Heading",
+                "parent_headings": [],
+                "level": 2,
+                "content": body,
+            }
+        ],
+    )
+
+    chunks = chunking_by_paragraph_semantic(
+        tokenizer,
+        body,
+        chunk_token_size=100,
+        blocks_path=blocks_path,
+        chunk_overlap_token_size=0,
+    )
+
+    assert [chunk["heading"]["heading"] for chunk in chunks] == [
+        "Heading [part 1]",
+        "Heading [part 2]",
+        "Heading [part 3]",
+    ]
+

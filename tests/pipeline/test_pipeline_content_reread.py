@@ -23,54 +23,34 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pytest
 
-from lightrag import LightRAG, ROLES, RoleLLMConfig
+from lightrag import ROLES, LightRAG, RoleLLMConfig
 from lightrag.base import DocProcessingStatus, DocStatus
 from lightrag.constants import (
     FULL_DOCS_FORMAT_LIGHTRAG,
     FULL_DOCS_FORMAT_RAW,
 )
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
-from lightrag.pipeline import _BatchRunContext
 from lightrag.parser.base import ParseResult
 from lightrag.parser.registry import parser_specs_snapshot
-from lightrag.utils import EmbeddingFunc, Tokenizer, get_content_summary
+from lightrag.pipeline import _BatchRunContext
+from lightrag.utils import get_content_summary
 from lightrag.utils_pipeline import make_lightrag_doc_content
 
+from ._fakes import make_lightrag, noop_llm
 
 pytestmark = pytest.mark.offline
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _mock_embedding(texts: list[str]) -> np.ndarray:
-    return np.random.rand(len(texts), 8)
-
-
-async def _noop_llm(prompt, **kwargs):  # pragma: no cover - never invoked
-    return ""
-
-
 def _build_rag(tmp_path: Path) -> LightRAG:
     role_configs = {spec.name: RoleLLMConfig() for spec in ROLES}
-    return LightRAG(
-        working_dir=str(tmp_path),
+    return make_lightrag(
+        tmp_path,
+        subdir=None,
         workspace=f"reread-{tmp_path.name}",
-        llm_model_func=_noop_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8,
-            max_token_size=1024,
-            func=_mock_embedding,
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        llm_model_func=noop_llm,
+        max_token_size=1024,
         role_llm_configs=role_configs,
     )
 

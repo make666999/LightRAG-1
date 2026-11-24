@@ -26,9 +26,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
 
-import numpy as np
 import pytest
 
 import lightrag.pipeline as pipeline_module
@@ -36,41 +34,13 @@ from lightrag import LightRAG
 from lightrag.base import DocProcessingStatus, DocStatus
 from lightrag.exceptions import PipelineCancelledException
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
-from lightrag.pipeline import _BatchRunContext
 from lightrag.parser.registry import parser_specs_snapshot
-from lightrag.utils import EmbeddingFunc, Tokenizer, compute_mdhash_id
+from lightrag.pipeline import _BatchRunContext
+from lightrag.utils import compute_mdhash_id
+
+from ._fakes import build_initialized_rag, two_chunk_chunking
 
 pytestmark = pytest.mark.offline
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*args, **kwargs) -> str:
-    return "ok"
-
-
-def _deterministic_chunking(
-    tokenizer,
-    content: str,
-    split_by_character,
-    split_by_character_only: bool,
-    chunk_overlap_token_size: int,
-    chunk_token_size: int,
-) -> list[dict]:
-    return [
-        {"tokens": 1, "content": f"{content}::chunk1", "chunk_order_index": 0},
-        {"tokens": 1, "content": f"{content}::chunk2", "chunk_order_index": 1},
-    ]
 
 
 def _status_to_text(status: object) -> str:
@@ -80,19 +50,12 @@ def _status_to_text(status: object) -> str:
 
 
 async def _build_rag(tmp_path, *, max_parallel_insert: int = 1) -> LightRAG:
-    rag = LightRAG(
-        working_dir=str(tmp_path / "wd"),
-        workspace=f"abort-{uuid4().hex[:8]}",
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
-        chunking_func=_deterministic_chunking,
+    return await build_initialized_rag(
+        tmp_path,
+        workspace_prefix="abort",
+        chunking_func=two_chunk_chunking,
         max_parallel_insert=max_parallel_insert,
     )
-    await rag.initialize_storages()
-    return rag
 
 
 def _make_status_doc(doc_id: str) -> DocProcessingStatus:
