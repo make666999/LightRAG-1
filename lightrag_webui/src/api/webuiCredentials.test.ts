@@ -1,10 +1,21 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { __setAxiosAdapterForTests, getAuthStatus, queryText, queryTextStream } from './lightrag'
+import { webuiAuthMode } from '@/lib/webuiAuthMode'
 import { useAuthStore } from '@/stores/state'
 import { useWebUIAuthStore } from '@/stores/webuiAuth'
 import { useAiContentNoticeStore } from '@/stores/aiContentNotice'
 import { captureProcessState, restoreProcessState, type ProcessStateSnapshot } from '@/test/processState'
 import { navigationService } from '@/services/navigation'
+
+describe('webuiAuthMode', () => {
+  test.each([
+    [false, false, 'guest'], [false, true, 'api-key-only'],
+    [true, false, 'account'], [true, true, 'account'],
+    [false, undefined, 'unknown'], [true, undefined, 'account']
+  ] as const)('accounts=%s key=%s selects %s', (accounts, key, mode) => {
+    expect(webuiAuthMode({ auth_configured: accounts, api_key_configured: key })).toBe(mode)
+  })
+})
 
 const stores = [useAuthStore, useWebUIAuthStore, useAiContentNoticeStore]
 let snapshot: ProcessStateSnapshot
@@ -21,25 +32,24 @@ const fail = (config: any, status: number, detail = 'Unauthorized'): never => {
   throw { config, response: { status, statusText: 'Error', data: { detail } } }
 }
 
-beforeEach(() => {
-  snapshot = captureProcessState(stores)
-  localStorage.setItem('settings-storage', JSON.stringify({ version: 22, state: { apiKey: 'legacy-secret' } }))
-  localStorage.setItem('LIGHTRAG-API-TOKEN', 'old-token')
-  useAuthStore.setState({ isAuthenticated: true, isGuestMode: false })
-  useWebUIAuthStore.setState({ mode: 'account' })
-  nav = spyOn(navigationService, 'navigateToUnauthenticated').mockImplementation(() => {})
-  log = spyOn(console, 'error').mockImplementation(() => {})
-})
-afterEach(() => {
-  __setAxiosAdapterForTests(undefined)
-  fetchSpy?.mockRestore()
-  fetchSpy = undefined
-  nav.mockRestore()
-  log.mockRestore()
-  restoreProcessState(stores, snapshot)
-})
-
 describe('WebUI credential transport', () => {
+  beforeEach(() => {
+    snapshot = captureProcessState(stores)
+    localStorage.setItem('settings-storage', JSON.stringify({ version: 22, state: { apiKey: 'legacy-secret' } }))
+    localStorage.setItem('LIGHTRAG-API-TOKEN', 'old-token')
+    useAuthStore.setState({ isAuthenticated: true, isGuestMode: false })
+    useWebUIAuthStore.setState({ mode: 'account' })
+    nav = spyOn(navigationService, 'navigateToUnauthenticated').mockImplementation(() => {})
+    log = spyOn(console, 'error').mockImplementation(() => {})
+  })
+  afterEach(() => {
+    __setAxiosAdapterForTests(undefined)
+    fetchSpy?.mockRestore()
+    fetchSpy = undefined
+    nav.mockRestore()
+    log.mockRestore()
+    restoreProcessState(stores, snapshot)
+  })
   test('regular requests send only bearer; public discovery sends neither credential', async () => {
     const seen: any[] = []
     __setAxiosAdapterForTests(async (config: any) => {

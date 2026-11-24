@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, tes
 import type { ComponentType } from 'react'
 import { act, cleanup, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter } from 'react-router-dom'
 
 import { renderWithProviders } from '@/test/render'
 import { resetCustomization, seedCustomization } from '@/test/customization'
@@ -35,7 +36,9 @@ const DESCRIPTION = 'Production cluster — read only'
 
 let realApiModule: Record<string, unknown>
 let WorkspaceApp: ComponentType
+let WorkspaceWelcome: ComponentType
 let authStatusFetches = 0
+let authStatusOverride: Record<string, unknown> | null = null
 /**
  * Everything a mounted shell writes OUTSIDE React.
  *
@@ -78,17 +81,20 @@ beforeAll(async () => {
   // Stub discovery and health checks before mounting the shell.
   mock.module('@/api/lightrag', () => ({
     ...realApiModule,
-    getAuthStatus: mock(async () => ({
-      ...((authStatusFetches += 1), {}),
-      auth_configured: false, api_key_configured: false,
-      access_token: 'test-token',
-      token_type: 'bearer',
-      auth_mode: 'disabled',
-      core_version: '1.0.0',
-      api_version: '1.0.0',
-      webui_title: TITLE,
-      webui_description: DESCRIPTION
-    })),
+    getAuthStatus: mock(async () => {
+      if (authStatusOverride) return authStatusOverride
+      authStatusFetches += 1
+      return {
+        auth_configured: false, api_key_configured: false,
+        access_token: 'test-token',
+        token_type: 'bearer',
+        auth_mode: 'disabled',
+        core_version: '1.0.0',
+        api_version: '1.0.0',
+        webui_title: TITLE,
+        webui_description: DESCRIPTION
+      }
+    }),
     checkHealth: mock(async () => ({
       status: 'healthy',
       core_version: '1.0.0',
@@ -99,6 +105,7 @@ beforeAll(async () => {
   }))
 
   WorkspaceApp = (await import('./WorkspaceApp')).default
+  WorkspaceWelcome = (await import('./WorkspaceWelcome')).default
 })
 
 afterAll(() => {
@@ -147,6 +154,7 @@ beforeEach(() => {
   // what this seam stands in for.
   resetVersionCheckCache()
   authStatusFetches = 0
+  authStatusOverride = null
   // First, before anything below mutates a store.
   fileSnapshot ??= captureProcessState(sharedStores)
   processSnapshot = captureProcessState(sharedStores)
@@ -241,5 +249,35 @@ describe('workspace header deployment description', () => {
     await user.click(trigger)
 
     expect(await screen.findByText(DESCRIPTION)).toBeVisible()
+  })
+})
+
+describe('workspace welcome branding', () => {
+  test('never puts the deployment description on the page', async () => {
+    // The description is the header tooltip's text — one line of operator
+    // context sized for a hover. Printing it on the welcome page would put
+    // an unbounded blob of bundle text in front of every visitor, competing
+    // with the welcome document that IS meant to be read there.
+    authStatusOverride = { auth_configured: true }
+    act(() => {
+      useAuthStore.setState({ isAuthenticated: false, isGuestMode: false })
+    })
+    const welcomeDescription = 'Internal deployment — do not share externally'
+    seedCustomization({ title: 'Acme Knowledge Base', description: welcomeDescription })
+
+    const view = renderWithProviders(
+      <MemoryRouter>
+        <WorkspaceWelcome />
+      </MemoryRouter>
+    )
+    await waitFor(
+      () => {
+        if (!view.container.innerHTML) throw new Error('welcome page has not settled')
+      },
+      { timeout: 5000 }
+    )
+
+    expect(await screen.findByRole('heading', { name: 'Acme Knowledge Base' })).toBeInTheDocument()
+    expect(screen.queryAllByText(welcomeDescription)).toHaveLength(0)
   })
 })

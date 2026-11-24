@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
   runSettingsStorageSplitMigration,
   getSettingsMigrationError,
@@ -8,7 +8,8 @@ import {
   acceptSettingsDataLoss,
   isSettingsDataLostError,
   SETTINGS_STORAGE_VERSION_AFTER_SPLIT,
-  QUERY_SETTINGS_STORE_VERSION
+  QUERY_SETTINGS_STORE_VERSION,
+  RETRIEVAL_HISTORY_STORE_VERSION
 } from './splitSettingsStorage'
 import { LEGACY_SETTINGS_VERSION_CAP } from './legacySettingsChain'
 import {
@@ -17,8 +18,9 @@ import {
   WEBUI_RETRIEVAL_HISTORY_KEY,
   WORKSPACE_RETRIEVAL_HISTORY_KEY
 } from '@/lib/storageKeys'
+import type { RetrievalHistoryStore } from '@/stores/retrievalHistory'
 
-/** In-memory Storage double; `failAfterWrites` injects a mid-run crash. */
+/** In-memory Storage double; `failAfterWrites` / `failValueLongerThan` inject faults. */
 class FakeStorage implements Storage {
   data = new Map<string, string>()
   writeCount = 0
@@ -59,6 +61,66 @@ class FakeStorage implements Storage {
   }
 }
 
+/**
+ * Total-byte quota — the model in which a large write can SUCCEED and a
+ * LATER write then fails because the budget is exhausted. `freeOnReplace`
+ * covers both real browser behaviors: some free a replaced key's old bytes
+ * before checking, some check against the current total. Optional
+ * `collapseAfterWrites` / `collapsedBudget` models a budget that collapses
+ * partway through a run (e.g. another tab consuming space while the split runs).
+ */
+class ByteQuotaStorage implements Storage {
+  data = new Map<string, string>()
+  removed: string[] = []
+  private writes = 0
+  constructor(
+    public budget: number,
+    private freeOnReplace = true,
+    private collapseAfterWrites?: number,
+    private collapsedBudget?: number
+  ) {}
+
+  get length() {
+    return this.data.size
+  }
+  private used(exceptKey?: string) {
+    let total = 0
+    for (const [key, value] of this.data) {
+      if (key !== exceptKey) total += key.length + value.length
+    }
+    return total
+  }
+  clear() {
+    this.data.clear()
+  }
+  getItem(key: string) {
+    return this.data.get(key) ?? null
+  }
+  key(index: number) {
+    return [...this.data.keys()][index] ?? null
+  }
+  removeItem(key: string) {
+    this.removed.push(key)
+    this.data.delete(key)
+  }
+  setItem(key: string, value: string) {
+    const used = this.freeOnReplace ? this.used(key) : this.used()
+    if (used + key.length + value.length > this.budget) {
+      const error = new Error('quota exceeded (byte budget)')
+      error.name = 'QuotaExceededError'
+      throw error
+    }
+    this.data.set(key, value)
+    if (
+      this.collapseAfterWrites !== undefined &&
+      this.collapsedBudget !== undefined &&
+      ++this.writes === this.collapseAfterWrites
+    ) {
+      this.budget = this.collapsedBudget
+    }
+  }
+}
+
 const HISTORY = [
   { id: 'h1', role: 'user', content: 'admin debug question' },
   { id: 'h2', role: 'assistant', content: 'answer' }
@@ -75,6 +137,11 @@ const v21State = () => ({
   retrievalHistory: HISTORY
 })
 
+/** Envelope-level loss marker, by literal name (it is module-private). */
+const SETTINGS_LOST_MARKER_KEY = 'lightragSettingsLostToQuota'
+
+const parsedFrom = (s: Storage, key: string) => JSON.parse(s.getItem(key)!)
+
 let storage: FakeStorage
 
 beforeEach(() => {
@@ -82,12 +149,7 @@ beforeEach(() => {
   resetSettingsMigrationErrorForTests()
 })
 
-const parsed = (key: string) => JSON.parse(storage.getItem(key)!)
-
-/** Envelope-level loss marker, by literal name (it is module-private).*/
-const SETTINGS_LOST_MARKER_KEY = 'lightragSettingsLostToQuota'
-
-const parsedFrom = (s: Storage, key: string) => JSON.parse(s.getItem(key)!)
+const parsed = (key: string) => parsedFrom(storage, key)
 
 describe('field mapping (fixed and exhaustive)', () => {
   test('querySettings → query-settings key, retrievalHistory → webui history, workspace history = []', () => {
@@ -318,25 +380,16 @@ describe('hasFutureSettingsEnvelope (rule 3 extended to the settings store)', ()
   })
 
   test('current, legacy, absent and corrupt envelopes are NOT future', () => {
-    // Current (22)
-    storage.setItem(
-      LEGACY_SETTINGS_STORAGE_KEY,
-      legacyEnvelope(SETTINGS_STORAGE_VERSION_AFTER_SPLIT, { theme: 'dark' })
-    )
-    expect(hasFutureSettingsEnvelope(storage)).toBe(false)
-    // Legacy (21)
-    storage.setItem(LEGACY_SETTINGS_STORAGE_KEY, legacyEnvelope(21, v21State()))
-    expect(hasFutureSettingsEnvelope(storage)).toBe(false)
-    // Non-numeric version
-    storage.setItem(
-      LEGACY_SETTINGS_STORAGE_KEY,
-      JSON.stringify({ state: {}, version: 'later' })
-    )
-    expect(hasFutureSettingsEnvelope(storage)).toBe(false)
-    // Corrupt JSON
-    storage.setItem(LEGACY_SETTINGS_STORAGE_KEY, '{not json')
-    expect(hasFutureSettingsEnvelope(storage)).toBe(false)
-    // Absent
+    const nonFuturePayloads = [
+      legacyEnvelope(SETTINGS_STORAGE_VERSION_AFTER_SPLIT, { theme: 'dark' }),
+      legacyEnvelope(21, v21State()),
+      JSON.stringify({ state: {}, version: 'later' }),
+      '{not json'
+    ]
+    for (const raw of nonFuturePayloads) {
+      storage.setItem(LEGACY_SETTINGS_STORAGE_KEY, raw)
+      expect(hasFutureSettingsEnvelope(storage)).toBe(false)
+    }
     storage.removeItem(LEGACY_SETTINGS_STORAGE_KEY)
     expect(hasFutureSettingsEnvelope(storage)).toBe(false)
     expect(hasFutureSettingsEnvelope(null)).toBe(false)
@@ -426,61 +479,42 @@ describe('quota-aware degradation (history is non-critical test data)', () => {
   })
 })
 
-/**
- * Total-byte quota — the model in which a large write can SUCCEED and a
- * LATER write then fails because the budget is exhausted. `freeOnReplace`
- * covers both real browser behaviors: some free a replaced key's old bytes
- * before checking, some check against the current total.
- */
-class ByteQuotaStorage implements Storage {
-  data = new Map<string, string>()
-  removed: string[] = []
-  constructor(
-    public budget: number,
-    private freeOnReplace = true
-  ) {}
-
-  get length() {
-    return this.data.size
-  }
-  private used(exceptKey?: string) {
-    let total = 0
-    for (const [key, value] of this.data) {
-      if (key !== exceptKey) total += key.length + value.length
-    }
-    return total
-  }
-  clear() {
-    this.data.clear()
-  }
-  getItem(key: string) {
-    return this.data.get(key) ?? null
-  }
-  key(index: number) {
-    return [...this.data.keys()][index] ?? null
-  }
-  removeItem(key: string) {
-    this.removed.push(key)
-    this.data.delete(key)
-  }
-  setItem(key: string, value: string) {
-    const used = this.freeOnReplace ? this.used(key) : this.used()
-    if (used + key.length + value.length > this.budget) {
-      const error = new Error('quota exceeded (byte budget)')
-      error.name = 'QuotaExceededError'
-      throw error
-    }
-    this.data.set(key, value)
-  }
-}
-
 describe('quota degradation under a byte budget', () => {
   const bigHistory = [{ id: 'h1', role: 'user', content: 'x'.repeat(1200) }]
-  const legacyWithBigHistory = () =>
-    legacyEnvelope(21, { ...v21State(), retrievalHistory: bigHistory })
+  const legacyWithBigHistory = (overrides: Record<string, unknown> = {}) =>
+    legacyEnvelope(21, { ...v21State(), retrievalHistory: bigHistory, ...overrides })
+
+  const seedTightStore = (
+    budget: number,
+    {
+      stateOverrides = {},
+      unrelatedBytes = 1200,
+      freeOnReplace = true,
+      extraKeys = {} as Record<string, string>
+    }: {
+      stateOverrides?: Record<string, unknown>
+      unrelatedBytes?: number
+      freeOnReplace?: boolean
+      extraKeys?: Record<string, string>
+    } = {}
+  ) => {
+    const quotaStorage = new ByteQuotaStorage(100000, freeOnReplace)
+    for (const [key, value] of Object.entries(extraKeys)) quotaStorage.setItem(key, value)
+    quotaStorage.setItem(LEGACY_SETTINGS_STORAGE_KEY, legacyWithBigHistory(stateOverrides))
+    if (unrelatedBytes > 0) quotaStorage.setItem('unrelated::blob', 'y'.repeat(unrelatedBytes))
+    quotaStorage.budget = budget
+    return quotaStorage
+  }
+
+  const restoreCapacityAndRerun = (quotaStorage: ByteQuotaStorage, deleteBlob = true) => {
+    if (deleteBlob) quotaStorage.data.delete('unrelated::blob')
+    quotaStorage.budget = 100000
+    resetSettingsMigrationErrorForTests()
+    runSettingsStorageSplitMigration(quotaStorage)
+  }
 
   const expectCompletedWithEmptyHistory = (quotaStorage: ByteQuotaStorage) => {
-    const read = (key: string) => JSON.parse(quotaStorage.getItem(key)!)
+    const read = (key: string) => parsedFrom(quotaStorage, key)
     // No dead end: the split completed under the degradation policy…
     expect(getSettingsMigrationError()).toBeNull()
     expect(wasHistoryDroppedDuringMigration()).toBe(true)
@@ -526,7 +560,7 @@ describe('quota degradation under a byte budget', () => {
 
     runSettingsStorageSplitMigration(quotaStorage)
 
-    const read = (key: string) => JSON.parse(quotaStorage.getItem(key)!)
+    const read = (key: string) => parsedFrom(quotaStorage, key)
     // The legacy envelope is the key being rewritten, so it is the one that
     // gets removed; the migrated copy must NOT be (the scratch key of the
     // headroom probe is bookkeeping, so assert the intent, not the list)…
@@ -613,11 +647,7 @@ describe('quota degradation under a byte budget', () => {
     // refuse to hydrate and the entry offers a retry (rules 6/7), and it must
     // leave a legacy envelope behind: a run that found NO envelope would
     // declare the split done over data it never migrated.
-    const quotaStorage = new ByteQuotaStorage(10000, false)
-    quotaStorage.setItem(LEGACY_SETTINGS_STORAGE_KEY, legacyWithBigHistory())
-    quotaStorage.setItem('unrelated::blob', 'y'.repeat(1000))
-    // The quota tightens under us (other origins' data, another tab's writes).
-    quotaStorage.budget = 1250
+    const quotaStorage = seedTightStore(1250, { unrelatedBytes: 1000, freeOnReplace: false })
 
     runSettingsStorageSplitMigration(quotaStorage)
 
@@ -638,11 +668,7 @@ describe('quota degradation under a byte budget', () => {
     // freeOnReplace: false is the engine that cannot shrink a key in place,
     // i.e. the one whose first write fails for reasons that have nothing to
     // do with how full the store is.
-    const quotaStorage = new ByteQuotaStorage(100000, false)
-    quotaStorage.setItem(LEGACY_SETTINGS_STORAGE_KEY, legacyWithBigHistory())
-    // Tight, but the legacy history it is about to shed is far larger than
-    // anything still to be written.
-    quotaStorage.budget = 1300
+    const quotaStorage = seedTightStore(1300, { unrelatedBytes: 0, freeOnReplace: false })
 
     runSettingsStorageSplitMigration(quotaStorage)
 
@@ -662,11 +688,7 @@ describe('quota degradation under a byte budget', () => {
     //
     // Hence the write-back ladder's last rung: the minimal envelope fits in
     // a window where the real bytes do not.
-    const quotaStorage = new ByteQuotaStorage(100000, true)
-    quotaStorage.setItem(LEGACY_SETTINGS_STORAGE_KEY, legacyWithBigHistory())
-    quotaStorage.setItem('unrelated::blob', 'y'.repeat(1200))
-    // The quota shrinks below what the store already holds.
-    quotaStorage.budget = 1300
+    const quotaStorage = seedTightStore(1300)
 
     runSettingsStorageSplitMigration(quotaStorage)
 
@@ -692,10 +714,7 @@ describe('quota degradation under a byte budget', () => {
     // migrated its empty state successfully, stamped v22 and never retried:
     // theme, language and apiKey gone, app starting clean, no error anywhere.
     // The retry button converted a visible failure into silent data loss.
-    const quotaStorage = new ByteQuotaStorage(100000, true)
-    quotaStorage.setItem(LEGACY_SETTINGS_STORAGE_KEY, legacyWithBigHistory())
-    quotaStorage.setItem('unrelated::blob', 'y'.repeat(1200))
-    quotaStorage.budget = 1300
+    const quotaStorage = seedTightStore(1300)
 
     runSettingsStorageSplitMigration(quotaStorage)
     // Reported as unrecoverable from the FIRST screen, not as "try again".
@@ -705,10 +724,7 @@ describe('quota degradation under a byte budget', () => {
 
     // Capacity returns and the user reloads — the sequence that used to lose
     // the settings for good.
-    quotaStorage.data.delete('unrelated::blob')
-    quotaStorage.budget = 100000
-    resetSettingsMigrationErrorForTests()
-    runSettingsStorageSplitMigration(quotaStorage)
+    restoreCapacityAndRerun(quotaStorage)
 
     // Still refused, still as unrecoverable, and NOTHING written: no targets
     // invented from an empty state, no v22 stamp over data never read.
@@ -718,10 +734,7 @@ describe('quota degradation under a byte budget', () => {
   })
 
   test('accepting the loss is what clears it, and only then', () => {
-    const quotaStorage = new ByteQuotaStorage(100000, true)
-    quotaStorage.setItem(LEGACY_SETTINGS_STORAGE_KEY, legacyWithBigHistory())
-    quotaStorage.setItem('unrelated::blob', 'y'.repeat(1200))
-    quotaStorage.budget = 1300
+    const quotaStorage = seedTightStore(1300)
     runSettingsStorageSplitMigration(quotaStorage)
     expect(isSettingsDataLostError(getSettingsMigrationError())).toBe(true)
 
@@ -741,25 +754,13 @@ describe('quota degradation under a byte budget', () => {
     // non-primitives" finds nothing to drop — so without a scalar ladder the
     // next rung was the empty envelope and EVERY scalar went at once. Here
     // the largest one goes and the cheap ones survive.
-    const quotaStorage = new ByteQuotaStorage(100000, true)
-    quotaStorage.setItem(
-      LEGACY_SETTINGS_STORAGE_KEY,
-      legacyEnvelope(21, {
-        theme: 'dark',
-        language: 'zh',
-        apiKey: 'k'.repeat(60),
-        querySettings: { mode: 'hybrid', top_k: 7, history_turns: 0 },
-        retrievalHistory: bigHistory
-      })
-    )
-    quotaStorage.setItem('unrelated::blob', 'y'.repeat(1200))
     // Sized to fit the envelope minus its biggest scalar, but not the whole
     // one (see the rung ladder in reducedLegacyPayloads).
-    quotaStorage.budget = 1340
+    const quotaStorage = seedTightStore(1340, { stateOverrides: { apiKey: 'k'.repeat(60) } })
 
     runSettingsStorageSplitMigration(quotaStorage)
 
-    const left = JSON.parse(quotaStorage.getItem(LEGACY_SETTINGS_STORAGE_KEY)!)
+    const left = parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY)
     // The oversized apiKey was shed; the cheap scalars survived.
     expect(left.state.apiKey).toBeUndefined()
     expect(left.state.theme).toBe('dark')
@@ -773,19 +774,7 @@ describe('quota degradation under a byte budget', () => {
   test('accepting a PARTIAL loss keeps what survived', () => {
     // The counterpart to the empty case: acceptance adapts to what is left,
     // so a user who says "continue" still gets the settings that fit.
-    const quotaStorage = new ByteQuotaStorage(100000, true)
-    quotaStorage.setItem(
-      LEGACY_SETTINGS_STORAGE_KEY,
-      legacyEnvelope(21, {
-        theme: 'dark',
-        language: 'zh',
-        apiKey: 'k'.repeat(60),
-        querySettings: { mode: 'hybrid', top_k: 7, history_turns: 0 },
-        retrievalHistory: bigHistory
-      })
-    )
-    quotaStorage.setItem('unrelated::blob', 'y'.repeat(1200))
-    quotaStorage.budget = 1340
+    const quotaStorage = seedTightStore(1340, { stateOverrides: { apiKey: 'k'.repeat(60) } })
     runSettingsStorageSplitMigration(quotaStorage)
     expect(isSettingsDataLostError(getSettingsMigrationError())).toBe(true)
 
@@ -793,12 +782,11 @@ describe('quota degradation under a byte budget', () => {
     acceptSettingsDataLoss(quotaStorage)
     // Fields remained, so the key stays (un-marked) and the reload migrates
     // them instead of starting from defaults.
-    const kept = JSON.parse(quotaStorage.getItem(LEGACY_SETTINGS_STORAGE_KEY)!)
+    const kept = parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY)
     expect(kept[SETTINGS_LOST_MARKER_KEY]).toBeUndefined()
     expect(kept.state.theme).toBe('dark')
 
-    resetSettingsMigrationErrorForTests()
-    runSettingsStorageSplitMigration(quotaStorage)
+    restoreCapacityAndRerun(quotaStorage, false)
     expect(getSettingsMigrationError()).toBeNull()
     expect(parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY).state.theme).toBe('dark')
   })
@@ -819,24 +807,16 @@ describe('quota degradation under a byte budget', () => {
     // so the reload migrated the reduced envelope successfully, the store
     // hydrated default query settings, and `acceptSettingsDataLoss` was
     // never offered for settings the browser never handed over.
-    const quotaStorage = new ByteQuotaStorage(100000, true)
-    quotaStorage.setItem(
-      LEGACY_SETTINGS_STORAGE_KEY,
-      legacyEnvelope(21, {
-        ...v21State(),
-        querySettings: { mode: 'hybrid', top_k: 7, blob: 'q'.repeat(600) },
-        retrievalHistory: bigHistory
-      })
-    )
-    quotaStorage.setItem('unrelated::blob', 'y'.repeat(1200))
     // Room for the scalars once the legacy envelope goes, but not for the
     // history-free payload that still carries querySettings.
-    quotaStorage.budget = 1500
+    const quotaStorage = seedTightStore(1500, {
+      stateOverrides: { querySettings: { mode: 'hybrid', top_k: 7, blob: 'q'.repeat(600) } }
+    })
 
     runSettingsStorageSplitMigration(quotaStorage)
 
     // The scalars still survive the rung — that half is unchanged…
-    const left = JSON.parse(quotaStorage.getItem(LEGACY_SETTINGS_STORAGE_KEY)!)
+    const left = parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY)
     expect(left.state).toEqual({ theme: 'dark', language: 'zh', apiKey: 'secret' })
     // …and the query settings that went with it are nowhere else.
     expect(quotaStorage.getItem(QUERY_SETTINGS_STORAGE_KEY)).toBeNull()
@@ -846,11 +826,7 @@ describe('quota degradation under a byte budget', () => {
 
     // Capacity returns and the user reloads: still refused, and nothing
     // written — no query-settings target invented from a field that is gone.
-    quotaStorage.data.delete('unrelated::blob')
-    quotaStorage.budget = 100000
-    resetSettingsMigrationErrorForTests()
-
-    runSettingsStorageSplitMigration(quotaStorage)
+    restoreCapacityAndRerun(quotaStorage)
 
     expect(isSettingsDataLostError(getSettingsMigrationError())).toBe(true)
     expect(quotaStorage.getItem(QUERY_SETTINGS_STORAGE_KEY)).toBeNull()
@@ -861,7 +837,7 @@ describe('quota degradation under a byte budget', () => {
     runSettingsStorageSplitMigration(quotaStorage)
 
     expect(getSettingsMigrationError()).toBeNull()
-    const migrated = JSON.parse(quotaStorage.getItem(LEGACY_SETTINGS_STORAGE_KEY)!)
+    const migrated = parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY)
     expect(migrated.version).toBe(SETTINGS_STORAGE_VERSION_AFTER_SPLIT)
     expect(migrated.state.theme).toBe('dark')
     expect(migrated.state.language).toBe('zh')
@@ -877,25 +853,19 @@ describe('quota degradation under a byte budget', () => {
     // query-settings key authoritative — the legacy copy was never going to
     // be written anywhere — so shedding `querySettings` from the envelope
     // forfeits nothing and must not raise a loss the user has to accept.
-    const quotaStorage = new ByteQuotaStorage(100000, true)
-    quotaStorage.setItem(
-      QUERY_SETTINGS_STORAGE_KEY,
-      JSON.stringify({ state: { querySettings: { mode: 'local' } }, version: 1 })
-    )
-    quotaStorage.setItem(
-      LEGACY_SETTINGS_STORAGE_KEY,
-      legacyEnvelope(21, {
-        ...v21State(),
-        querySettings: { mode: 'hybrid', top_k: 7, blob: 'q'.repeat(600) },
-        retrievalHistory: bigHistory
-      })
-    )
-    quotaStorage.setItem('unrelated::blob', 'y'.repeat(1200))
-    quotaStorage.budget = 1500
+    const quotaStorage = seedTightStore(1500, {
+      extraKeys: {
+        [QUERY_SETTINGS_STORAGE_KEY]: JSON.stringify({
+          state: { querySettings: { mode: 'local' } },
+          version: 1
+        })
+      },
+      stateOverrides: { querySettings: { mode: 'hybrid', top_k: 7, blob: 'q'.repeat(600) } }
+    })
 
     runSettingsStorageSplitMigration(quotaStorage)
 
-    const left = JSON.parse(quotaStorage.getItem(LEGACY_SETTINGS_STORAGE_KEY)!)
+    const left = parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY)
     expect(left.state).toEqual({ theme: 'dark', language: 'zh', apiKey: 'secret' })
     // No marker: nothing the rung dropped existed only in this envelope.
     expect(SETTINGS_LOST_MARKER_KEY in left).toBe(false)
@@ -903,11 +873,7 @@ describe('quota degradation under a byte budget', () => {
 
     // So when capacity returns it migrates normally, with no acceptance —
     // and the user's own query-settings key is still the authoritative one.
-    quotaStorage.data.delete('unrelated::blob')
-    quotaStorage.budget = 100000
-    resetSettingsMigrationErrorForTests()
-
-    runSettingsStorageSplitMigration(quotaStorage)
+    restoreCapacityAndRerun(quotaStorage)
 
     expect(getSettingsMigrationError()).toBeNull()
     expect(parsedFrom(quotaStorage, QUERY_SETTINGS_STORAGE_KEY).state.querySettings.mode).toBe(
@@ -932,62 +898,14 @@ describe('quota degradation under a byte budget', () => {
   })
 })
 
-/**
- * A budget that COLLAPSES partway through the run — another origin (or
- * another tab of this one) consumed the space while the split was writing.
- * It is the only way the PHASE-2 ladder is reachable: phase 2's payload is
- * strictly smaller than the envelope it replaces, so under a fixed budget
- * the removal always makes room for it.
- */
-class CollapsingQuotaStorage implements Storage {
-  data = new Map<string, string>()
-  private writes = 0
-  constructor(
-    public budget: number,
-    private collapseAfterWrites: number,
-    private collapsedBudget: number
-  ) {}
-  get length() {
-    return this.data.size
-  }
-  private used(exceptKey?: string) {
-    let total = 0
-    for (const [key, value] of this.data) {
-      if (key !== exceptKey) total += key.length + value.length
-    }
-    return total
-  }
-  clear() {
-    this.data.clear()
-  }
-  getItem(key: string) {
-    return this.data.get(key) ?? null
-  }
-  key(index: number) {
-    return [...this.data.keys()][index] ?? null
-  }
-  removeItem(key: string) {
-    this.data.delete(key)
-  }
-  setItem(key: string, value: string) {
-    if (this.used(key) + key.length + value.length > this.budget) {
-      const error = new Error('quota exceeded (byte budget)')
-      error.name = 'QuotaExceededError'
-      throw error
-    }
-    this.data.set(key, value)
-    if (++this.writes === this.collapseAfterWrites) this.budget = this.collapsedBudget
-  }
-}
-
 describe('a shed envelope stamped POST-SPLIT still requires acceptance', () => {
   const shedAtPhaseTwo = () => {
     // Seed write + the three phase-1 target writes, then the budget collapses
     // to a window that fits neither the phase-2 payload nor the bytes just
     // removed — but does fit a scalar rung, which carries phase 2's OWN
     // version (22) along with the loss marker.
-    const storage = new CollapsingQuotaStorage(100000, 4, 1400)
-    storage.setItem(
+    const quotaStorage = new ByteQuotaStorage(100000, true, 4, 1400)
+    quotaStorage.setItem(
       LEGACY_SETTINGS_STORAGE_KEY,
       legacyEnvelope(21, {
         theme: 'dark',
@@ -997,9 +915,9 @@ describe('a shed envelope stamped POST-SPLIT still requires acceptance', () => {
         retrievalHistory: [{ id: 'h1', role: 'user', content: 'x'.repeat(900) }]
       })
     )
-    storage.budget = 3000
-    runSettingsStorageSplitMigration(storage)
-    return storage
+    quotaStorage.budget = 3000
+    runSettingsStorageSplitMigration(quotaStorage)
+    return quotaStorage
   }
 
   test('the reload REFUSES instead of migrating the surviving fields', () => {
@@ -1009,35 +927,35 @@ describe('a shed envelope stamped POST-SPLIT still requires acceptance', () => {
     // and returned clean, never reaching the marker: the partial settings
     // hydrated with no error and no acceptance, and the API key that did not
     // fit was gone silently. Exactly the loss the marker exists to report.
-    const storage = shedAtPhaseTwo()
+    const quotaStorage = shedAtPhaseTwo()
 
     // The run that did the shedding reports it…
     expect(isSettingsDataLostError(getSettingsMigrationError())).toBe(true)
-    const shed = JSON.parse(storage.getItem(LEGACY_SETTINGS_STORAGE_KEY)!)
+    const shed = parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY)
     expect(shed.version).toBe(SETTINGS_STORAGE_VERSION_AFTER_SPLIT) // past the cap
     expect(shed.lightragSettingsLostToQuota).toBe(true)
     expect(shed.state.apiKey).toBeUndefined() // the field that did not fit
     expect(shed.state.theme).toBe('dark') // what the rung saved
 
     // …and so does the reload, once there is room again.
-    storage.budget = 100000
+    quotaStorage.budget = 100000
     resetSettingsMigrationErrorForTests()
-    runSettingsStorageSplitMigration(storage)
+    runSettingsStorageSplitMigration(quotaStorage)
     expect(isSettingsDataLostError(getSettingsMigrationError())).toBe(true)
     // Refusing touched nothing.
-    expect(JSON.parse(storage.getItem(LEGACY_SETTINGS_STORAGE_KEY)!)).toEqual(shed)
+    expect(parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY)).toEqual(shed)
   })
 
   test('acceptance keeps the surviving fields and stops the refusal', () => {
-    const storage = shedAtPhaseTwo()
-    storage.budget = 100000
+    const quotaStorage = shedAtPhaseTwo()
+    quotaStorage.budget = 100000
 
-    acceptSettingsDataLoss(storage)
+    acceptSettingsDataLoss(quotaStorage)
 
     resetSettingsMigrationErrorForTests()
-    runSettingsStorageSplitMigration(storage)
+    runSettingsStorageSplitMigration(quotaStorage)
     expect(getSettingsMigrationError()).toBeNull()
-    const accepted = JSON.parse(storage.getItem(LEGACY_SETTINGS_STORAGE_KEY)!)
+    const accepted = parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY)
     expect('lightragSettingsLostToQuota' in accepted).toBe(false)
     expect(accepted.state.theme).toBe('dark')
     expect(accepted.state.language).toBe('zh')
@@ -1089,7 +1007,7 @@ describe('a shed envelope stamped POST-SPLIT still requires acceptance', () => {
 
     runSettingsStorageSplitMigration(quotaStorage)
 
-    const shed = JSON.parse(quotaStorage.getItem(LEGACY_SETTINGS_STORAGE_KEY)!)
+    const shed = parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY)
     // The migrated field's own key is right there, so it is NOT what made
     // this a loss — the prompt history is.
     expect(quotaStorage.getItem(QUERY_SETTINGS_STORAGE_KEY)).not.toBeNull()
@@ -1104,7 +1022,7 @@ describe('a shed envelope stamped POST-SPLIT still requires acceptance', () => {
     resetSettingsMigrationErrorForTests()
     runSettingsStorageSplitMigration(quotaStorage)
     expect(isSettingsDataLostError(getSettingsMigrationError())).toBe(true)
-    expect(JSON.parse(quotaStorage.getItem(LEGACY_SETTINGS_STORAGE_KEY)!)).toEqual(shed)
+    expect(parsedFrom(quotaStorage, LEGACY_SETTINGS_STORAGE_KEY)).toEqual(shed)
   })
 
   test('a STRICTLY future envelope is rule 3\'s, marker or not', () => {
@@ -1162,5 +1080,174 @@ describe('query-settings store version stability', () => {
     // leaves fields it has never heard of to the store's own defaults.
     expect(envelope.state.querySettings.mode).toBe('hybrid')
     expect('disable_user_prompt_prefix' in envelope.state.querySettings).toBe(false)
+  })
+})
+
+const installLocalStorage = (stub: Storage): (() => void) => {
+  const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: stub,
+    configurable: true
+  })
+  return () => {
+    if (previousDescriptor) {
+      Object.defineProperty(globalThis, 'localStorage', previousDescriptor)
+    } else {
+      delete (globalThis as Record<string, unknown>).localStorage
+    }
+  }
+}
+
+describe('split store disjoint writers', () => {
+  // Storage-split isolation: the three split keys have disjoint writers, so a
+  // write through one store must never touch the other keys — the whole-
+  // envelope write-back race of the legacy single key is gone by construction.
+  //
+  // Isolation rule: the two history stores are FRESH instances built via the
+  // exported factory while this block's stub is installed, while the (possibly
+  // cached) query-settings singleton is read through its OWN
+  // `persist.getOptions().storage`. Swapping `localStorage` in `beforeEach`/
+  // `afterEach` avoids sibling-describe `beforeAll` hoisting in Bun.
+  const stub = new FakeStorage()
+  let restoreLocalStorage: (() => void) | undefined
+  let webuiHistory: RetrievalHistoryStore | undefined
+  let workspaceHistory: RetrievalHistoryStore | undefined
+  let querySettings: typeof import('@/stores/querySettings').useQuerySettingsStore | undefined
+  let savedQuerySettings:
+    | ReturnType<typeof import('@/stores/querySettings').useQuerySettingsStore.getState>['querySettings']
+    | undefined
+
+  const readQuerySettingsEnvelope = async () => {
+    const storeStorage = querySettings!.persist.getOptions().storage!
+    return await storeStorage.getItem(QUERY_SETTINGS_STORAGE_KEY)
+  }
+
+  beforeEach(async () => {
+    restoreLocalStorage = installLocalStorage(stub)
+    if (!webuiHistory || !workspaceHistory || !querySettings) {
+      const { createRetrievalHistoryStore } = await import('@/stores/retrievalHistory')
+      webuiHistory = createRetrievalHistoryStore(WEBUI_RETRIEVAL_HISTORY_KEY)
+      workspaceHistory = createRetrievalHistoryStore(WORKSPACE_RETRIEVAL_HISTORY_KEY)
+      querySettings = (await import('@/stores/querySettings')).useQuerySettingsStore
+      savedQuerySettings = { ...querySettings.getState().querySettings }
+    }
+  })
+
+  afterEach(() => {
+    restoreLocalStorage?.()
+    restoreLocalStorage = undefined
+  })
+
+  afterAll(() => {
+    if (querySettings && savedQuerySettings) {
+      querySettings.setState({ querySettings: savedQuerySettings })
+    }
+  })
+
+  test('workspace history writes touch ONLY the workspace history key', async () => {
+    const settingsBefore = JSON.stringify(await readQuerySettingsEnvelope())
+    const webuiBefore = stub.getItem(WEBUI_RETRIEVAL_HISTORY_KEY)
+
+    workspaceHistory!
+      .getState()
+      .setHistory([{ id: 'w1', role: 'user', content: 'workspace question' }])
+
+    // Its own key (in this block's stub) got the write…
+    expect(parsedFrom(stub, WORKSPACE_RETRIEVAL_HISTORY_KEY).state.history).toHaveLength(1)
+    // …and neither sibling key moved: not in this stub, and not wherever the
+    // query-settings singleton actually persists.
+    expect(stub.getItem(QUERY_SETTINGS_STORAGE_KEY)).toBeNull()
+    expect(stub.getItem(WEBUI_RETRIEVAL_HISTORY_KEY)).toBe(webuiBefore)
+    expect(JSON.stringify(await readQuerySettingsEnvelope())).toBe(settingsBefore)
+  })
+
+  test('the two histories are invisible to each other', () => {
+    webuiHistory!
+      .getState()
+      .setHistory([{ id: 'a1', role: 'user', content: 'admin debug' }])
+
+    expect(workspaceHistory!.getState().history.map((m) => m.id)).toEqual(['w1'])
+    expect(webuiHistory!.getState().history.map((m) => m.id)).toEqual(['a1'])
+    expect(parsedFrom(stub, WEBUI_RETRIEVAL_HISTORY_KEY).state.history[0].id).toBe('a1')
+    expect(parsedFrom(stub, WORKSPACE_RETRIEVAL_HISTORY_KEY).state.history[0].id).toBe('w1')
+
+    // Clearing one side leaves the other side's history untouched.
+    workspaceHistory!.getState().clearHistory()
+    expect(workspaceHistory!.getState().history).toEqual([])
+    expect(webuiHistory!.getState().history.map((m) => m.id)).toEqual(['a1'])
+    expect(parsedFrom(stub, WEBUI_RETRIEVAL_HISTORY_KEY).state.history[0].id).toBe('a1')
+  })
+
+  test('query settings writes touch ONLY the query-settings key', async () => {
+    const webuiBefore = stub.getItem(WEBUI_RETRIEVAL_HISTORY_KEY)
+    const workspaceBefore = stub.getItem(WORKSPACE_RETRIEVAL_HISTORY_KEY)
+
+    querySettings!.getState().updateQuerySettings({ top_k: 99 })
+
+    // Read back through the singleton's OWN storage binding.
+    const envelope = (await readQuerySettingsEnvelope()) as {
+      state: { querySettings: { top_k: number } }
+    }
+    expect(envelope.state.querySettings.top_k).toBe(99)
+    // The history keys in this block's stub did not move.
+    expect(stub.getItem(WEBUI_RETRIEVAL_HISTORY_KEY)).toBe(webuiBefore)
+    expect(stub.getItem(WORKSPACE_RETRIEVAL_HISTORY_KEY)).toBe(workspaceBefore)
+  })
+
+  test('history_turns stays pinned to 0 through updates', () => {
+    querySettings!.getState().updateQuerySettings({ history_turns: 7 } as never)
+    expect(querySettings!.getState().querySettings.history_turns).toBe(0)
+  })
+})
+
+describe('bounded history persistence under quota pressure', () => {
+  // Bounded-capacity persistence for the retrieval histories (product
+  // decision: the chat history is a non-critical test record). When a
+  // persisted write exceeds the browser quota the write is ABANDONED — the
+  // stored envelope resets to an empty history so the key stays bounded, the
+  // in-memory conversation survives for the session, and a one-time toast
+  // warns the user — instead of zustand's default of silently failing on
+  // every subsequent write forever.
+  const TEST_KEY = 'lightrag::quota-test-history'
+  const quotaStub = new FakeStorage()
+  quotaStub.failValueLongerThan = 500
+  quotaStub.failureName = 'QuotaExceededError'
+
+  let restoreLocalStorage: (() => void) | undefined
+  let historyStore: RetrievalHistoryStore | undefined
+
+  beforeEach(async () => {
+    restoreLocalStorage = installLocalStorage(quotaStub)
+    if (!historyStore) {
+      const { createRetrievalHistoryStore } = await import('@/stores/retrievalHistory')
+      historyStore = createRetrievalHistoryStore(TEST_KEY)
+    }
+  })
+
+  afterEach(() => {
+    restoreLocalStorage?.()
+    restoreLocalStorage = undefined
+  })
+
+  test('an over-quota write abandons persistence but keeps the live conversation', () => {
+    const bigHistory = [{ id: 'b1', role: 'user' as const, content: 'x'.repeat(2000) }]
+
+    historyStore!.getState().setHistory(bigHistory)
+
+    // The live session still shows the conversation…
+    expect(historyStore!.getState().history).toHaveLength(1)
+    // …while the persisted envelope was reset to an EMPTY history (bounded),
+    // not left holding a stale value and not thrown out of setHistory.
+    const persisted = parsedFrom(quotaStub, TEST_KEY)
+    expect(persisted.version).toBe(RETRIEVAL_HISTORY_STORE_VERSION)
+    expect(persisted.state.history).toEqual([])
+  })
+
+  test('small writes persist normally again afterwards', () => {
+    const smallHistory = [{ id: 's1', role: 'user' as const, content: 'short' }]
+
+    historyStore!.getState().setHistory(smallHistory)
+
+    expect(parsedFrom(quotaStub, TEST_KEY).state.history).toHaveLength(1)
   })
 })
