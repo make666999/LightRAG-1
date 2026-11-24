@@ -1150,3 +1150,247 @@ async def test_bedrock_empty_response_without_token_limit_says_so(monkeypatch):
     assert "stopReason=end_turn" in message
     assert "model produced no output" in message
     assert "BEDROCK_LLM_MAX_TOKENS" not in message
+
+
+# --------------------------------------------------------------------------- #
+# Connection-closed exception classification & retry exhaustion
+# --------------------------------------------------------------------------- #
+
+
+class _FlakyConnectionClient:
+    """Fake Bedrock client whose converse() drops the connection N times."""
+
+    def __init__(self, calls: list[int], failures: int):
+        self._calls = calls
+        self._failures = failures
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def converse(self, **kwargs):
+        from botocore.exceptions import ConnectionClosedError
+
+        self._calls.append(1)
+        if len(self._calls) <= self._failures:
+            raise ConnectionClosedError(
+                endpoint_url="https://bedrock-runtime.example.com"
+            )
+        return {
+            "output": {"message": {"content": [{"text": "ok"}]}},
+            "stopReason": "end_turn",
+            "usage": {},
+        }
+
+
+class _DisconnectedEmbeddingClient:
+    """Fake Bedrock client whose invoke_model() always drops the connection."""
+
+    def __init__(self, calls: list[int]):
+        self._calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def invoke_model(self, **kwargs):
+        from botocore.exceptions import ConnectionClosedError
+
+        self._calls.append(1)
+        raise ConnectionClosedError(endpoint_url="https://bedrock-runtime.example.com")
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_bedrock_complete_if_cache_retries_dropped_connection(monkeypatch):
+    from tenacity import wait_none
+
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.setattr(bedrock_complete_if_cache.retry, "wait", wait_none())
+
+    calls: list[int] = []
+    fake_session = SimpleNamespace(
+        client=lambda *_args, **_kwargs: _FlakyConnectionClient(calls, failures=2)
+    )
+    with patch("lightrag.llm.bedrock.aioboto3.Session", return_value=fake_session):
+        result = await bedrock_complete_if_cache(model="bedrock-model", prompt="hello")
+
+    assert result == "ok"
+    assert len(calls) == 3
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_bedrock_complete_if_cache_reraises_after_retry_exhaustion(monkeypatch):
+    from tenacity import wait_none
+
+    from lightrag.llm.bedrock import BedrockConnectionError
+
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.setattr(bedrock_complete_if_cache.retry, "wait", wait_none())
+
+    calls: list[int] = []
+    fake_session = SimpleNamespace(
+        client=lambda *_args, **_kwargs: _FlakyConnectionClient(calls, failures=5)
+    )
+    with (
+        patch("lightrag.llm.bedrock.aioboto3.Session", return_value=fake_session),
+        pytest.raises(BedrockConnectionError),
+    ):
+        await bedrock_complete_if_cache(model="bedrock-model", prompt="hello")
+
+    assert len(calls) == 5
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_bedrock_embed_retries_then_reraises_dropped_connection(monkeypatch):
+    from tenacity import wait_none
+
+    from lightrag.llm.bedrock import BedrockConnectionError
+
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.setattr(bedrock_embed.func.retry, "wait", wait_none())
+
+    calls: list[int] = []
+    fake_session = SimpleNamespace(
+        client=lambda *_args, **_kwargs: _DisconnectedEmbeddingClient(calls)
+    )
+    with (
+        patch("lightrag.llm.bedrock.aioboto3.Session", return_value=fake_session),
+        pytest.raises(BedrockConnectionError),
+    ):
+        await bedrock_embed(texts=["hello"])
+
+    assert len(calls) == 5
+
+
+# --------------------------------------------------------------------------- #
+# Token usage tracking (non-streaming and streaming)
+# --------------------------------------------------------------------------- #
+
+
+class _UsageEventStream:
+    """Async iterator yielding synthetic Bedrock converse_stream events."""
+
+    def __init__(self, events):
+        self._events = iter(events)
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._events)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+    def close(self):
+        self.closed = True
+
+
+class _UsageClient:
+    """Stub Bedrock client recording request kwargs and returning a preset response."""
+
+    def __init__(self, response):
+        self.response = response
+        self.request = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def converse(self, **kwargs):
+        self.request = kwargs
+        return self.response
+
+    async def converse_stream(self, **kwargs):
+        self.request = kwargs
+        return self.response
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_bedrock_non_streaming_usage_is_tracked_without_reaching_sdk():
+    from lightrag.utils import TokenTracker
+
+    tracker = TokenTracker()
+    client = _UsageClient(
+        {
+            "output": {"message": {"content": [{"text": "answer"}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 10, "outputTokens": 4, "totalTokens": 14},
+        }
+    )
+
+    with patch(
+        "lightrag.llm.bedrock.aioboto3.Session",
+        return_value=SimpleNamespace(client=lambda *_a, **_k: client),
+    ):
+        result = await bedrock_complete_if_cache.__wrapped__(
+            model="bedrock-model",
+            prompt="hello",
+            token_tracker=tracker,
+        )
+
+    assert result == "answer"
+    assert tracker.get_usage() == {
+        "prompt_tokens": 10,
+        "completion_tokens": 4,
+        "total_tokens": 14,
+        "call_count": 1,
+    }
+    assert "token_tracker" not in client.request
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_bedrock_streaming_usage_is_tracked_after_message_stop():
+    from lightrag.utils import TokenTracker
+
+    tracker = TokenTracker()
+    event_stream = _UsageEventStream(
+        [
+            {"contentBlockDelta": {"delta": {"text": "answer"}}},
+            {"messageStop": {"stopReason": "end_turn"}},
+            {
+                "metadata": {
+                    "usage": {
+                        "inputTokens": 8,
+                        "outputTokens": 3,
+                        "totalTokens": 11,
+                    }
+                }
+            },
+        ]
+    )
+    client = _UsageClient({"stream": event_stream})
+
+    with patch(
+        "lightrag.llm.bedrock.aioboto3.Session",
+        return_value=SimpleNamespace(client=lambda *_a, **_k: client),
+    ):
+        result = await bedrock_complete_if_cache.__wrapped__(
+            model="bedrock-model",
+            prompt="hello",
+            stream=True,
+            token_tracker=tracker,
+        )
+        chunks = [chunk async for chunk in result]
+
+    assert chunks == ["answer"]
+    assert tracker.get_usage() == {
+        "prompt_tokens": 8,
+        "completion_tokens": 3,
+        "total_tokens": 11,
+        "call_count": 1,
+    }
+    assert "token_tracker" not in client.request
+    assert event_stream.closed is True

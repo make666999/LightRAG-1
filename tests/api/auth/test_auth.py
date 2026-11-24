@@ -1,8 +1,15 @@
+"""Auth handler, password hashing, JWT validation, and shared pre-auth helpers."""
+
+from __future__ import annotations
+
+import base64
 import importlib
+import json
 import sys
 from types import SimpleNamespace
 
 import bcrypt
+import jwt
 import pytest
 from fastapi import HTTPException
 from starlette.status import HTTP_403_FORBIDDEN
@@ -15,6 +22,8 @@ from tests.api._cheap_bcrypt import CHEAP_DUMMY_SPEC, cheap_bcrypt_salts
 # Every test here checks which verification ran and its result, never its
 # cost, so hashes and the dummy spec use bcrypt's minimum cost.
 pytestmark = [pytest.mark.offline, pytest.mark.usefixtures(cheap_bcrypt_salts.__name__)]
+
+_JWT_SECRET = "test-jwt-secret-that-is-at-least-32-bytes"
 
 
 def import_real_api_module(module_name: str):
@@ -33,7 +42,7 @@ def auth_module(monkeypatch):
     config = import_real_api_module("lightrag.api.config")
 
     mock_global_args = SimpleNamespace(
-        token_secret="test-jwt-secret-that-is-at-least-32-bytes",
+        token_secret=_JWT_SECRET,
         jwt_algorithm="HS256",
         token_expire_hours=48,
         guest_token_expire_hours=24,
@@ -52,6 +61,11 @@ def auth_module(monkeypatch):
 def build_bcrypt_value(password: str) -> str:
     hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     return f"{BCRYPT_PASSWORD_PREFIX}{hashed}"
+
+
+# --------------------------------------------------------------------------- #
+# Password verification, account parsing, and combined auth
+# --------------------------------------------------------------------------- #
 
 
 def test_verify_plaintext_password(auth_module):
@@ -183,7 +197,7 @@ def test_invalid_auth_accounts_raises(monkeypatch):
     config = import_real_api_module("lightrag.api.config")
 
     mock_global_args = SimpleNamespace(
-        token_secret="test-jwt-secret-that-is-at-least-32-bytes",
+        token_secret=_JWT_SECRET,
         jwt_algorithm="HS256",
         token_expire_hours=48,
         guest_token_expire_hours=24,
@@ -203,7 +217,7 @@ def load_auth_handler(monkeypatch, auth_accounts: str):
     config = import_real_api_module("lightrag.api.config")
 
     mock_global_args = SimpleNamespace(
-        token_secret="test-jwt-secret-that-is-at-least-32-bytes",
+        token_secret=_JWT_SECRET,
         jwt_algorithm="HS256",
         token_expire_hours=48,
         guest_token_expire_hours=24,
@@ -470,3 +484,251 @@ def test_hash_password_cli_reports_password_over_bcrypt_limit(capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "password is 73 bytes in UTF-8; bcrypt accepts at most 72" in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# JWT validation guards (forged / tampered tokens)
+# --------------------------------------------------------------------------- #
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _assert_rejected(handler, token: str) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        handler.validate_token(token)
+    assert exc_info.value.status_code == 401
+
+
+class TestJWTValidation:
+    """Offline guards that forged or tampered JWTs are rejected after a PyJWT upgrade."""
+
+    @pytest.fixture
+    def handler(self, auth_module):
+        return auth_module.AuthHandler()
+
+    def test_valid_token_round_trips(self, handler):
+        token = handler.create_token("alice", role="user")
+
+        info = handler.validate_token(token)
+
+        assert info["username"] == "alice"
+        assert info["role"] == "user"
+
+    def test_tampered_signature_is_rejected(self, handler):
+        header, payload, signature = handler.create_token("alice").split(".")
+        flipped = ("A" if signature[0] != "A" else "B") + signature[1:]
+
+        _assert_rejected(handler, ".".join([header, payload, flipped]))
+
+    def test_token_signed_with_other_secret_is_rejected(self, handler):
+        forged = jwt.encode(
+            {"sub": "alice", "role": "user", "exp": 4102444800},
+            "some-other-secret-that-is-32-bytes-long",
+            algorithm="HS256",
+        )
+
+        _assert_rejected(handler, forged)
+
+    def test_unsigned_alg_none_token_is_rejected(self, handler):
+        header = _b64(json.dumps({"alg": "none", "typ": "JWT"}).encode())
+        payload = _b64(
+            json.dumps({"sub": "admin", "role": "user", "exp": 4102444800}).encode()
+        )
+
+        _assert_rejected(handler, f"{header}.{payload}.")
+
+    def test_swapped_payload_with_old_signature_is_rejected(self, handler):
+        header, _, signature = handler.create_token("alice").split(".")
+        forged_payload = _b64(
+            json.dumps({"sub": "admin", "role": "user", "exp": 4102444800}).encode()
+        )
+
+        _assert_rejected(handler, ".".join([header, forged_payload, signature]))
+
+
+# --------------------------------------------------------------------------- #
+# Shared pre-auth helpers: path_is_whitelisted, get_route_path, credentials_accepted
+# --------------------------------------------------------------------------- #
+
+
+def _scope(path: str, root_path: str = "") -> dict:
+    """A minimal ASGI scope. ``path`` is in canonical form: it includes
+    ``root_path``, the way FastAPI hands it to the route dependency."""
+    return {"type": "http", "path": path, "root_path": root_path}
+
+
+class TestSharedCredentialCheck:
+    """The shared pre-auth helpers used by admission middleware and /health."""
+
+    @pytest.fixture
+    def utils_api(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", [sys.argv[0]])
+        return importlib.import_module("lightrag.api.utils_api")
+
+    @pytest.fixture
+    def patterns(self, monkeypatch, utils_api):
+        def _set(entries):
+            compiled = []
+            for entry in entries:
+                if entry.endswith("/*"):
+                    compiled.append((entry[:-2], True))
+                else:
+                    compiled.append((entry, False))
+            monkeypatch.setattr(utils_api, "whitelist_patterns", compiled)
+
+        return _set
+
+    def test_exact_and_prefix_whitelist_entries(self, utils_api, patterns):
+        patterns(["/health", "/api/*"])
+
+        assert utils_api.path_is_whitelisted(_scope("/health")) is True
+        assert utils_api.path_is_whitelisted(_scope("/api/chat")) is True
+        assert utils_api.path_is_whitelisted(_scope("/healthz")) is False
+        assert utils_api.path_is_whitelisted(_scope("/documents/upload")) is False
+
+    def test_catch_all_whitelist_covers_ingestion(self, utils_api, patterns):
+        """An operator who whitelists everything must not get 401s from the
+        middleware on paths the route dependency waves through."""
+        patterns(["/*"])
+
+        assert utils_api.path_is_whitelisted(_scope("/documents/upload")) is True
+
+    def test_entries_are_matched_against_the_route_path(self, utils_api, patterns):
+        """Entries are unprefixed route paths, so the mount prefix must come off
+        before matching — in either forwarding form."""
+        patterns(["/health", "/api/*"])
+
+        # Verbatim forwarding: the proxy passes the prefixed path through.
+        assert (
+            utils_api.path_is_whitelisted(_scope("/api/v1/health", "/api/v1")) is True
+        )
+        assert (
+            utils_api.path_is_whitelisted(_scope("/api/v1/documents", "/api/v1"))
+            is False
+        )
+        assert (
+            utils_api.path_is_whitelisted(_scope("/site01/health", "/site01")) is True
+        )
+        assert (
+            utils_api.path_is_whitelisted(_scope("/site01/api/tags", "/site01")) is True
+        )
+        assert (
+            utils_api.path_is_whitelisted(_scope("/site01/documents", "/site01"))
+            is False
+        )
+
+        # Proxy-strip forwarding: bare path with root_path already set.
+        assert utils_api.path_is_whitelisted(_scope("/health", "/api/v1")) is True
+        assert utils_api.path_is_whitelisted(_scope("/documents", "/api/v1")) is False
+
+    def test_prefix_entries_match_on_segment_boundaries(self, utils_api, patterns):
+        """A ``/*`` entry exempts the prefix and what is under it, nothing else."""
+        patterns(["/graph/*"])
+
+        assert utils_api.path_is_whitelisted(_scope("/graph")) is True
+        assert utils_api.path_is_whitelisted(_scope("/graph/label/list")) is True
+        assert utils_api.path_is_whitelisted(_scope("/graphs")) is False
+
+        patterns(["/api/*"])
+        assert utils_api.path_is_whitelisted(_scope("/api/tags")) is True
+        assert utils_api.path_is_whitelisted(_scope("/apikeys")) is False
+
+    def test_mount_prefix_falls_back_to_the_explicit_argument(
+        self, utils_api, patterns
+    ):
+        """Callers whose scope was not built by FastAPI (hand-rolled ASGI scopes)
+        pass the prefix explicitly."""
+        patterns(["/health"])
+
+        assert (
+            utils_api.path_is_whitelisted(
+                {"type": "http", "path": "/site01/health"}, mount_prefix="/site01"
+            )
+            is True
+        )
+
+    def test_route_path_never_cuts_mid_segment(self, utils_api):
+        """``/api`` is not a segment prefix of ``/apikeys``, so nothing comes off."""
+        assert utils_api.get_route_path(_scope("/apikeys", "/api")) == "/apikeys"
+        assert utils_api.get_route_path(_scope("/api/tags", "/api")) == "/tags"
+        # An exact-prefix hit normalizes to "/" (Starlette returns "" here).
+        assert utils_api.get_route_path(_scope("/site01", "/site01")) == "/"
+        assert utils_api.get_route_path(_scope("/documents")) == "/documents"
+
+    def test_fully_open_mode_accepts_anything(self, monkeypatch, utils_api):
+        monkeypatch.setattr(utils_api, "auth_configured", False)
+
+        assert (
+            utils_api.credentials_accepted(
+                token=None, api_key_header_value=None, api_key=None
+            )
+            is True
+        )
+
+    def test_api_key_mode_requires_the_key(self, monkeypatch, utils_api):
+        monkeypatch.setattr(utils_api, "auth_configured", False)
+
+        assert (
+            utils_api.credentials_accepted(
+                token=None, api_key_header_value=None, api_key="secret"
+            )
+            is False
+        )
+        assert (
+            utils_api.credentials_accepted(
+                token=None, api_key_header_value="wrong", api_key="secret"
+            )
+            is False
+        )
+        assert (
+            utils_api.credentials_accepted(
+                token=None, api_key_header_value="secret", api_key="secret"
+            )
+            is True
+        )
+
+    def test_guest_token_never_substitutes_for_the_api_key(
+        self, monkeypatch, utils_api
+    ):
+        """GHSA-f4vv-55c2-5789: a guest token must not authenticate in
+        API-key-only mode."""
+        monkeypatch.setattr(utils_api, "auth_configured", False)
+        guest = utils_api.auth_handler.create_token(username="guest", role="guest")
+
+        assert (
+            utils_api.credentials_accepted(
+                token=guest, api_key_header_value=None, api_key="secret"
+            )
+            is False
+        )
+
+    def test_password_mode_accepts_a_non_guest_token(self, monkeypatch, utils_api):
+        monkeypatch.setattr(utils_api, "auth_configured", True)
+        user = utils_api.auth_handler.create_token(username="alice", role="user")
+        guest = utils_api.auth_handler.create_token(username="guest", role="guest")
+
+        assert (
+            utils_api.credentials_accepted(
+                token=user, api_key_header_value=None, api_key=None
+            )
+            is True
+        )
+        # A guest token is not a login.
+        assert (
+            utils_api.credentials_accepted(
+                token=guest, api_key_header_value=None, api_key=None
+            )
+            is False
+        )
+
+    def test_garbage_token_is_rejected_not_raised(self, monkeypatch, utils_api):
+        monkeypatch.setattr(utils_api, "auth_configured", True)
+
+        assert (
+            utils_api.credentials_accepted(
+                token="not-a-jwt", api_key_header_value=None, api_key=None
+            )
+            is False
+        )

@@ -23,11 +23,6 @@ pytestmark = [pytest.mark.offline, pytest.mark.asyncio]
 
 @pytest.fixture(autouse=True)
 def _no_retry_wait(monkeypatch):
-    """Strip the exponential backoff so the retrying cases stay fast.
-
-    ``wraps`` stores the ``AsyncRetrying`` instance on ``.retry`` and each call
-    copies it, so patching the attribute here reaches the per-call copy.
-    """
     monkeypatch.setattr(openai_responses_complete_if_cache.retry, "wait", wait_none())
 
 
@@ -46,6 +41,8 @@ class _FakeResponses:
 
 
 class _FakeClient:
+    """Minimal AsyncOpenAI stand-in recording close() and responses.create()."""
+
     def __init__(self, payload: Any):
         self.responses = _FakeResponses(payload)
         self.closed = False
@@ -88,8 +85,6 @@ def _response(
         ),
         usage=usage,
     )
-    # `output_text` is an SDK convenience property; omitting it exercises the
-    # fallback walk over output[].
     if output_text is not None:
         payload.output_text = output_text
     return payload
@@ -113,13 +108,25 @@ def _patch_client(monkeypatch, payload: Any) -> _FakeClient:
     return client
 
 
+async def _non_streaming_failure(monkeypatch, payload, **kwargs) -> BaseException:
+    _patch_client(monkeypatch, payload)
+    with pytest.raises(Exception) as excinfo:
+        await openai_responses_complete_if_cache("gpt-5.6", "hi", **kwargs)
+    return excinfo.value
+
+
+# --------------------------------------------------------------------------- #
+# Request construction & parameter translation
+# --------------------------------------------------------------------------- #
+
+
 async def test_returns_output_text_and_closes_client(monkeypatch):
     client = _patch_client(monkeypatch, _response(output=[_message("hello")]))
 
     result = await openai_responses_complete_if_cache("gpt-5.6", "hi")
 
     assert result == "hello"
-    assert client.closed, "client must be closed on the non-streaming path"
+    assert client.closed
 
 
 async def test_system_prompt_is_sent_as_instructions(monkeypatch):
@@ -129,7 +136,6 @@ async def test_system_prompt_is_sent_as_instructions(monkeypatch):
 
     call = client.responses.calls[0]
     assert call["instructions"] == "be terse"
-    # Responses has no system role; a leaked system message would be a bug.
     assert all(item["role"] != "system" for item in call["input"])
 
 
@@ -147,7 +153,6 @@ async def test_history_assistant_turn_uses_output_text_part(monkeypatch):
 
     api_input = client.responses.calls[0]["input"]
     assert api_input[0]["content"][0]["type"] == "input_text"
-    # The API rejects an assistant turn tagged as input_text.
     assert api_input[1]["content"][0]["type"] == "output_text"
     assert api_input[-1]["content"][0]["type"] == "input_text"
 
@@ -162,82 +167,70 @@ async def test_output_budget_aliases_map_to_max_output_tokens(monkeypatch, alias
 
     call = client.responses.calls[0]
     assert call["max_output_tokens"] == 321
-    # The Chat Completions spellings must not reach the Responses API.
     assert "max_completion_tokens" not in call
     assert "max_tokens" not in call
 
 
-async def test_reasoning_effort_becomes_nested_reasoning(monkeypatch):
+@pytest.mark.parametrize(
+    ("kwargs", "expected_reasoning"),
+    [
+        pytest.param({"reasoning_effort": "low"}, {"effort": "low"}, id="flat-alias"),
+        pytest.param(
+            {"reasoning": {"effort": "high"}, "reasoning_effort": "low"},
+            {"effort": "high"},
+            id="explicit-dict-wins",
+        ),
+    ],
+)
+async def test_reasoning_param_translation(monkeypatch, kwargs, expected_reasoning):
     client = _patch_client(monkeypatch, _response(output=[_message("ok")]))
 
-    await openai_responses_complete_if_cache("gpt-5.6", "hi", reasoning_effort="low")
+    await openai_responses_complete_if_cache("gpt-5.6", "hi", **kwargs)
 
     call = client.responses.calls[0]
-    assert call["reasoning"] == {"effort": "low"}
+    assert call["reasoning"] == expected_reasoning
     assert "reasoning_effort" not in call
 
 
-async def test_explicit_reasoning_dict_wins_over_flat_alias(monkeypatch):
-    client = _patch_client(monkeypatch, _response(output=[_message("ok")]))
-
-    await openai_responses_complete_if_cache(
-        "gpt-5.6", "hi", reasoning={"effort": "high"}, reasoning_effort="low"
-    )
-
-    assert client.responses.calls[0]["reasoning"] == {"effort": "high"}
+_SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}}
 
 
-async def test_response_format_becomes_text_format(monkeypatch):
+@pytest.mark.parametrize(
+    ("response_format", "expected_format"),
+    [
+        pytest.param({"type": "json_object"}, {"type": "json_object"}, id="json-object"),
+        pytest.param(
+            {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": _SCHEMA, "strict": True},
+            },
+            {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": _SCHEMA,
+                "strict": True,
+            },
+            id="nested-json-schema-flattened",
+        ),
+        pytest.param(
+            {"type": "json_schema", "name": "answer", "schema": {"type": "object"}},
+            {"type": "json_schema", "name": "answer", "schema": {"type": "object"}},
+            id="flat-json-schema-untouched",
+        ),
+    ],
+)
+async def test_response_format_translation(
+    monkeypatch, response_format, expected_format
+):
     client = _patch_client(monkeypatch, _response(output=[_message('{"a":1}')]))
 
     await openai_responses_complete_if_cache(
-        "gpt-5.6", "hi", response_format={"type": "json_object"}
+        "gpt-5.6", "hi", response_format=dict(response_format)
     )
 
     call = client.responses.calls[0]
-    assert call["text"] == {"format": {"type": "json_object"}}
+    assert call["text"] == {"format": expected_format}
     assert "response_format" not in call
-
-
-async def test_json_schema_response_format_is_flattened_for_text_format(monkeypatch):
-    """Chat Completions nests the schema under `json_schema`; Responses wants
-    its keys directly on the format object and 400s on the nested form."""
-    client = _patch_client(monkeypatch, _response(output=[_message('{"a":1}')]))
-    schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
-
-    await openai_responses_complete_if_cache(
-        "gpt-5.6",
-        "hi",
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "answer", "schema": schema, "strict": True},
-        },
-    )
-
-    assert client.responses.calls[0]["text"] == {
-        "format": {
-            "type": "json_schema",
-            "name": "answer",
-            "schema": schema,
-            "strict": True,
-        }
-    }
-
-
-async def test_flat_json_schema_response_format_is_forwarded_untouched(monkeypatch):
-    """A caller who already wrote the Responses spelling must not be reshaped."""
-    client = _patch_client(monkeypatch, _response(output=[_message('{"a":1}')]))
-    text_format = {
-        "type": "json_schema",
-        "name": "answer",
-        "schema": {"type": "object"},
-    }
-
-    await openai_responses_complete_if_cache(
-        "gpt-5.6", "hi", response_format=dict(text_format)
-    )
-
-    assert client.responses.calls[0]["text"] == {"format": text_format}
 
 
 async def test_unsupported_chat_completions_params_are_dropped(monkeypatch):
@@ -249,14 +242,15 @@ async def test_unsupported_chat_completions_params_are_dropped(monkeypatch):
 
     call = client.responses.calls[0]
     for dropped in ("frequency_penalty", "presence_penalty", "n"):
-        assert dropped not in call, f"{dropped} would be rejected by the API"
+        assert dropped not in call
+
+
+# --------------------------------------------------------------------------- #
+# Non-streaming response extraction, COT, usage, truncation, and errors
+# --------------------------------------------------------------------------- #
 
 
 async def test_reasoning_only_body_raises_retryable_even_with_cot(monkeypatch):
-    """A response with reasoning and no body text is empty whatever
-    enable_cot says: a <think> trace returned in its place used to skip the
-    retry that the same response gets with enable_cot=False, and the query
-    path then returned (and cached) the trace as the answer."""
     client = _patch_client(
         monkeypatch,
         _response(output=[_reasoning("thinking hard"), _message("")]),
@@ -268,35 +262,29 @@ async def test_reasoning_only_body_raises_retryable_even_with_cot(monkeypatch):
     assert not isinstance(excinfo.value, EmptyTruncatedResponseError)
     assert "reasoning-only output" in str(excinfo.value)
     assert "thinking hard" not in str(excinfo.value)
-    assert len(client.responses.calls) == 3, "a sampling artifact is retried"
+    assert len(client.responses.calls) == 3
 
 
-async def test_cot_is_ignored_when_body_text_present(monkeypatch):
+@pytest.mark.parametrize(
+    ("body", "extra_kwargs"),
+    [
+        pytest.param("answer", {}, id="plain-body"),
+        pytest.param(
+            '{"a": 1}', {"response_format": {"type": "json_object"}}, id="structured"
+        ),
+    ],
+)
+async def test_cot_dropped_when_body_text_present(monkeypatch, body, extra_kwargs):
     _patch_client(
         monkeypatch,
-        _response(output=[_reasoning("trace"), _message("answer")]),
-    )
-
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi", enable_cot=True)
-
-    assert result == "answer", "reasoning is dropped once body text exists"
-
-
-async def test_structured_output_disables_cot(monkeypatch):
-    _patch_client(
-        monkeypatch,
-        _response(output=[_reasoning("trace"), _message('{"a": 1}')]),
+        _response(output=[_reasoning("trace"), _message(body)]),
     )
 
     result = await openai_responses_complete_if_cache(
-        "gpt-5.6",
-        "hi",
-        enable_cot=True,
-        response_format={"type": "json_object"},
+        "gpt-5.6", "hi", enable_cot=True, **extra_kwargs
     )
 
-    # <think> tags would corrupt JSON the caller is about to parse.
-    assert result == '{"a": 1}'
+    assert result == body
 
 
 async def test_token_tracker_maps_responses_usage_keys(monkeypatch):
@@ -327,39 +315,14 @@ async def test_truncated_output_is_wrapped_for_the_cache_layer(monkeypatch):
     result = await openai_responses_complete_if_cache("gpt-5.6", "hi")
 
     assert isinstance(result, TruncatedResponse)
-    assert is_truncated_response(result), "cache layer must skip persisting this"
+    assert is_truncated_response(result)
     assert str(result) == '{"partial": '
 
 
-async def test_empty_truncated_output_raises_non_retryable(monkeypatch):
-    _patch_client(
-        monkeypatch,
-        _response(
-            output=[],
-            status="incomplete",
-            incomplete_reason="max_output_tokens",
-            usage=_usage(10, 500, reasoning_tokens=500),
-        ),
-    )
-
-    # Budget exhaustion is deterministic, so it must not buy two more retries.
-    with pytest.raises(EmptyTruncatedResponseError) as excinfo:
-        await openai_responses_complete_if_cache("gpt-5.6", "hi")
-
-    assert "max_output_tokens" in str(excinfo.value)
-
-
-async def test_empty_output_without_truncation_raises_retryable(monkeypatch):
-    _patch_client(monkeypatch, _response(output=[_message("")]))
-
-    with pytest.raises((InvalidResponseError, Exception)) as excinfo:
-        await openai_responses_complete_if_cache("gpt-5.6", "hi")
-
-    assert not isinstance(excinfo.value, EmptyTruncatedResponseError)
-
-
-async def test_usage_is_counted_even_when_output_is_unusable(monkeypatch):
-    _patch_client(
+async def test_empty_truncated_output_raises_non_retryable_and_counts_usage(
+    monkeypatch,
+):
+    client = _patch_client(
         monkeypatch,
         _response(
             output=[],
@@ -371,13 +334,23 @@ async def test_usage_is_counted_even_when_output_is_unusable(monkeypatch):
     recorded: list[dict[str, int]] = []
     tracker = SimpleNamespace(add_usage=recorded.append)
 
-    with pytest.raises(EmptyTruncatedResponseError):
+    with pytest.raises(EmptyTruncatedResponseError) as excinfo:
         await openai_responses_complete_if_cache("gpt-5.6", "hi", token_tracker=tracker)
 
-    # The request burned its budget whether or not the output was usable.
+    assert "max_output_tokens" in str(excinfo.value)
+    assert len(client.responses.calls) == 1
     assert recorded == [
         {"prompt_tokens": 9, "completion_tokens": 400, "total_tokens": 409}
     ]
+
+
+async def test_empty_output_without_truncation_raises_retryable(monkeypatch):
+    _patch_client(monkeypatch, _response(output=[_message("")]))
+
+    with pytest.raises(InvalidResponseError) as excinfo:
+        await openai_responses_complete_if_cache("gpt-5.6", "hi")
+
+    assert not isinstance(excinfo.value, EmptyTruncatedResponseError)
 
 
 async def test_output_text_property_is_preferred(monkeypatch):
@@ -391,12 +364,63 @@ async def test_output_text_property_is_preferred(monkeypatch):
     )
 
 
-# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param([], id="empty-output"),
+        pytest.param([_message("partial")], id="partial-output-not-masked"),
+    ],
+)
+async def test_non_streaming_failed_status_raises_and_counts_usage(monkeypatch, output):
+    payload = _response(output=output, status="failed", usage=_usage(5, 2))
+    payload.error = SimpleNamespace(code="server_error", message="upstream exploded")
+    recorded: list[dict[str, int]] = []
+    tracker = SimpleNamespace(add_usage=recorded.append)
+
+    error = await _non_streaming_failure(monkeypatch, payload, token_tracker=tracker)
+
+    assert isinstance(error, InvalidResponseError)
+    assert "server_error" in str(error)
+    assert "upstream exploded" in str(error)
+    assert recorded
+    assert all(
+        counts == {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+        for counts in recorded
+    )
+
+
+async def test_refusal_content_part_raises_rather_than_reporting_empty_output(
+    monkeypatch,
+):
+    payload = _response(output=[_refusal("I will not answer that")])
+
+    error = await _non_streaming_failure(monkeypatch, payload)
+
+    assert isinstance(error, ResponseRefusedError)
+    assert "I will not answer that" in str(error)
+
+
+async def test_non_budget_incomplete_status_raises(monkeypatch):
+    payload = _response(
+        output=[_message("partial")],
+        status="incomplete",
+        incomplete_reason="content_filter",
+    )
+
+    error = await _non_streaming_failure(monkeypatch, payload)
+
+    assert isinstance(error, InvalidResponseError)
+    assert "content_filter" in str(error)
+
+
+# --------------------------------------------------------------------------- #
 # Streaming
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 
 
 class _FakeStream:
+    """Async iterable yielding stub Responses API stream events."""
+
     def __init__(self, events: list[Any]):
         self._events = events
         self.aclosed = False
@@ -416,11 +440,21 @@ def _delta(event_type: str, delta: str) -> SimpleNamespace:
     return SimpleNamespace(type=event_type, delta=delta)
 
 
-def _completed() -> SimpleNamespace:
-    """A clean terminal; a stream without one is treated as cut off."""
+def _completed(usage: Any = None) -> SimpleNamespace:
     return SimpleNamespace(
         type="response.completed",
-        response=SimpleNamespace(status="completed", usage=None),
+        response=SimpleNamespace(status="completed", usage=usage),
+    )
+
+
+def _incomplete(reason: str, usage: Any = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        type="response.incomplete",
+        response=SimpleNamespace(
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason=reason),
+            usage=usage,
+        ),
     )
 
 
@@ -445,92 +479,74 @@ async def test_streaming_yields_output_text_deltas(monkeypatch):
     assert client.closed
 
 
-async def test_streaming_wraps_reasoning_in_think_tags(monkeypatch):
-    stream = _FakeStream(
-        [
-            _delta("response.reasoning_summary_text.delta", "step one"),
-            _delta("response.output_text.delta", "answer"),
-            _completed(),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
+@pytest.mark.parametrize(
+    ("events", "enable_cot", "expected"),
+    [
+        pytest.param(
+            [
+                _delta("response.reasoning_summary_text.delta", "step one"),
+                _delta("response.output_text.delta", "answer"),
+                _completed(),
+            ],
+            True,
+            "<think>step one</think>answer",
+            id="reasoning-then-body",
+        ),
+        pytest.param(
+            [
+                _delta("response.reasoning_summary_text.delta", "only thinking"),
+                _completed(_usage(3, 4)),
+            ],
+            True,
+            "<think>only thinking</think>",
+            id="reasoning-only-closes-tag",
+        ),
+        pytest.param(
+            [
+                _delta("response.reasoning_summary_text.delta", "trace"),
+                _delta("response.output_text.delta", "answer"),
+                _completed(),
+            ],
+            False,
+            "answer",
+            id="cot-disabled-drops-reasoning",
+        ),
+    ],
+)
+async def test_streaming_cot_wrapping_and_filtering(
+    monkeypatch, events, enable_cot, expected
+):
+    _patch_client(monkeypatch, _FakeStream(events))
 
     result = await openai_responses_complete_if_cache(
-        "gpt-5.6", "hi", stream=True, enable_cot=True
+        "gpt-5.6", "hi", stream=True, enable_cot=enable_cot
     )
 
-    # The reasoning block must be closed as soon as body text starts.
-    assert await _collect(result) == "<think>step one</think>answer"
+    assert await _collect(result) == expected
 
 
-async def test_streaming_closes_think_tag_when_no_body_text_follows(monkeypatch):
-    stream = _FakeStream(
-        [
-            _delta("response.reasoning_summary_text.delta", "only thinking"),
-            _completed(),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-
-    result = await openai_responses_complete_if_cache(
-        "gpt-5.6", "hi", stream=True, enable_cot=True
-    )
-
-    assert await _collect(result) == "<think>only thinking</think>"
-
-
-async def test_streaming_drops_reasoning_when_cot_disabled(monkeypatch):
-    stream = _FakeStream(
-        [
-            _delta("response.reasoning_summary_text.delta", "trace"),
-            _delta("response.output_text.delta", "answer"),
-            _completed(),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
-
-    assert await _collect(result) == "answer"
-
-
-async def test_streaming_records_usage_from_completed_event(monkeypatch):
-    stream = _FakeStream(
-        [
-            _delta("response.output_text.delta", "ok"),
-            SimpleNamespace(
-                type="response.completed",
-                response=SimpleNamespace(usage=_usage(3, 4)),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-    recorded: list[dict[str, int]] = []
-    tracker = SimpleNamespace(add_usage=recorded.append)
-
-    result = await openai_responses_complete_if_cache(
-        "gpt-5.6", "hi", stream=True, token_tracker=tracker
-    )
-    await _collect(result)
-
-    assert recorded == [{"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}]
-
-
-async def test_streaming_records_usage_from_incomplete_event(monkeypatch):
-    stream = _FakeStream(
-        [
-            _delta("response.output_text.delta", "partial"),
-            SimpleNamespace(
-                type="response.incomplete",
-                response=SimpleNamespace(
-                    status="incomplete",
-                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
-                    usage=_usage(3, 4),
-                ),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
+@pytest.mark.parametrize(
+    ("events", "expected_text"),
+    [
+        pytest.param(
+            [_delta("response.output_text.delta", "ok"), _completed(_usage(3, 4))],
+            "ok",
+            id="completed-event",
+        ),
+        pytest.param(
+            [
+                _delta("response.output_text.delta", "partial"),
+                _incomplete("max_output_tokens", _usage(3, 4)),
+            ],
+            "partial",
+            id="incomplete-budget-event",
+        ),
+    ],
+)
+async def test_streaming_records_usage_from_terminal_event(
+    monkeypatch, events, expected_text
+):
+    _patch_client(monkeypatch, _FakeStream(events))
     recorded: list[dict[str, int]] = []
     tracker = SimpleNamespace(add_usage=recorded.append)
 
@@ -538,24 +554,17 @@ async def test_streaming_records_usage_from_incomplete_event(monkeypatch):
         "gpt-5.6", "hi", stream=True, token_tracker=tracker
     )
 
-    assert await _collect(result) == "partial", "partial output is kept"
+    assert await _collect(result) == expected_text
     assert recorded == [{"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}]
 
 
 async def test_streaming_empty_truncation_raises_non_retryable(monkeypatch):
-    stream = _FakeStream(
-        [
-            SimpleNamespace(
-                type="response.incomplete",
-                response=SimpleNamespace(
-                    status="incomplete",
-                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
-                    usage=_usage(3, 120, reasoning_tokens=120),
-                ),
-            ),
-        ]
+    _patch_client(
+        monkeypatch,
+        _FakeStream(
+            [_incomplete("max_output_tokens", _usage(3, 120, reasoning_tokens=120))]
+        ),
     )
-    _patch_client(monkeypatch, stream)
 
     result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
 
@@ -563,61 +572,25 @@ async def test_streaming_empty_truncation_raises_non_retryable(monkeypatch):
         await _collect(result)
 
 
-def _incomplete(reason: str, usage: Any = None) -> SimpleNamespace:
-    return SimpleNamespace(
-        type="response.incomplete",
-        response=SimpleNamespace(
-            status="incomplete",
-            incomplete_details=SimpleNamespace(reason=reason),
-            usage=usage,
+@pytest.mark.parametrize(
+    ("prefix_events", "expected_partial"),
+    [
+        pytest.param([], "", id="no-text"),
+        pytest.param(
+            [_delta("response.output_text.delta", "par")],
+            "par",
+            id="partial-text-not-masked",
         ),
-    )
-
-
-async def test_streaming_non_budget_incomplete_terminal_raises(monkeypatch):
-    """`response.incomplete` also covers stops that are not token-limit
-    truncation. Without a branch of its own, a content-filtered stream with no
-    text ends successfully and empty."""
-    _patch_client(
-        monkeypatch, _FakeStream([_incomplete("content_filter", _usage(3, 0))])
-    )
-
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
-
-    with pytest.raises(InvalidResponseError) as excinfo:
-        await _collect(result)
-    assert "content_filter" in str(excinfo.value)
-
-
-async def test_streaming_non_budget_incomplete_is_not_masked_by_partial_text(
-    monkeypatch,
+    ],
+)
+async def test_streaming_non_budget_incomplete_raises_and_counts_usage(
+    monkeypatch, prefix_events, expected_partial
 ):
-    """Text yielded before a stopped terminal is the tail of a generation that
-    did not finish, so it must not be presented as a complete answer."""
-    stream = _FakeStream(
-        [
-            _delta("response.output_text.delta", "par"),
-            _incomplete("content_filter"),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
-
-    chunks: list[str] = []
-    with pytest.raises(InvalidResponseError):
-        async for chunk in result:
-            chunks.append(chunk)
-    assert "".join(chunks) == "par"
-
-
-async def test_streaming_non_budget_incomplete_still_counts_usage(monkeypatch):
-    """A stopped generation spent its budget like any other attempt."""
     _patch_client(
-        monkeypatch, _FakeStream([_incomplete("content_filter", _usage(4, 1))])
+        monkeypatch,
+        _FakeStream([*prefix_events, _incomplete("content_filter", _usage(4, 1))]),
     )
     recorded: list[dict[str, int]] = []
-
     result = await openai_responses_complete_if_cache(
         "gpt-5.6",
         "hi",
@@ -625,129 +598,21 @@ async def test_streaming_non_budget_incomplete_still_counts_usage(monkeypatch):
         token_tracker=SimpleNamespace(add_usage=recorded.append),
     )
 
-    with pytest.raises(InvalidResponseError):
-        await _collect(result)
-    # The attempt spent its budget whether or not the output was usable.
+    chunks: list[str] = []
+    with pytest.raises(InvalidResponseError) as excinfo:
+        async for chunk in result:
+            chunks.append(chunk)
+
+    assert "content_filter" in str(excinfo.value)
+    assert "".join(chunks) == expected_partial
     assert recorded == [{"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5}]
 
 
-async def test_streaming_refusal_deltas_raise_with_the_refusal_text(monkeypatch):
-    """A refusal streams on its own event type and can still end with
-    `response.completed`, so an unhandled one ends the iterator empty."""
-    stream = _FakeStream(
-        [
-            _delta("response.refusal.delta", "I cannot "),
-            _delta("response.refusal.delta", "help with that"),
-            SimpleNamespace(
-                type="response.completed",
-                response=SimpleNamespace(status="completed", usage=_usage(6, 4)),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
-
-    with pytest.raises(ResponseRefusedError) as excinfo:
-        await _collect(result)
-    assert "I cannot help with that" in str(excinfo.value)
-
-
-async def test_streaming_refusal_done_event_is_used_when_no_deltas_arrived(
-    monkeypatch,
-):
-    """`response.refusal.done` carries the whole refusal, so it is the fallback
-    rather than an addition - using both would duplicate the text."""
-    stream = _FakeStream(
-        [
-            SimpleNamespace(type="response.refusal.done", refusal="policy: no"),
-            SimpleNamespace(
-                type="response.completed",
-                response=SimpleNamespace(status="completed", usage=None),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
-
-    with pytest.raises(ResponseRefusedError) as excinfo:
-        await _collect(result)
-    assert str(excinfo.value).count("policy: no") == 1
-
-
-async def test_streaming_empty_refusal_delta_does_not_disarm_the_done_fallback(
-    monkeypatch,
-):
-    """An empty delta is still a refusal, but it is not the refusal *text*.
-    Letting it stand in for the text would suppress the raise and skip the
-    `.done` event that carries the actual reason."""
-    stream = _FakeStream(
-        [
-            _delta("response.refusal.delta", ""),
-            SimpleNamespace(type="response.refusal.done", refusal="policy: no"),
-            SimpleNamespace(
-                type="response.completed",
-                response=SimpleNamespace(status="completed", usage=None),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
-
-    with pytest.raises(ResponseRefusedError) as excinfo:
-        await _collect(result)
-    assert "policy: no" in str(excinfo.value)
-
-
-async def test_streaming_textless_refusal_still_raises(monkeypatch):
-    """A refusal event with no text anywhere is still a refusal; ending the
-    iterator on it would report the refused turn as an empty answer."""
-    stream = _FakeStream(
-        [
-            _delta("response.refusal.delta", ""),
-            SimpleNamespace(
-                type="response.completed",
-                response=SimpleNamespace(status="completed", usage=None),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
-
-    with pytest.raises(ResponseRefusedError):
-        await _collect(result)
-
-
-async def test_streaming_refusal_falls_back_to_the_terminal_content_parts(monkeypatch):
-    """Sibling of the `_extract_text` fallback: a server that populates the
-    terminal payload without emitting the refusal events must not end the
-    iterator empty and successful."""
-    stream = _FakeStream(
-        [
-            SimpleNamespace(
-                type="response.completed",
-                response=_response(output=[_refusal("I will not answer that")]),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
-
-    with pytest.raises(ResponseRefusedError) as excinfo:
-        await _collect(result)
-    assert "I will not answer that" in str(excinfo.value)
-
-
 async def test_streaming_unreadable_incomplete_terminal_raises(monkeypatch):
-    """A terminal this driver cannot read reports "unknown" and takes the
-    stopped-generation path: incomplete is not complete, and guessing which
-    reason it was would be worse."""
-    stream = _FakeStream([SimpleNamespace(type="response.incomplete", response=None)])
-    _patch_client(monkeypatch, stream)
+    _patch_client(
+        monkeypatch,
+        _FakeStream([SimpleNamespace(type="response.incomplete", response=None)]),
+    )
 
     result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
 
@@ -756,43 +621,84 @@ async def test_streaming_unreadable_incomplete_terminal_raises(monkeypatch):
     assert "unknown" in str(excinfo.value)
 
 
-async def test_streaming_refusal_done_does_not_duplicate_the_deltas(monkeypatch):
-    stream = _FakeStream(
-        [
-            _delta("response.refusal.delta", "no can do"),
-            SimpleNamespace(type="response.refusal.done", refusal="no can do"),
-            SimpleNamespace(
-                type="response.completed",
-                response=SimpleNamespace(status="completed", usage=None),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
+@pytest.mark.parametrize(
+    ("events", "expected_text"),
+    [
+        pytest.param(
+            [
+                _delta("response.refusal.delta", "I cannot "),
+                _delta("response.refusal.delta", "help with that"),
+                _completed(_usage(6, 4)),
+            ],
+            "I cannot help with that",
+            id="refusal-deltas",
+        ),
+        pytest.param(
+            [
+                SimpleNamespace(type="response.refusal.done", refusal="policy: no"),
+                _completed(),
+            ],
+            "policy: no",
+            id="refusal-done-without-deltas",
+        ),
+        pytest.param(
+            [
+                _delta("response.refusal.delta", ""),
+                SimpleNamespace(type="response.refusal.done", refusal="policy: no"),
+                _completed(),
+            ],
+            "policy: no",
+            id="empty-delta-keeps-done-fallback",
+        ),
+        pytest.param(
+            [_delta("response.refusal.delta", ""), _completed()],
+            None,
+            id="textless-refusal",
+        ),
+        pytest.param(
+            [
+                SimpleNamespace(
+                    type="response.completed",
+                    response=_response(output=[_refusal("I will not answer that")]),
+                )
+            ],
+            "I will not answer that",
+            id="terminal-content-part-fallback",
+        ),
+        pytest.param(
+            [
+                _delta("response.refusal.delta", "no can do"),
+                SimpleNamespace(type="response.refusal.done", refusal="no can do"),
+                _completed(),
+            ],
+            "no can do",
+            id="done-does-not-duplicate-deltas",
+        ),
+    ],
+)
+async def test_streaming_refusal_raises_response_refused_error(
+    monkeypatch, events, expected_text
+):
+    _patch_client(monkeypatch, _FakeStream(events))
 
     result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
 
     with pytest.raises(ResponseRefusedError) as excinfo:
         await _collect(result)
-    assert str(excinfo.value).count("no can do") == 1
+    if expected_text is not None:
+        assert str(excinfo.value).count(expected_text) == 1
 
 
 async def test_streaming_reasoning_only_truncation_is_not_treated_as_empty(monkeypatch):
-    """Reasoning text already reached the consumer inside <think>, so the
-    stream ends normally rather than raising."""
-    stream = _FakeStream(
-        [
-            _delta("response.reasoning_summary_text.delta", "thinking"),
-            SimpleNamespace(
-                type="response.incomplete",
-                response=SimpleNamespace(
-                    status="incomplete",
-                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
-                    usage=_usage(3, 9, reasoning_tokens=9),
-                ),
-            ),
-        ]
+    _patch_client(
+        monkeypatch,
+        _FakeStream(
+            [
+                _delta("response.reasoning_summary_text.delta", "thinking"),
+                _incomplete("max_output_tokens", _usage(3, 9, reasoning_tokens=9)),
+            ]
+        ),
     )
-    _patch_client(monkeypatch, stream)
 
     result = await openai_responses_complete_if_cache(
         "gpt-5.6", "hi", stream=True, enable_cot=True
@@ -801,237 +707,78 @@ async def test_streaming_reasoning_only_truncation_is_not_treated_as_empty(monke
     assert await _collect(result) == "<think>thinking</think>"
 
 
-async def test_streaming_failed_terminal_raises_with_the_provider_reason(monkeypatch):
-    """`response.failed` is neither a completed/incomplete terminal nor the
-    separate `error` event, so an unhandled one would end the iterator
-    successfully on the partial text it had already yielded."""
-    stream = _FakeStream(
-        [
-            _delta("response.output_text.delta", "partial"),
-            SimpleNamespace(
-                type="response.failed",
-                response=SimpleNamespace(
-                    status="failed",
-                    error=SimpleNamespace(
-                        code="server_error", message="upstream exploded"
+async def test_streaming_failed_terminal_raises_and_counts_usage(monkeypatch):
+    _patch_client(
+        monkeypatch,
+        _FakeStream(
+            [
+                _delta("response.output_text.delta", "partial"),
+                SimpleNamespace(
+                    type="response.failed",
+                    response=SimpleNamespace(
+                        status="failed",
+                        error=SimpleNamespace(
+                            code="server_error", message="upstream exploded"
+                        ),
+                        usage=_usage(3, 4),
                     ),
-                    usage=_usage(3, 4),
                 ),
-            ),
-        ]
+            ]
+        ),
     )
-    _patch_client(monkeypatch, stream)
+    recorded: list[dict[str, int]] = []
+    result = await openai_responses_complete_if_cache(
+        "gpt-5.6",
+        "hi",
+        stream=True,
+        token_tracker=SimpleNamespace(add_usage=recorded.append),
+    )
 
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
-
+    chunks: list[str] = []
     with pytest.raises(InvalidResponseError) as excinfo:
-        await _collect(result)
+        async for chunk in result:
+            chunks.append(chunk)
+
+    assert "".join(chunks) == "partial"
     assert "server_error" in str(excinfo.value)
     assert "upstream exploded" in str(excinfo.value)
-
-
-async def test_streaming_failed_terminal_still_counts_usage(monkeypatch):
-    """The attempt was billed whether or not it produced a usable answer,
-    matching how the truncated terminal accounts before raising."""
-    stream = _FakeStream(
-        [
-            SimpleNamespace(
-                type="response.failed",
-                response=SimpleNamespace(
-                    status="failed",
-                    error=SimpleNamespace(code="server_error", message="boom"),
-                    usage=_usage(3, 4),
-                ),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-    recorded: list[dict[str, int]] = []
-    tracker = SimpleNamespace(add_usage=recorded.append)
-
-    result = await openai_responses_complete_if_cache(
-        "gpt-5.6", "hi", stream=True, token_tracker=tracker
-    )
-
-    with pytest.raises(InvalidResponseError):
-        await _collect(result)
     assert recorded == [{"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}]
 
 
 async def test_streaming_failed_terminal_closes_an_open_think_tag(monkeypatch):
-    """Reasoning already opened `<think>`; the error path must still close it
-    so the consumer is not left holding an unterminated tag."""
-    chunks: list[str] = []
-    stream = _FakeStream(
-        [
-            _delta("response.reasoning_summary_text.delta", "thinking"),
-            SimpleNamespace(
-                type="response.failed",
-                response=SimpleNamespace(
-                    status="failed",
-                    error=SimpleNamespace(code="server_error", message="boom"),
-                    usage=None,
+    _patch_client(
+        monkeypatch,
+        _FakeStream(
+            [
+                _delta("response.reasoning_summary_text.delta", "thinking"),
+                SimpleNamespace(
+                    type="response.failed",
+                    response=SimpleNamespace(
+                        status="failed",
+                        error=SimpleNamespace(code="server_error", message="boom"),
+                        usage=None,
+                    ),
                 ),
-            ),
-        ]
+            ]
+        ),
     )
-    _patch_client(monkeypatch, stream)
 
     result = await openai_responses_complete_if_cache(
         "gpt-5.6", "hi", stream=True, enable_cot=True
     )
 
+    chunks: list[str] = []
     with pytest.raises(InvalidResponseError):
         async for chunk in result:
             chunks.append(chunk)
     assert "".join(chunks) == "<think>thinking</think>"
 
 
-async def _non_streaming_failure(monkeypatch, payload, **kwargs) -> BaseException:
-    """Return the exception a non-streaming call ends on.
-
-    The decorator re-raises the last attempt's own exception (``reraise=True``),
-    so the driver's error type reaches the caller directly, not wrapped in a
-    ``tenacity.RetryError``.
-    """
-    _patch_client(monkeypatch, payload)
-
-    with pytest.raises(Exception) as excinfo:
-        await openai_responses_complete_if_cache("gpt-5.6", "hi", **kwargs)
-    return excinfo.value
-
-
-async def test_failed_status_raises_rather_than_reporting_empty_output(monkeypatch):
-    """The non-streaming sibling of `response.failed`: a request accepted at
-    the transport layer that failed during generation comes back as a payload
-    with status "failed", not as an exception from responses.create()."""
-    payload = _response(status="failed")
-    payload.error = SimpleNamespace(code="server_error", message="upstream exploded")
-
-    error = await _non_streaming_failure(monkeypatch, payload)
-
-    assert isinstance(error, InvalidResponseError)
-    assert "server_error" in str(error)
-    assert "upstream exploded" in str(error)
-
-
-async def test_failed_status_is_not_masked_by_partial_output(monkeypatch):
-    """Content on a failed payload is the tail of a generation that did not
-    finish, so returning it would present a failure as a short answer."""
-    payload = _response(output=[_message("partial")], status="failed")
-    payload.error = SimpleNamespace(code="server_error", message="boom")
-
-    error = await _non_streaming_failure(monkeypatch, payload)
-
-    assert isinstance(error, InvalidResponseError)
-
-
-async def test_failed_status_counts_usage_before_raising(monkeypatch):
-    payload = _response(status="failed", usage=_usage(5, 2))
-    payload.error = SimpleNamespace(code="server_error", message="boom")
-    recorded: list[dict[str, int]] = []
-    tracker = SimpleNamespace(add_usage=recorded.append)
-
-    await _non_streaming_failure(monkeypatch, payload, token_tracker=tracker)
-
-    # One entry per attempt: each retry is a separately billed request.
-    assert recorded
-    assert all(
-        counts == {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
-        for counts in recorded
-    )
-
-
-async def test_refusal_content_part_raises_rather_than_reporting_empty_output(
-    monkeypatch,
-):
-    """The non-streaming sibling of the refusal events: a refused turn carries
-    `refusal` content parts, which the body walk skips, so the payload would
-    otherwise be diagnosed as "model produced no output"."""
-    payload = _response(output=[_refusal("I will not answer that")])
-
-    error = await _non_streaming_failure(monkeypatch, payload)
-
-    assert isinstance(error, ResponseRefusedError)
-    assert "I will not answer that" in str(error)
-
-
-async def test_non_budget_incomplete_status_raises(monkeypatch):
-    """The non-streaming sibling of the stopped terminal: content on a payload
-    stopped by a content filter is the tail of a generation that did not
-    finish, so returning it would present it as a complete answer."""
-    payload = _response(
-        output=[_message("partial")],
-        status="incomplete",
-        incomplete_reason="content_filter",
-    )
-
-    error = await _non_streaming_failure(monkeypatch, payload)
-
-    assert isinstance(error, InvalidResponseError)
-    assert "content_filter" in str(error)
-
-
-async def test_budget_truncation_still_returns_its_partial_content(monkeypatch):
-    """The one incomplete reason that keeps its output: the model chose where
-    to stop within a limit the caller set."""
-    _patch_client(
-        monkeypatch,
-        _response(
-            output=[_message("partial")],
-            status="incomplete",
-            incomplete_reason="max_output_tokens",
-        ),
-    )
-
-    result = await openai_responses_complete_if_cache("gpt-5.6", "hi")
-
-    assert result == "partial"
-    assert is_truncated_response(result)
-
-
-async def test_streaming_completed_with_no_text_raises_like_non_streaming(
-    monkeypatch,
-):
-    """A clean `response.completed` with no output_text delta and no
-    reasoning delta at all (a forwarded `tools` request that only produced a
-    function call, or a compatible gateway supplying an empty terminal) must
-    not end the iterator successfully on nothing -- `_handle_non_streaming`
-    already raises InvalidResponseError for the equivalent empty,
-    non-truncated payload (see test_empty_output_without_truncation_raises_retryable)."""
-    stream = _FakeStream(
-        [
-            SimpleNamespace(
-                type="response.completed",
-                response=SimpleNamespace(usage=_usage(3, 0)),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
+async def test_streaming_completed_with_no_text_raises_like_non_streaming(monkeypatch):
+    _patch_client(monkeypatch, _FakeStream([_completed(_usage(3, 0))]))
 
     result = await openai_responses_complete_if_cache("gpt-5.6", "hi", stream=True)
     with pytest.raises(InvalidResponseError) as excinfo:
         await _collect(result)
 
     assert not isinstance(excinfo.value, EmptyTruncatedResponseError)
-
-
-async def test_streaming_completed_with_reasoning_only_does_not_raise(monkeypatch):
-    """The empty-output check must key on body OR reasoning text, not body
-    text alone -- a reasoning-only completed turn is still usable output."""
-    stream = _FakeStream(
-        [
-            _delta("response.reasoning_summary_text.delta", "trace"),
-            SimpleNamespace(
-                type="response.completed",
-                response=SimpleNamespace(usage=_usage(3, 4)),
-            ),
-        ]
-    )
-    _patch_client(monkeypatch, stream)
-
-    result = await openai_responses_complete_if_cache(
-        "gpt-5.6", "hi", stream=True, enable_cot=True
-    )
-
-    assert await _collect(result) == "<think>trace</think>"

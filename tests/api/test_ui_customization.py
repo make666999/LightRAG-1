@@ -25,6 +25,7 @@ from lightrag.api.ui_customization import (
     UICustomizationSnapshot,
     UILocaleContent,
     WEBUI_CHROME_LOCALES,
+    _sniff_logo_mime,
     chrome_language_for,
     load_ui_customization_snapshot,
     locale_direction,
@@ -56,23 +57,27 @@ PNG_BYTES = (
 SVG_BYTES = b'<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>'
 
 
+def _set_clean_env(mp):
+    for var in _ENV_VARS_TO_ISOLATE:
+        mp.delenv(var, raising=False)
+    mp.setenv("AUTH_ACCOUNTS", "")
+    mp.setenv("LIGHTRAG_API_KEY", "")
+    mp.setenv("TOKEN_SECRET", "")
+    mp.setenv("LLM_BINDING", "openai")
+    mp.setenv("EMBEDDING_BINDING", "openai")
+
+
 @pytest.fixture(autouse=True)
 def _isolate_env(monkeypatch):
-    for var in _ENV_VARS_TO_ISOLATE:
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("AUTH_ACCOUNTS", "")
-    monkeypatch.setenv("LIGHTRAG_API_KEY", "")
-    monkeypatch.setenv("TOKEN_SECRET", "")
-    monkeypatch.setenv("LLM_BINDING", "openai")
-    monkeypatch.setenv("EMBEDDING_BINDING", "openai")
+    _set_clean_env(monkeypatch)
 
     import lightrag.api.config as config
 
+    saved = (config._global_args, config._initialized)
     config._global_args = None
     config._initialized = False
     yield
-    config._global_args = None
-    config._initialized = False
+    config._global_args, config._initialized = saved
 
 
 def make_bundle(root, manifest=None, *, extra_files=None):
@@ -94,10 +99,7 @@ def make_bundle(root, manifest=None, *, extra_files=None):
             "default_locale": "en",
             # The fallback target must NOT be default_locale. Pointing "ko"
             # at "en" makes the manifest-fallback path and the default-locale
-            # path land on the same answer, and every assertion about the
-            # former is then satisfied by the latter — short-circuiting the
-            # fallback lookup entirely would keep this suite green. See
-            # TestCustomizationEndpointWithBundle.test_fallback_chain_then_default.
+            # path land on the same answer.
             "fallbacks": {"ko": ["zh"]},
             "brand": {"logo": "assets/logo.svg"},
             "locales": {
@@ -132,13 +134,7 @@ def add_login_consent(
     agreements="# 协议",
     consent_documents=None,
 ):
-    """Declare the login-page blurb and/or the merged agreement document.
-
-    `None` for either leaves the field UNDECLARED (the manifest key is not
-    written at all), which is how the half-configured cases are staged.
-    `consent_documents` is an INLINE string (the checkbox's link label), not
-    a path, and is likewise only written when given.
-    """
+    """Declare the login-page blurb and/or the merged agreement document."""
     manifest = json.loads((bundle / "manifest.json").read_text("utf-8"))
     for field_name, text in (("login", login), ("agreements", agreements)):
         if text is None:
@@ -182,6 +178,8 @@ class TestBundleValidation:
         assert snapshot.locales["en"].welcome == "# Welcome EN"
         assert snapshot.locales["en"].logo_asset_id == "brand-logo"
         assert len(snapshot.assets) == 1
+        logo = next(iter(snapshot.assets.values()))
+        assert logo.mime == "image/svg+xml"
         assert snapshot.bundle_revision
 
     def test_explicit_null_logo_accepted(self, tmp_path):
@@ -283,9 +281,17 @@ class TestBundleValidation:
         with pytest.raises(UICustomizationError, match="byte limit"):
             load_ui_customization_snapshot(bundle)
 
-    def test_logo_mime_checked_by_content(self, tmp_path):
+    def test_logo_mime_checked_by_content_through_bundle_loader(self, tmp_path):
+        """End-to-end check that bundle loading wires invalid and valid SVGs through the sniffer."""
         bundle = make_bundle(tmp_path)
-        # .svg extension but garbage content: rejected by content sniffing.
+        # Valid SVG with XML prologue loads as image/svg+xml.
+        (bundle / "assets" / "logo.svg").write_bytes(
+            b'<?xml version="1.0"?>' + SVG_BYTES
+        )
+        snapshot = load_ui_customization_snapshot(bundle)
+        assert next(iter(snapshot.assets.values())).mime == "image/svg+xml"
+
+        # Invalid bytes with .svg extension fail startup.
         (bundle / "assets" / "logo.svg").write_bytes(b"GIF89a not allowed")
         with pytest.raises(UICustomizationError, match="not PNG, JPEG, WebP or SVG"):
             load_ui_customization_snapshot(bundle)
@@ -303,51 +309,28 @@ class TestBundleValidation:
                 id="doctype-without-svg-root",
             ),
             pytest.param(b"<!-- just a comment -->", id="comment-only"),
-            # A slash right after the name is only a root when it is the
-            # ``/>`` of an empty element; XML allows nothing between the two.
-            # These are ill-formed and have no root element at all.
             pytest.param(b"<svg/not-an-element>", id="slash-then-name"),
-            # An UNCLOSED start tag. Whatever the file's length, a root that
-            # never closes has to fail startup rather than be served for a
-            # year as an immutable image/svg+xml.
             pytest.param(b"<svg", id="bare-name-no-close"),
             pytest.param(b"<svg ", id="name-and-space-no-close"),
             pytest.param(
                 b'<svg xmlns="http://www.w3.org/2000/svg"', id="attrs-no-close"
             ),
-            # A `>` INSIDE a quoted attribute value is not the tag's own: XML
-            # permits it there, so these tags never close.
             pytest.param(b'<svg title=">', id="gt-inside-double-quotes"),
             pytest.param(b"<svg title='>'", id="gt-inside-single-quotes"),
-            # LENGTH is not evidence. The same unterminated literal padded
-            # past any window is still an unclosed tag: the whole file is in
-            # memory, so it is scanned rather than assumed.
             pytest.param(b'<svg title="' + b"x" * 5000, id="unterminated-quote-padded"),
-            # A raw `<` cannot appear in a start tag, so a tag abandoned
-            # before its `>` must not borrow the NEXT element's.
             pytest.param(b"<svg foo\n<rect>", id="lt-inside-start-tag"),
             pytest.param(b'<svg t="a<b">', id="lt-inside-attribute-value"),
-            # A slash is legal only as the `/>` of an empty element — a rule
-            # that whitespace after the name must not smuggle past.
             pytest.param(b"<svg /x>", id="space-then-slash-then-name"),
-            # The rest of the start-tag production, which a delimiter scan
-            # never checked at all. Each is a fatal XML error, so each is a
-            # file no renderer would draw.
             pytest.param(b"<svg width=100>", id="unquoted-attribute-value"),
             pytest.param(b'<svg a="1"b="2">', id="attributes-without-separator"),
             pytest.param(b"<svg foo>", id="attribute-without-value"),
             pytest.param(b'<svg ="1">', id="value-without-name"),
-            # `AttValue ::= '"' ([^<&"] | Reference)* '"'` — a bare `&` is a
-            # fatal error, so these are files no renderer will draw.
             pytest.param(b'<svg title="&"></svg>', id="bare-ampersand"),
             pytest.param(b'<svg title="&;"/>', id="empty-reference"),
             pytest.param(b'<svg title="&#xzz;"/>', id="malformed-hex-char-ref"),
             pytest.param(b'<svg title="&#12a;"/>', id="malformed-decimal-char-ref"),
             pytest.param(b'<svg title="&a b;"/>', id="whitespace-in-reference-name"),
-            # Neither \v nor \f is XML whitespace, so neither delimits the
-            # element name (`bytes.isspace()` would have said otherwise).
             pytest.param(b"<svg\x0bfoo>", id="vertical-tab-is-not-xml-space"),
-            # A prologue node that never ends leaves no root to find.
             pytest.param(b"<!-- brand mark", id="unterminated-comment"),
             pytest.param(b'<?xml version="1.0"', id="unterminated-pi"),
             pytest.param(
@@ -356,14 +339,9 @@ class TestBundleValidation:
             ),
         ],
     )
-    def test_xml_without_svg_root_is_rejected(self, tmp_path, content):
-        # An XML declaration alone is not an image. Accepting it would serve
-        # an unrenderable logo under an immutable image/svg+xml cache header,
-        # contradicting the fail-fast promise the error message makes.
-        bundle = make_bundle(tmp_path)
-        (bundle / "assets" / "logo.svg").write_bytes(content)
+    def test_xml_without_svg_root_is_rejected(self, content):
         with pytest.raises(UICustomizationError, match="not PNG, JPEG, WebP or SVG"):
-            load_ui_customization_snapshot(bundle)
+            _sniff_logo_mime(content, "assets/logo.svg")
 
     @pytest.mark.parametrize(
         "content",
@@ -376,20 +354,12 @@ class TestBundleValidation:
                 id="declaration-comment-doctype-then-svg",
             ),
             pytest.param(b"\xef\xbb\xbf\n  " + SVG_BYTES, id="bom-and-whitespace"),
-            # An empty root is still a root: `/` is accepted as the `/>` of a
-            # self-closing element, which is exactly what tightening the
-            # slash check must NOT break.
             pytest.param(b'<svg xmlns="http://www.w3.org/2000/svg"/>', id="empty-root"),
-            # The other side of the quote tracking: a literal `>` in an
-            # attribute value is legal XML, and the tag's real `>` follows it.
             pytest.param(
                 b'<svg data-note="a>b" xmlns="http://www.w3.org/2000/svg">'
                 b"<rect/></svg>",
                 id="gt-in-attribute-value-then-real-close",
             ),
-            # Every prologue node can hold a `>` that is NOT its terminator.
-            # Ending one at the first `>` rejects a VALID logo, and a bundle
-            # whose logo is rejected aborts server startup.
             pytest.param(
                 b'<?xml-stylesheet type="text/css" href="a>b.css"?>' + SVG_BYTES,
                 id="pi-pseudo-attribute-holds-gt",
@@ -410,18 +380,11 @@ class TestBundleValidation:
                 b"]>" + SVG_BYTES,
                 id="illustrator-multi-entity-subset",
             ),
-            # Sub-nodes inside the subset are skipped WHOLE. Quote-tracking
-            # through them would read this apostrophe as an unterminated
-            # literal and reject the file.
             pytest.param(
                 b"<!DOCTYPE svg [<!-- don't -->]>" + SVG_BYTES,
                 id="subset-comment-with-apostrophe",
             ),
-            # PI content has no quote semantics at all, so it is never
-            # quote-tracked either.
             pytest.param(b"<?ps don't?>" + SVG_BYTES, id="pi-with-lone-apostrophe"),
-            # The accepting side of the start-tag production: everything a
-            # real SVG's root tag does, which tightening it must not break.
             pytest.param(b'<svg xmlns="x" />', id="space-before-empty-close"),
             pytest.param(b'<svg xmlns="x" ><rect/></svg>', id="space-before-close"),
             pytest.param(
@@ -436,12 +399,6 @@ class TestBundleValidation:
                 b'<svg style="fill:red;\n stroke:blue" xmlns="x"><rect/></svg>',
                 id="newline-inside-attribute-value",
             ),
-            # Every shape of Reference an AttValue may legally hold. The
-            # entity need not be DECLARED here — resolving it is the
-            # renderer's job — and an internal subset may define its own,
-            # which is how Illustrator writes its namespace attributes.
-            # A custom (subset-declared) name, not a predefined one: restricting
-            # references to the five predefined entities would reject it.
             pytest.param(
                 b'<!DOCTYPE svg [<!ENTITY ns_x "http://x/">]>'
                 b'<svg xmlns:x="&ns_x;" xmlns="x"/>',
@@ -456,38 +413,14 @@ class TestBundleValidation:
                 b"<!-- a [ \" ' ] brand mark -->" + SVG_BYTES,
                 id="comment-with-brackets-and-quotes",
             ),
+            pytest.param(
+                b"<!--" + b"x" * 5000 + b"-->" + SVG_BYTES,
+                id="long-prologue-does-not-hide-root",
+            ),
         ],
     )
-    def test_real_svg_variants_are_accepted(self, tmp_path, content):
-        bundle = make_bundle(tmp_path)
-        (bundle / "assets" / "logo.svg").write_bytes(content)
-        snapshot = load_ui_customization_snapshot(bundle)
-        assert snapshot.locales["en"].logo_asset_id == "brand-logo"
-        logo = next(
-            asset
-            for asset in snapshot.assets.values()
-            if asset.asset_id == "brand-logo"
-        )
-        assert logo.mime == "image/svg+xml"
-
-    def test_a_long_prologue_does_not_hide_the_root(self, tmp_path):
-        # There is no sniff window any more, and this is what its removal is
-        # for. A prologue longer than the old 4 KiB slice used to push the
-        # start tag out of view, and the code accepted it UNSEEN — "it must
-        # close later" — which is how an unterminated literal padded past the
-        # window got in. The file is already in memory: read it.
-        comment = b"<!--" + b"x" * 5000 + b"-->"
-        content = comment + b'<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>'
-
-        bundle = make_bundle(tmp_path)
-        (bundle / "assets" / "logo.svg").write_bytes(content)
-        snapshot = load_ui_customization_snapshot(bundle)
-        logo = next(
-            asset
-            for asset in snapshot.assets.values()
-            if asset.asset_id == "brand-logo"
-        )
-        assert logo.mime == "image/svg+xml"
+    def test_real_svg_variants_are_accepted(self, content):
+        assert _sniff_logo_mime(content, "assets/logo.svg") == "image/svg+xml"
 
     def test_locale_logo_override(self, tmp_path):
         bundle = make_bundle(tmp_path, extra_files={"assets/logo-zh.png": PNG_BYTES})
@@ -502,12 +435,7 @@ class TestBundleValidation:
 
 
 class TestCopyrightBundle:
-    """`brand.copyright` with an optional per-locale override.
-
-    The line is the DEPLOYMENT's own legal assertion, so the only source is
-    the manifest: there is no LightRAG default to inherit, and no bundle text
-    that turns into one.
-    """
+    """`brand.copyright` with an optional per-locale override."""
 
     def test_absent_by_default(self, tmp_path):
         snapshot = load_ui_customization_snapshot(make_bundle(tmp_path))
@@ -524,7 +452,6 @@ class TestCopyrightBundle:
         assert snapshot.locales["zh"].copyright == "© 2025 ACME Inc."
 
     def test_locale_override_and_explicit_null(self, tmp_path):
-        """Same three-way shape as `logo`: inherit, replace, or opt out."""
         bundle = make_bundle(tmp_path)
         manifest = json.loads((bundle / "manifest.json").read_text("utf-8"))
         manifest["brand"]["copyright"] = "© 2025 ACME Inc."
@@ -540,24 +467,11 @@ class TestCopyrightBundle:
         assert snapshot.locales["zh"].copyright is None
         assert snapshot.locales["en"].copyright == "© 2025 ACME Inc."
 
-    @pytest.mark.parametrize(
-        "blank",
-        [
-            "   ",
-        ],
-    )
-    def test_blank_is_none_rather_than_a_startup_failure(self, tmp_path, blank):
-        """Unlike a blank `login`/`agreements`, blank here is not an error.
-
-        Blankness only turns the line OFF — the same end state as omitting the
-        field, and the one an uncustomized deployment is already in. Nothing
-        is silently mis-shown, so refusing to start would cost a deployment
-        more than it protects it.
-        """
+    def test_blank_is_none_rather_than_a_startup_failure(self, tmp_path):
         bundle = make_bundle(tmp_path)
         manifest = json.loads((bundle / "manifest.json").read_text("utf-8"))
-        manifest["brand"]["copyright"] = blank
-        manifest["locales"]["zh"]["copyright"] = blank
+        manifest["brand"]["copyright"] = "   "
+        manifest["locales"]["zh"]["copyright"] = "   "
         (bundle / "manifest.json").write_text(json.dumps(manifest), "utf-8")
         snapshot = load_ui_customization_snapshot(bundle)
         assert snapshot.locales["en"].copyright is None
@@ -593,7 +507,6 @@ class TestCopyrightBundle:
             load_ui_customization_snapshot(bundle)
 
     def test_participates_in_the_bundle_revision(self, tmp_path):
-        """It lives in manifest.json, which is hashed like any other file."""
         bundle = make_bundle(tmp_path)
         before = load_ui_customization_snapshot(bundle).bundle_revision
         manifest = json.loads((bundle / "manifest.json").read_text("utf-8"))
@@ -618,14 +531,13 @@ class TestLoginConsentBundle:
         assert snapshot.locales["zh"].login == "# 登录说明"
         assert snapshot.locales["zh"].agreements == "# 协议"
         assert snapshot.locales["zh"].consent_required is True
-        # Per LOCALE, not per bundle: "en" declared neither.
         assert snapshot.locales["en"].consent_required is False
 
     @pytest.mark.parametrize(
         "login, agreements",
         [
-            ("# 登录说明", None),  # a branded login page, nothing to agree to
-            (None, "# 协议"),  # an agreement document no page links to
+            ("# 登录说明", None),
+            (None, "# 协议"),
         ],
     )
     def test_half_a_configuration_leaves_the_gate_off(
@@ -647,12 +559,6 @@ class TestLoginConsentBundle:
 
     @pytest.mark.parametrize("field_name", ["login", "agreements"])
     def test_blank_template_is_rejected(self, tmp_path, field_name):
-        """Declared-but-empty is a misconfiguration, not a declaration.
-
-        Whether the file exists is the switch, so a blank one would put a
-        consent checkbox in front of an empty document — startup naming the
-        file beats a user meeting an empty dialog.
-        """
         bundle = add_login_consent(make_bundle(tmp_path), **{field_name: "   \n"})
         with pytest.raises(UICustomizationError, match=f"locales.zh.{field_name}"):
             load_ui_customization_snapshot(bundle)
@@ -661,7 +567,6 @@ class TestLoginConsentBundle:
     def test_optional_templates_obey_the_required_ones_rules(
         self, tmp_path, field_name
     ):
-        """Path containment, existence and the size limit are NOT relaxed."""
         for bad_path, match in (
             ("../../etc/passwd", "traversal"),
             ("/etc/passwd", "absolute"),
@@ -693,22 +598,12 @@ class TestLoginConsentBundle:
 
 
 class TestConsentDocumentsName:
-    """`consent_documents`: how the checkbox NAMES its link.
-
-    An inline string, not a path — the label is one line of text, and a file
-    per language per deployment would be ceremony for it. It names the
-    document the bundle already ships, so it lives beside it in the manifest
-    rather than in the WebUI's translations, which cannot know that a
-    deployment calls its document "Terms of Service".
-    """
-
     def test_declared_value_is_carried(self, tmp_path):
         bundle = add_login_consent(
             make_bundle(tmp_path), consent_documents="《示例公司服务条款》"
         )
         snapshot = load_ui_customization_snapshot(bundle)
         assert snapshot.locales["zh"].consent_documents == "《示例公司服务条款》"
-        # Per locale, like every other content field.
         assert snapshot.locales["en"].consent_documents is None
 
     def test_explicit_null_is_undeclared(self, tmp_path):
@@ -718,16 +613,9 @@ class TestConsentDocumentsName:
         (bundle / "manifest.json").write_text(json.dumps(manifest), "utf-8")
         snapshot = load_ui_customization_snapshot(bundle)
         assert snapshot.locales["zh"].consent_documents is None
-        # The gate is unaffected: the NAME is optional, the documents are not.
         assert snapshot.locales["zh"].consent_required is True
 
     def test_it_does_not_switch_the_gate_on(self, tmp_path):
-        """A name without documents is still nothing to agree to.
-
-        `consent_required` stays the login+agreements pair's decision alone,
-        so a stray label can never put a login-blocking checkbox in front of
-        a document that does not exist.
-        """
         bundle = add_login_consent(
             make_bundle(tmp_path),
             login=None,
@@ -738,13 +626,7 @@ class TestConsentDocumentsName:
         assert snapshot.locales["zh"].consent_documents == "《服务条款》"
         assert snapshot.locales["zh"].consent_required is False
 
-    @pytest.mark.parametrize(
-        "bad",
-        [
-            "   \n",
-            42,
-        ],
-    )
+    @pytest.mark.parametrize("bad", ["   \n", 42])
     def test_blank_or_non_string_is_rejected(self, tmp_path, bad):
         bundle = make_bundle(tmp_path)
         manifest = json.loads((bundle / "manifest.json").read_text("utf-8"))
@@ -756,7 +638,6 @@ class TestConsentDocumentsName:
             load_ui_customization_snapshot(bundle)
 
     def test_consent_templates_participate_in_the_revision(self, tmp_path):
-        """Editing the agreement text must invalidate the bundle revision."""
         bundle = add_login_consent(make_bundle(tmp_path))
         before = load_ui_customization_snapshot(bundle)
         (bundle / "locales" / "zh" / "agreements.md").write_text("# 协议 v2", "utf-8")
@@ -780,7 +661,7 @@ class TestRevisionBoundaries:
         (bundle / "locales" / "zh" / "welcome.md").write_text("# 新欢迎", "utf-8")
         after = load_ui_customization_snapshot(bundle)
         assert before.bundle_revision != after.bundle_revision
-        assert set(before.assets) == set(after.assets)  # (hash, id) unchanged
+        assert set(before.assets) == set(after.assets)
 
     def test_logo_change_moves_both(self, tmp_path):
         bundle = make_bundle(tmp_path)
@@ -789,7 +670,6 @@ class TestRevisionBoundaries:
         after = load_ui_customization_snapshot(bundle)
         assert before.bundle_revision != after.bundle_revision
         assert set(before.assets) != set(after.assets)
-        # The semantic asset id is stable; only the hash moved.
         assert {a.asset_id for a in after.assets.values()} == {"brand-logo"}
 
 
@@ -797,6 +677,8 @@ class TestRevisionBoundaries:
 # Endpoints
 # --------------------------------------------------------------------------- #
 class _FakeLightRAG:
+    """Minimal LightRAG double satisfying create_app's route wiring."""
+
     def __init__(self, *_args, **_kwargs):
         pass
 
@@ -817,6 +699,8 @@ class _FakeLightRAG:
 
 
 class _FakeOllamaAPI:
+    """Minimal OllamaAPI double exposing an empty router."""
+
     def __init__(self, *_args, **_kwargs):
         self.router = APIRouter()
 
@@ -873,33 +757,65 @@ def _build_app(tmp_path, monkeypatch, *cli_args):
 
 
 class TestCustomizationEndpointNoBundle:
-    def test_customized_false_with_brand(self, tmp_path, monkeypatch):
-        _stage_frontend(tmp_path)
-        client = TestClient(_build_app(tmp_path, monkeypatch))
+    @pytest.fixture(scope="class")
+    @classmethod
+    def no_bundle_client(cls, tmp_path_factory):
+        import lightrag.api.config as config
 
-        resp = client.get("/ui/customization?locale=zh-TW")
+        root = tmp_path_factory.mktemp("no_bundle_ui")
+        _stage_frontend(root)
+        saved = (config._global_args, config._initialized)
+        with pytest.MonkeyPatch.context() as mp:
+            _set_clean_env(mp)
+            mp.setenv("EMBEDDING_MODEL", "text-embedding-3-small")
+            app = _build_app(root, mp)
+            try:
+                yield TestClient(app)
+            finally:
+                config._global_args, config._initialized = saved
+
+    def test_customized_false_with_brand(self, no_bundle_client):
+        resp = no_bundle_client.get("/ui/customization?locale=zh-TW")
         assert resp.status_code == 200
         data = resp.json()
         assert data["customized"] is False
         assert data["brand"]["title"]
         assert "welcome" not in data
-        # No bundle ⇒ nothing asserts a copyright ⇒ no line for the page to
-        # render. LightRAG never puts its own notice on a deployment's page.
         assert "copyright" not in data["brand"]
-        # No bundle ⇒ no deployment agreement text ⇒ no login consent gate.
         assert not data.get("consent_required")
         assert resp.headers["cache-control"] == "no-store"
         assert "etag" not in resp.headers
 
-    def test_asset_endpoint_rejects_everything(self, tmp_path, monkeypatch):
-        _stage_frontend(tmp_path)
-        client = TestClient(_build_app(tmp_path, monkeypatch))
+    def test_asset_endpoint_rejects_everything(self, no_bundle_client):
         assert (
-            client.get("/ui/customization/assets/abc123/brand-logo").status_code == 404
+            no_bundle_client.get(
+                "/ui/customization/assets/abc123/brand-logo"
+            ).status_code
+            == 404
         )
 
 
 class TestCustomizationEndpointWithBundle:
+    @pytest.fixture(scope="class")
+    @classmethod
+    def bundle_client(cls, tmp_path_factory):
+        """Read-only app booted once for the standard two-locale bundle."""
+        import lightrag.api.config as config
+
+        root = tmp_path_factory.mktemp("with_bundle_ui")
+        bundle = make_bundle(root)
+        _stage_frontend(root, workspace=True)
+        saved = (config._global_args, config._initialized)
+        with pytest.MonkeyPatch.context() as mp:
+            _set_clean_env(mp)
+            mp.setenv("EMBEDDING_MODEL", "text-embedding-3-small")
+            mp.setenv("UI_TEMPLATES_DIR", str(bundle))
+            app = _build_app(root, mp)
+            try:
+                yield TestClient(app)
+            finally:
+                config._global_args, config._initialized = saved
+
     def _client(self, tmp_path, monkeypatch, *cli_args, workspace=True, consent=False):
         bundle = make_bundle(tmp_path)
         if consent:
@@ -908,27 +824,47 @@ class TestCustomizationEndpointWithBundle:
         _stage_frontend(tmp_path, workspace=workspace)
         return TestClient(_build_app(tmp_path, monkeypatch, *cli_args))
 
-    def test_login_consent_absent_by_default(self, tmp_path, monkeypatch):
-        data = (
-            self._client(tmp_path, monkeypatch)
-            .get("/ui/customization?locale=zh")
-            .json()
-        )
+    def test_full_representation(self, bundle_client):
+        resp = bundle_client.get("/ui/customization?locale=zh")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["customized"] is True
+        assert data["locale"] == "zh"
+        assert data["fallback_used"] is False
+        assert data["direction"] == "ltr"
+        assert data["welcome"] == {"format": "markdown", "content": "# 欢迎"}
+        assert data["query_empty"]["content"] == "请提问"
+        assert data["brand"]["logo_alt"] == "ACME 中文"
+        assert data["brand"]["logo_url"].startswith("/ui/customization/assets/")
+        assert data["brand"]["copyright"] is None
         assert data["login"] is None
         assert data["agreements"] is None
         assert data["consent_documents"] is None
         assert data["consent_required"] is False
+        assert resp.headers["cache-control"] == "no-store"
+        assert "etag" not in resp.headers
 
-    def test_login_consent_served(self, tmp_path, monkeypatch):
+    def test_login_consent_served_and_follows_resolved_locale(
+        self, tmp_path, monkeypatch
+    ):
         client = self._client(tmp_path, monkeypatch, consent=True)
-        data = client.get("/ui/customization?locale=zh").json()
-        assert data["login"] == {"format": "markdown", "content": "# 登录说明"}
-        assert data["agreements"] == {"format": "markdown", "content": "# 协议"}
-        assert data["consent_required"] is True
-        # Declared by no locale in this bundle: the WebUI's own translation
-        # names the link, which is why null travels rather than a server-side
-        # default the frontend would have to recognize as one.
-        assert data["consent_documents"] is None
+        zh = client.get("/ui/customization?locale=zh").json()
+        assert zh["login"] == {"format": "markdown", "content": "# 登录说明"}
+        assert zh["agreements"] == {"format": "markdown", "content": "# 协议"}
+        assert zh["consent_required"] is True
+        assert zh["consent_documents"] is None
+
+        # "en" is declared but carries neither template.
+        en = client.get("/ui/customization?locale=en").json()
+        assert en["locale"] == "en"
+        assert en["consent_required"] is False
+        assert en["agreements"] is None
+
+        # "ko" falls back to "zh", which carries both.
+        ko = client.get("/ui/customization?locale=ko").json()
+        assert (ko["locale"], ko["fallback_used"]) == ("zh", True)
+        assert ko["consent_required"] is True
+        assert ko["agreements"]["content"] == "# 协议"
 
     def test_consent_documents_served(self, tmp_path, monkeypatch):
         bundle = add_login_consent(
@@ -939,39 +875,10 @@ class TestCustomizationEndpointWithBundle:
         client = TestClient(_build_app(tmp_path, monkeypatch))
         data = client.get("/ui/customization?locale=zh").json()
         assert data["consent_documents"] == "《示例公司服务条款》"
-        # The locale that declares none says so, in the same response shape.
         assert (
             client.get("/ui/customization?locale=en").json()["consent_documents"]
             is None
         )
-
-    def test_consent_follows_the_resolved_locale(self, tmp_path, monkeypatch):
-        """The gate is a property of the locale actually served.
-
-        A visitor falling back to a locale that declares no agreement text
-        must not be shown a checkbox pointing at nothing — the flag and the
-        documents come from the same resolved locale, together.
-        """
-        client = self._client(tmp_path, monkeypatch, consent=True)
-        # "en" is declared but carries neither template.
-        en = client.get("/ui/customization?locale=en").json()
-        assert en["locale"] == "en"
-        assert en["consent_required"] is False
-        assert en["agreements"] is None
-        # "ko" falls back to "zh", which carries both.
-        ko = client.get("/ui/customization?locale=ko").json()
-        assert (ko["locale"], ko["fallback_used"]) == ("zh", True)
-        assert ko["consent_required"] is True
-        assert ko["agreements"]["content"] == "# 协议"
-
-    def test_copyright_absent_by_default(self, tmp_path, monkeypatch):
-        """A bundle that declares none serves null — never LightRAG's own."""
-        data = (
-            self._client(tmp_path, monkeypatch)
-            .get("/ui/customization?locale=zh")
-            .json()
-        )
-        assert data["brand"]["copyright"] is None
 
     def test_copyright_served_per_resolved_locale(self, tmp_path, monkeypatch):
         bundle = make_bundle(tmp_path)
@@ -987,79 +894,38 @@ class TestCustomizationEndpointWithBundle:
             client.get("/ui/customization?locale=en").json()["brand"]["copyright"]
             == "© 2025 ACME Inc."
         )
-        # "ko" falls back to "zh", so it gets the zh line, not the brand one.
         ko = client.get("/ui/customization?locale=ko").json()
         assert (ko["locale"], ko["fallback_used"]) == ("zh", True)
         assert ko["brand"]["copyright"] == "© 2025 ACME 公司"
 
-    def test_full_representation(self, tmp_path, monkeypatch):
-        client = self._client(tmp_path, monkeypatch)
-        resp = client.get("/ui/customization?locale=zh")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["customized"] is True
-        assert data["locale"] == "zh"
-        assert data["fallback_used"] is False
-        assert data["direction"] == "ltr"
-        assert data["welcome"] == {"format": "markdown", "content": "# 欢迎"}
-        assert data["query_empty"]["content"] == "请提问"
-        assert data["brand"]["logo_alt"] == "ACME 中文"
-        assert data["brand"]["logo_url"].startswith("/ui/customization/assets/")
-        assert resp.headers["cache-control"] == "no-store"
-        assert "etag" not in resp.headers
-
-    def test_case_normalization_and_underscore_rejection(self, tmp_path, monkeypatch):
-        client = self._client(tmp_path, monkeypatch)
-        ok = client.get("/ui/customization?locale=ZH")
+    def test_case_normalization_and_underscore_rejection(self, bundle_client):
+        ok = bundle_client.get("/ui/customization?locale=ZH")
         assert ok.json()["locale"] == "zh"
-        bad = client.get("/ui/customization?locale=zh_TW")
+        bad = bundle_client.get("/ui/customization?locale=zh_TW")
         assert bad.status_code == 400
 
-    def test_fallback_chain_then_default(self, tmp_path, monkeypatch):
-        """The two resolution paths are exercised SEPARATELY.
-
-        `fallback_used` is True for both a manifest fallback and the
-        default-locale catch-all, so the flag alone cannot tell them apart —
-        only the resolved locale can, and only while the bundle's fallback
-        target differs from its default_locale (see make_bundle).
-        """
-        client = self._client(tmp_path, monkeypatch)
-
-        # Declared in `fallbacks` → that target, NOT default_locale.
-        ko = client.get("/ui/customization?locale=ko").json()
+    def test_fallback_chain_then_default(self, bundle_client):
+        ko = bundle_client.get("/ui/customization?locale=ko").json()
         assert (ko["locale"], ko["fallback_used"]) == ("zh", True)
 
-        # Unknown locale with no fallback entry → the bundle's own default,
-        # never the frontend defaults.
-        fr = client.get("/ui/customization?locale=fr").json()
+        fr = bundle_client.get("/ui/customization?locale=fr").json()
         assert (fr["locale"], fr["fallback_used"]) == ("en", True)
         assert fr["customized"] is True
-
-        # Guard on the test's own discriminating power: if a future edit
-        # points the fallback back at default_locale, the two paths collapse
-        # into one answer and the assertions above stop proving that
-        # `fallbacks` is consulted at all.
         assert ko["locale"] != fr["locale"]
 
     @pytest.mark.parametrize(
         ("locale", "direction"),
         [
-            # The four the hand-curated list happened to hold.
             ("ar", "rtl"),
             ("he", "rtl"),
             ("fa", "rtl"),
             ("ur", "rtl"),
-            # Regression: RTL languages it did not, so their bundles were laid
-            # out left-to-right. A bundle may declare ANY valid BCP 47 locale.
             ("ps", "rtl"),
             ("ckb", "rtl"),
             ("dv", "rtl"),
             ("yi", "rtl"),
             ("nqo", "rtl"),
             ("syr", "rtl"),
-            # An explicit SCRIPT subtag outranks the language, in BOTH
-            # directions — which is also what proves the language set was not
-            # simply widened until these passed.
             ("ku-Arab", "rtl"),
             ("ku", "ltr"),
             ("az-Arab", "rtl"),
@@ -1067,22 +933,11 @@ class TestCustomizationEndpointWithBundle:
             ("pa-Arab", "rtl"),
             ("pa", "ltr"),
             ("ar-Latn", "ltr"),
-            # A 4-letter subtag past the script's window is an extension
-            # value: `ar-u-nu-latn` asks for Latin DIGITS and stays RTL.
             ("ar-u-nu-latn", "rtl"),
-            # …but the window is not a fixed index either: BCP 47 puts up to
-            # three extlang subtags between the language and the script, so
-            # `Latn` is the THIRD subtag here and still decides.
             ("ar-aao-Latn", "ltr"),
             ("ar-aao-arz-acm-Latn", "ltr"),
-            # Three is the grammar's limit, so a FOURTH 3-letter subtag is
-            # not an extlang and what follows it is not in the script's
-            # window. The tag is malformed; declared behaviour is to ignore
-            # the stray `Latn` and answer from the language, rather than
-            # let an unbounded skip walk to any 4-letter subtag it finds.
             ("ar-aao-arz-acm-apc-Latn", "rtl"),
             ("ar-EG", "rtl"),
-            # Unchanged: every locale the WebUI itself ships chrome for.
             ("en", "ltr"),
             ("zh-TW", "ltr"),
             ("fr", "ltr"),
@@ -1107,20 +962,20 @@ class TestCustomizationEndpointWithBundle:
         client = TestClient(_build_app(tmp_path, monkeypatch))
         assert client.get("/ui/customization?locale=ar").json()["direction"] == "rtl"
 
-    def test_asset_served_immutable_with_security_headers(self, tmp_path, monkeypatch):
-        client = self._client(tmp_path, monkeypatch)
-        logo_url = client.get("/ui/customization?locale=en").json()["brand"]["logo_url"]
-        resp = client.get(logo_url)
+    def test_asset_served_immutable_with_security_headers(self, bundle_client):
+        logo_url = bundle_client.get("/ui/customization?locale=en").json()["brand"][
+            "logo_url"
+        ]
+        resp = bundle_client.get(logo_url)
         assert resp.status_code == 200
         assert resp.content == SVG_BYTES
         assert resp.headers["content-type"].startswith("image/svg+xml")
         assert "immutable" in resp.headers["cache-control"]
         assert resp.headers["x-content-type-options"] == "nosniff"
         assert "content-security-policy" in resp.headers
-        # Unknown hash and mismatched id are both rejected.
         parts = logo_url.rsplit("/", 2)
-        assert client.get(f"{parts[0]}/{'0' * 64}/{parts[2]}").status_code == 404
-        assert client.get(f"{parts[0]}/{parts[1]}/other-id").status_code == 404
+        assert bundle_client.get(f"{parts[0]}/{'0' * 64}/{parts[2]}").status_code == 404
+        assert bundle_client.get(f"{parts[0]}/{parts[1]}/other-id").status_code == 404
 
     def test_logo_url_keeps_api_prefix(self, tmp_path, monkeypatch):
         client = self._client(tmp_path, monkeypatch, "--api-prefix", "/site01")
@@ -1128,18 +983,13 @@ class TestCustomizationEndpointWithBundle:
         assert data["brand"]["logo_url"].startswith("/site01/ui/customization/assets/")
         assert client.get(data["brand"]["logo_url"]).status_code == 200
 
-    def test_health_carries_no_customization_fields(self, tmp_path, monkeypatch):
-        client = self._client(tmp_path, monkeypatch)
-        health = client.get("/health")
+    def test_health_carries_no_customization_fields(self, bundle_client):
+        health = bundle_client.get("/health")
         assert "bundle_revision" not in health.text
         assert "customization" not in health.text
 
-    def test_route_audit_includes_mounts_and_customization(self, tmp_path, monkeypatch):
-        client = self._client(tmp_path, monkeypatch)
-        app = client.app
-        # Mounts are top-level entries of app.routes. Routes added through
-        # include_router are not: FastAPI keeps each included APIRouter as one
-        # nested entry with no `path`, so read those from the OpenAPI schema.
+    def test_route_audit_includes_mounts_and_customization(self, bundle_client):
+        app = bundle_client.app
         mount_paths = {getattr(route, "path", None) for route in app.routes}
         assert "/webui" in mount_paths
         assert "/workspace" in mount_paths
@@ -1183,16 +1033,7 @@ class TestOrthogonality:
 
 
 class TestChromeTranslationCoverage:
-    """A bundle may declare ANY valid BCP 47 locale — a deployment is free to
-    write its welcome text in a language the WebUI itself is not translated
-    into, and rejecting those bundles would forbid a legitimate setup. What
-    the operator needs instead is to learn at deploy time that the controls
-    around that content cannot follow it, so startup names such locales.
-    """
-
     def test_the_python_list_matches_the_webui_language_list(self):
-        """The warning is only truthful while the two lists agree; the
-        frontend's list is the source of truth (its locale JSON files)."""
         source = (
             Path(__file__).resolve().parents[2]
             / "lightrag_webui"
@@ -1204,7 +1045,6 @@ class TestChromeTranslationCoverage:
         assert block is not None, "SUPPORTED_UI_LANGUAGES not found in the WebUI source"
         webui_ids = set(re.findall(r"'([^']+)'", block.group(1)))
         assert webui_ids, "no languages parsed from the WebUI source"
-        # The manifest form is BCP 47; the frontend ids use underscores.
         assert {locale.replace("_", "-") for locale in webui_ids} == set(
             WEBUI_CHROME_LOCALES
         )
@@ -1212,11 +1052,11 @@ class TestChromeTranslationCoverage:
     @pytest.mark.parametrize(
         "locale,expected",
         [
-            ("de-AT", "de"),  # region variants ride on the language subtag
+            ("de-AT", "de"),
             ("zh-CN", "zh"),
-            ("zh-HK", "zh-TW"),  # traditional script/regions → the shipped variant
+            ("zh-HK", "zh-TW"),
             ("zh-Hant", "zh-TW"),
-            ("es", None),  # valid BCP 47, no WebUI translation
+            ("es", None),
             ("", None),
         ],
     )
@@ -1230,84 +1070,43 @@ class TestChromeTranslationCoverage:
         assert locales_without_chrome_translation(["en", "fr"]) == []
 
     def test_startup_warns_about_a_bundle_the_chrome_cannot_follow(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, lightrag_log_records
     ):
-        from lightrag.utils import logger as lightrag_logger
-
         _stage_frontend(tmp_path)
         bundle = make_bundle(tmp_path)
         manifest = json.loads((bundle / "manifest.json").read_text())
-        # A Spanish-only bundle: perfectly valid, but the WebUI ships no
-        # Spanish interface, so its controls cannot follow the content.
         manifest["locales"]["es"] = manifest["locales"].pop("zh")
         manifest["default_locale"] = "es"
         manifest["fallbacks"] = {}
         (bundle / "manifest.json").write_text(json.dumps(manifest), "utf-8")
         monkeypatch.setenv("UI_TEMPLATES_DIR", str(bundle))
 
-        # The project logger does not propagate to the root logger caplog
-        # installs on, so capture on the logger that actually emits.
-        records = []
-
-        class _Capture(logging.Handler):
-            def emit(self, record):
-                records.append(record)
-
-        handler = _Capture(level=logging.WARNING)
-        lightrag_logger.addHandler(handler)
-        try:
-            _build_app(tmp_path, monkeypatch)
-        finally:
-            lightrag_logger.removeHandler(handler)
+        _build_app(tmp_path, monkeypatch)
 
         warnings = [
             record.getMessage()
-            for record in records
+            for record in lightrag_log_records
             if record.levelno >= logging.WARNING
         ]
         assert any("no interface translation" in message for message in warnings)
-        # It names the offending locale, not merely that something is off.
         assert any("'es'" in message for message in warnings)
 
     def test_a_fully_translatable_bundle_warns_about_nothing(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, lightrag_log_records
     ):
-        from lightrag.utils import logger as lightrag_logger
-
         _stage_frontend(tmp_path)
-        bundle = make_bundle(tmp_path)  # en + zh, both shipped by the WebUI
+        bundle = make_bundle(tmp_path)
         monkeypatch.setenv("UI_TEMPLATES_DIR", str(bundle))
 
-        records = []
-
-        class _Capture(logging.Handler):
-            def emit(self, record):
-                records.append(record)
-
-        handler = _Capture(level=logging.WARNING)
-        lightrag_logger.addHandler(handler)
-        try:
-            _build_app(tmp_path, monkeypatch)
-        finally:
-            lightrag_logger.removeHandler(handler)
+        _build_app(tmp_path, monkeypatch)
 
         assert not any(
-            "no interface translation" in record.getMessage() for record in records
+            "no interface translation" in record.getMessage()
+            for record in lightrag_log_records
         )
 
 
 class TestLogoUrlAltCoupling:
-    """`logo_url` and `logo_alt` are one decision, never two.
-
-    A response that names no logo must not still carry alt text for it: the
-    page renders the <img> only when a URL is present, so a lone alt text
-    describes an image nobody sees, and a client that keys on `logo_alt`
-    being non-null would render a broken image. A validated bundle cannot
-    reach that state (every declared `logo_asset_id` is loaded alongside its
-    locale), so the coupling is asserted against a hand-built snapshot whose
-    locale points at an asset id the snapshot does not carry.
-    """
-
     def _app(self, snapshot):
         from fastapi import FastAPI
         from lightrag.api.routers.ui_customization_routes import (
@@ -1318,7 +1117,14 @@ class TestLogoUrlAltCoupling:
         app.include_router(create_ui_customization_routes(snapshot, "ACME", "desc"))
         return app
 
-    def test_alt_is_dropped_when_the_asset_cannot_be_named(self):
+    @pytest.mark.parametrize(
+        "logo_asset_id",
+        [
+            pytest.param("brand-logo", id="missing-referenced-asset"),
+            pytest.param(None, id="explicit-no-logo"),
+        ],
+    )
+    def test_alt_is_dropped_when_no_logo_url(self, logo_asset_id):
         snapshot = UICustomizationSnapshot(
             default_locale="en",
             locales={
@@ -1326,23 +1132,7 @@ class TestLogoUrlAltCoupling:
                     welcome="w",
                     query_empty="q",
                     logo_alt="ACME",
-                    logo_asset_id="brand-logo",
-                )
-            },
-            fallbacks={},
-            assets={},  # the referenced asset is absent
-            bundle_revision="deadbeef",
-        )
-        data = TestClient(self._app(snapshot)).get("/ui/customization").json()
-        assert data["brand"]["logo_url"] is None
-        assert data["brand"]["logo_alt"] is None
-
-    def test_explicit_no_logo_carries_neither(self):
-        snapshot = UICustomizationSnapshot(
-            default_locale="en",
-            locales={
-                "en": UILocaleContent(
-                    welcome="w", query_empty="q", logo_alt="ACME", logo_asset_id=None
+                    logo_asset_id=logo_asset_id,
                 )
             },
             fallbacks={},
@@ -1358,89 +1148,79 @@ class TestLogoUrlAltCoupling:
 # Unpopulated bundle directory
 # --------------------------------------------------------------------------- #
 class TestUnpopulatedBundleDirectory:
-    """A configured directory holding no manifest.json is "not populated yet",
-    not "broken".
-
-    The shipped compose files mount ./data/ui_templates and set
-    UI_TEMPLATES_DIR unconditionally, so the directory a default deployment
-    boots with is one Docker created empty. Treating that as a bundle error
-    would make `docker compose up` fail out of the box; treating a directory
-    that DOES hold a manifest leniently would give up the fail-fast guarantee
-    that a half-written bundle never silently serves LightRAG content.
-    """
-
-    def test_empty_directory_resolves_to_no_bundle(self, tmp_path):
-        empty = tmp_path / "ui_templates"
-        empty.mkdir()
-        assert resolve_ui_customization_snapshot(empty) is None
-
     @pytest.mark.parametrize(
-        "stray",
+        "populate",
         [
-            ".DS_Store",
+            pytest.param(lambda root: None, id="empty-dir"),
+            pytest.param(
+                lambda root: (root / ".DS_Store").write_bytes(b"whatever"),
+                id="stray-ds-store",
+            ),
+            pytest.param(
+                lambda root: (
+                    (root / "locales" / "en").mkdir(parents=True),
+                    (root / "locales" / "en" / "welcome.md").write_text("# hi", "utf-8"),
+                ),
+                id="partial-without-manifest",
+            ),
         ],
     )
-    def test_stray_files_do_not_make_it_a_bundle(self, tmp_path, stray):
-        """The probe is the manifest, NOT "the directory has zero entries".
-
-        macOS writes .DS_Store into any directory a user opens in Finder and
-        git needs a .gitkeep to track an otherwise empty one — an entry-count
-        test would turn either into a boot loop.
-        """
+    def test_directory_without_manifest_resolves_to_no_bundle(self, tmp_path, populate):
         root = tmp_path / "ui_templates"
         root.mkdir()
-        (root / stray).write_bytes(b"whatever")
+        populate(root)
         assert resolve_ui_customization_snapshot(root) is None
 
-    def test_partial_bundle_without_a_manifest_is_not_a_bundle(self, tmp_path):
-        root = tmp_path / "ui_templates"
-        (root / "locales" / "en").mkdir(parents=True)
-        (root / "locales" / "en" / "welcome.md").write_text("# hi", "utf-8")
-        assert resolve_ui_customization_snapshot(root) is None
-
-    def test_a_manifest_that_is_a_directory_fails(self, tmp_path):
-        """Present-but-unusable is an anomaly, not an empty mount point.
-
-        Degrading to the built-in branding here would drop the fail-fast
-        guarantee the moment an operator has created a manifest entry.
-        """
-        root = tmp_path / "ui_templates"
-        (root / "manifest.json").mkdir(parents=True)
-        with pytest.raises(UICustomizationError, match="not a readable regular"):
-            resolve_ui_customization_snapshot(root)
-
-    def test_a_dangling_manifest_symlink_fails(self, tmp_path):
-        """``exists()`` follows symlinks, so a broken one looks absent to it."""
-        root = tmp_path / "ui_templates"
-        root.mkdir()
-        (root / "manifest.json").symlink_to(root / "nowhere.json")
-        with pytest.raises(UICustomizationError, match="not a readable regular"):
-            resolve_ui_customization_snapshot(root)
+    @pytest.mark.parametrize(
+        ("prepare", "match"),
+        [
+            pytest.param(
+                lambda base: base / "nowhere",
+                "does not exist",
+                id="missing-directory",
+            ),
+            pytest.param(
+                lambda base: (
+                    (base / "ui_templates").write_text("", "utf-8"),
+                    base / "ui_templates",
+                )[1],
+                "is not a directory",
+                id="file-instead-of-directory",
+            ),
+            pytest.param(
+                lambda base: (
+                    (base / "ui_templates" / "manifest.json").mkdir(parents=True),
+                    base / "ui_templates",
+                )[1],
+                "not a readable regular",
+                id="manifest-is-directory",
+            ),
+            pytest.param(
+                lambda base: (
+                    (base / "ui_templates").mkdir(),
+                    (base / "ui_templates" / "manifest.json").symlink_to(
+                        base / "ui_templates" / "nowhere.json"
+                    ),
+                    base / "ui_templates",
+                )[2],
+                "not a readable regular",
+                id="dangling-manifest-symlink",
+            ),
+        ],
+    )
+    def test_invalid_bundle_paths_fail(self, tmp_path, prepare, match):
+        target = prepare(tmp_path)
+        with pytest.raises(UICustomizationError, match=match):
+            resolve_ui_customization_snapshot(target)
 
     def test_a_manifest_symlink_that_resolves_is_loaded(self, tmp_path):
-        """A resolving symlink is a normal bundle (ConfigMap projections use
-        them), so it must load rather than trip the anomaly branch."""
         bundle = make_bundle(tmp_path)
         real = bundle / "manifest.real.json"
         (bundle / "manifest.json").rename(real)
         (bundle / "manifest.json").symlink_to(real)
         assert resolve_ui_customization_snapshot(bundle) is not None
 
-    def test_missing_directory_still_fails(self, tmp_path):
-        """Pointing the variable at nothing stays a configuration error: a
-        bind mount materializes both ends, so only a typo produces it."""
-        with pytest.raises(UICustomizationError, match="does not exist"):
-            resolve_ui_customization_snapshot(tmp_path / "nowhere")
-
-    def test_a_file_instead_of_a_directory_still_fails(self, tmp_path):
-        not_a_dir = tmp_path / "ui_templates"
-        not_a_dir.write_text("", "utf-8")
-        with pytest.raises(UICustomizationError, match="is not a directory"):
-            resolve_ui_customization_snapshot(not_a_dir)
-
     def test_a_present_manifest_keeps_every_validation(self, tmp_path):
-        """The fail-fast half that must survive: once a manifest exists, the
-        bundle is validated exactly as before."""
         bundle = make_bundle(tmp_path)
         (bundle / "manifest.json").write_text("{broken", "utf-8")
         with pytest.raises(UICustomizationError, match="not valid JSON"):
@@ -1452,48 +1232,27 @@ class TestUnpopulatedBundleDirectory:
             resolve_ui_customization_snapshot(bundle2)
 
     def test_loader_contract_is_unchanged(self, tmp_path):
-        """resolve_* owns the tri-state; load_* still validates-or-raises, so
-        a direct caller sees no new None to handle."""
         empty = tmp_path / "ui_templates"
         empty.mkdir()
         with pytest.raises(UICustomizationError, match="manifest.json is missing"):
             load_ui_customization_snapshot(empty)
 
     def test_startup_survives_an_unpopulated_mount_and_says_so(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, lightrag_log_records
     ):
-        """Fix-proof: with the directory Docker auto-creates, the server used
-        to refuse to start (UICustomizationError → restart loop). It now boots
-        with the built-in branding and names the path it found nothing in."""
-        from lightrag.utils import logger as lightrag_logger
-
         _stage_frontend(tmp_path)
         mount_point = tmp_path / "data" / "ui_templates"
         mount_point.mkdir(parents=True)
         monkeypatch.setenv("UI_TEMPLATES_DIR", str(mount_point))
 
-        records = []
-
-        class _Capture(logging.Handler):
-            def emit(self, record):
-                records.append(record)
-
-        handler = _Capture(level=logging.WARNING)
-        lightrag_logger.addHandler(handler)
-        try:
-            app = _build_app(tmp_path, monkeypatch)
-        finally:
-            lightrag_logger.removeHandler(handler)
-
+        app = _build_app(tmp_path, monkeypatch)
         client = TestClient(app)
         assert client.get("/ui/customization").json()["customized"] is False
 
         warnings = [
             record.getMessage()
-            for record in records
+            for record in lightrag_log_records
             if record.levelno >= logging.WARNING
         ]
         assert any("no manifest.json" in message for message in warnings)
-        # It names the directory, which is what separates "not written yet"
-        # from "the mount did not land where I thought".
         assert any(str(mount_point) in message for message in warnings)
