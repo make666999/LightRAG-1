@@ -1,26 +1,4 @@
-"""Attribute validation for the manual entity/relation mutation APIs.
-
-Regression tests for GHSA-c922-pw4m-4wcv. `updated_data` used to be merged into
-the stored object wholesale (`{**node_data, **updated_data}`), so a caller with
-one API key could write an attribute no graph backend can store. On the default
-NetworkX backend that mutation lands in the in-memory `nx.Graph` *before*
-serialization, and there is no rollback -- so every later whole-graph flush by
-any caller re-hits the same failure and the instance stops persisting entirely.
-
-`Test*WritePathStaysHealthy` are the fix proofs. Each one runs a hostile payload
-through a **real** `NetworkXStorage` and then asserts that an ordinary,
-unrelated write still succeeds. On the pre-fix code the rejection does not
-happen, the ordinary write raises `TypeError: GraphML does not support ...`, and
-the test fails behaviourally. Nothing here imports a symbol added by the fix, so
-the module still collects against the pre-fix tree -- otherwise the whole file
-would error out on import and prove nothing. The shared validator's own unit
-tests live in tests/utils/test_graph_attribute_validator.py.
-
-`TestAllowedFieldsAndTypes` pins the rules, including the two a
-plausible-looking fix gets wrong (`None` and control characters are *not*
-storable scalars) and the one that over-rejects (a multi-line description is
-perfectly legal and must keep working).
-"""
+"""Attribute and description validation for manual entity/relation mutation APIs."""
 
 from __future__ import annotations
 
@@ -29,22 +7,20 @@ from copy import deepcopy
 import pytest
 
 from lightrag import utils_graph
-from lightrag.constants import GRAPH_FIELD_SEP
+from lightrag.constants import GRAPH_FIELD_SEP, SOURCE_IDS_LIMIT_METHOD_KEEP
 from lightrag.kg.networkx_impl import NetworkXStorage
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
-from lightrag.utils import make_relation_chunk_key
+from lightrag.operate import (
+    _handle_single_entity_extraction,
+    _handle_single_relationship_extraction,
+    _merge_nodes_then_upsert,
+    _normalize_text_extraction_record_attributes,
+)
+from lightrag.utils import VectorStorageConsistencyError, make_relation_chunk_key
 
 pytestmark = pytest.mark.offline
 
 NESTED = {"any": ["object"]}
-
-
-@pytest.fixture(autouse=True)
-def _shared_data():
-    finalize_share_data()
-    initialize_share_data()
-    yield
-    finalize_share_data()
 
 
 class _NoopLock:
@@ -53,13 +29,6 @@ class _NoopLock:
 
     async def __aexit__(self, *exc):
         return False
-
-
-@pytest.fixture(autouse=True)
-def _patch_graph_lock(monkeypatch):
-    monkeypatch.setattr(
-        utils_graph, "get_storage_keyed_lock", lambda *a, **k: _NoopLock()
-    )
 
 
 class _KVStorage:
@@ -87,12 +56,7 @@ class _VectorStorage(_KVStorage):
 
 
 class _Fixture:
-    """A real NetworkXStorage plus in-memory VDB/KV doubles.
-
-    The graph storage is deliberately the real thing: the defect this file
-    guards is that a bad attribute reaches `nx.Graph` and breaks *serialization*
-    for every subsequent writer, which a fake graph cannot express.
-    """
+    """A real NetworkXStorage plus in-memory VDB/KV doubles."""
 
     def __init__(self, tmp_path):
         self.global_config = {
@@ -175,13 +139,21 @@ class _Fixture:
 
 
 @pytest.fixture
-async def rag(tmp_path):
-    return await _Fixture(tmp_path).start()
+async def rag(tmp_path, monkeypatch):
+    finalize_share_data()
+    initialize_share_data()
+    monkeypatch.setattr(
+        utils_graph, "get_storage_keyed_lock", lambda *a, **k: _NoopLock()
+    )
+    try:
+        yield await _Fixture(tmp_path).start()
+    finally:
+        finalize_share_data()
 
 
-# ---------------------------------------------------------------------------
-# Fix proofs: a rejected payload must leave the write path usable.
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Fix proofs: rejected attribute payloads leave NetworkX write path healthy
+# --------------------------------------------------------------------------- #
 
 
 class TestEntityEditWritePathStaysHealthy:
@@ -192,19 +164,12 @@ class TestEntityEditWritePathStaysHealthy:
         with pytest.raises(ValueError, match="Unknown entity field 'poc_nested'"):
             await rag.edit_entity("VICTIM", {"poc_nested": NESTED})
 
-        # The whole point: nothing landed in the in-memory graph, so an
-        # unrelated write still reaches disk. Pre-fix this raised TypeError.
         assert "poc_nested" not in await rag.graph.get_node("VICTIM")
         await rag.create_entity("AFTER")
         assert "AFTER" in rag.graphml_text()
 
     @pytest.mark.asyncio
     async def test_null_on_an_allowed_field_is_refused(self, rag):
-        """`None` is the bypass an "allowlist + any scalar" fix leaves open.
-
-        GraphML rejects `NoneType` exactly like it rejects `dict`, so allowing
-        it reproduces the original outage through an accepted field name.
-        """
         await rag.create_entity("VICTIM")
 
         with pytest.raises(ValueError, match="'file_path' must be a string"):
@@ -215,7 +180,6 @@ class TestEntityEditWritePathStaysHealthy:
 
     @pytest.mark.asyncio
     async def test_control_character_on_an_allowed_field_is_refused(self, rag):
-        """The second bypass: a `str` XML cannot encode is still not storable."""
         await rag.create_entity("VICTIM")
 
         with pytest.raises(ValueError, match=r"must not contain the character U\+000B"):
@@ -226,21 +190,12 @@ class TestEntityEditWritePathStaysHealthy:
 
     @pytest.mark.asyncio
     async def test_wrong_scalar_type_on_source_id_is_refused(self, rag):
-        """The durable variant: an `int` here is storable but poisonous.
-
-        It serializes fine, reaches disk and survives a restart -- and then
-        every reader that splits `source_id` on GRAPH_FIELD_SEP raises
-        `AttributeError`, including the ingestion merge. So a scalar check alone
-        is not enough; the field's own type has to be enforced.
-        """
         await rag.create_entity("VICTIM")
 
         with pytest.raises(ValueError, match="'source_id' must be a string, got int"):
             await rag.edit_entity("VICTIM", {"source_id": 123})
 
         assert (await rag.graph.get_node("VICTIM"))["source_id"] == "chunk-1"
-        # Still editable afterwards -- pre-fix this raised AttributeError
-        # forever, restart included.
         await rag.edit_entity("VICTIM", {"description": "an ordinary update"})
         assert (await rag.graph.get_node("VICTIM"))["description"] == (
             "an ordinary update"
@@ -365,12 +320,7 @@ class TestRelationWeightEvidenceFloor:
         )
         storage_key = make_relation_chunk_key("REL_A", "REL_B")
         await rag.relation_chunks.upsert(
-            {
-                storage_key: {
-                    "chunk_ids": [legacy_source_id],
-                    "count": 1,
-                }
-            }
+            {storage_key: {"chunk_ids": [legacy_source_id], "count": 1}}
         )
 
         await rag.edit_relation(
@@ -394,12 +344,7 @@ class TestRelationWeightEvidenceFloor:
         )
         storage_key = make_relation_chunk_key("REL_A", "REL_B")
         await rag.relation_chunks.upsert(
-            {
-                storage_key: {
-                    "chunk_ids": ["manual_creation"],
-                    "count": 1,
-                }
-            }
+            {storage_key: {"chunk_ids": ["manual_creation"], "count": 1}}
         )
 
         await rag.edit_relation(
@@ -462,13 +407,6 @@ class TestRelationWeightEvidenceFloor:
 class TestEntityCreateWritePathStaysHealthy:
     @pytest.mark.asyncio
     async def test_non_scalar_on_a_known_field_is_refused(self, rag):
-        """The create path was reported as unaffected. It is not.
-
-        Copying six named fields stops an unknown *key*, but a non-scalar value
-        on a known one (`entity_type` here) reached `upsert_node` unexamined and
-        produced the identical instance-wide outage. Only `description` was
-        incidentally safe, because building the VDB content concatenates it.
-        """
         await rag.create_entity("CTRL")
 
         with pytest.raises(ValueError, match="'entity_type' must be a string"):
@@ -480,12 +418,6 @@ class TestEntityCreateWritePathStaysHealthy:
 
     @pytest.mark.asyncio
     async def test_unknown_key_is_still_ignored_not_rejected(self, rag):
-        """Create keeps dropping unknown keys.
-
-        It never wrote them (the named-field copy is a structural allowlist), so
-        turning them into a 400 would break working payloads for no gain. Only
-        the merging paths need reject-unknown.
-        """
         await rag.create_entity("CREATE_EXTRA", poc_nested=NESTED)
 
         node = await rag.graph.get_node("CREATE_EXTRA")
@@ -493,15 +425,9 @@ class TestEntityCreateWritePathStaysHealthy:
         assert "CREATE_EXTRA" in rag.graphml_text()
 
 
-# ---------------------------------------------------------------------------
-# The rules themselves.
-# ---------------------------------------------------------------------------
-
-
 class TestAllowedFieldsAndTypes:
     @pytest.mark.asyncio
     async def test_multiline_description_is_accepted(self, rag):
-        """Guard against over-rejection: tab/newline/CR are valid XML."""
         await rag.create_entity("VICTIM")
         text = "first line\nsecond\tline\rthird"
 
@@ -512,7 +438,6 @@ class TestAllowedFieldsAndTypes:
 
     @pytest.mark.asyncio
     async def test_rename_field_is_still_allowed(self, rag):
-        """`entity_name` is the rename target and must stay editable."""
         await rag.create_entity("OLD_NAME")
 
         await rag.edit_entity("OLD_NAME", {"entity_name": "NEW_NAME"})
@@ -522,11 +447,6 @@ class TestAllowedFieldsAndTypes:
 
     @pytest.mark.asyncio
     async def test_entity_id_is_not_an_editable_field(self, rag):
-        """It was silently ignored before (overwritten by the rename target).
-
-        A 400 naming the allowed fields is the discoverable behaviour; silently
-        accepting a rename request that does nothing is not.
-        """
         await rag.create_entity("VICTIM")
 
         with pytest.raises(ValueError, match="Unknown entity field 'entity_id'"):
@@ -544,18 +464,8 @@ class TestAllowedFieldsAndTypes:
             assert field in message
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "weight, expected",
-        [(2, 2.0), ("2.5", 2.5)],
-    )
+    @pytest.mark.parametrize("weight, expected", [(2, 2.0), ("2.5", 2.5)])
     async def test_relation_weight_is_normalized_to_float(self, rag, weight, expected):
-        """A numeric string is accepted, and stored as a number.
-
-        The create path has always run `weight` through `float()`, so accepting
-        a numeric string keeps existing callers working; normalizing here means
-        the stored attribute is a float on the edit path too, instead of a
-        string that only the VDB payload converted.
-        """
         await rag.create_entity("REL_A")
         await rag.create_entity("REL_B")
         await rag.create_relation("REL_A", "REL_B")
@@ -567,23 +477,10 @@ class TestAllowedFieldsAndTypes:
         assert stored == expected
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        # One isfinite() check: a literal nan, and an overflow to inf. Other
-        # spellings only re-test float() parsing.
-        "weight",
-        ["nan", "1e999"],
-    )
+    @pytest.mark.parametrize("weight", ["nan", "1e999"])
     async def test_relation_weight_rejects_strings_that_coerce_to_non_finite(
         self, rag, weight
     ):
-        """The value check has to run on the *coerced* number, not the input.
-
-        A numeric string is a perfectly storable `str`, so validating only what
-        the caller sent lets the `float()` conversion manufacture the non-scalar
-        the contract forbids. That would be accepted here and rejected later in
-        storage -- PGTableGraphStorage's jsonb column refuses the bare `NaN`
-        `json.dumps` emits -- turning an intended 400 into a 500.
-        """
         await rag.create_entity("REL_A")
         await rag.create_entity("REL_B")
         await rag.create_relation("REL_A", "REL_B")
@@ -596,16 +493,8 @@ class TestAllowedFieldsAndTypes:
         assert "AFTER" in rag.graphml_text()
 
     @pytest.mark.asyncio
-    # The int64 upper boundary, and the lower bound past where float() overflows.
     @pytest.mark.parametrize("weight", [2**63, -(10**400)])
     async def test_relation_weight_rejects_oversized_integers(self, rag, weight):
-        """A huge JSON integer must be a 400, not an uncaught OverflowError.
-
-        `json.loads` yields a Python int of unbounded size, and `float()` raises
-        `OverflowError` past ~1e308 -- which is neither `TypeError` nor
-        `ValueError`, so it escaped the coercion handler and reached the route as
-        a 500. The int64 bound refuses it before the conversion is attempted.
-        """
         await rag.create_entity("REL_A")
         await rag.create_entity("REL_B")
         await rag.create_relation("REL_A", "REL_B")
@@ -618,7 +507,6 @@ class TestAllowedFieldsAndTypes:
         assert "AFTER" in rag.graphml_text()
 
     @pytest.mark.asyncio
-    # Non-scalars are also refused by test_unknown_key_with_non_scalar_value_is_refused.
     @pytest.mark.parametrize("weight", [True, "abc", None])
     async def test_relation_weight_rejects_non_numbers(self, rag, weight):
         await rag.create_entity("REL_A")
@@ -633,12 +521,6 @@ class TestAllowedFieldsAndTypes:
 
     @pytest.mark.asyncio
     async def test_merge_target_entity_data_is_validated(self, rag):
-        """The third copy of the same wholesale merge, in `_merge_entities_impl`.
-
-        Not reachable from the HTTP route (it does not pass the argument), but
-        part of the public Python API, so the report's two-site patch would have
-        left it open.
-        """
         await rag.create_entity("SOURCE")
         await rag.create_entity("TARGET")
 
@@ -657,3 +539,346 @@ class TestAllowedFieldsAndTypes:
         assert await rag.graph.has_node("SOURCE")
         await rag.create_entity("AFTER")
         assert "AFTER" in rag.graphml_text()
+
+
+# --------------------------------------------------------------------------- #
+# Description validation, record normalization, and merge consistency
+# --------------------------------------------------------------------------- #
+
+
+class _DummyGraphStorage:
+    def __init__(self, node=None):
+        self.node = node
+        self.upserted_nodes = []
+
+    async def get_node(self, node_id):
+        return self.node
+
+    async def upsert_node(self, node_id, node_data):
+        self.upserted_nodes.append((node_id, node_data))
+        self.node = dict(node_data)
+
+
+class _DummyVectorStorage:
+    def __init__(self):
+        self.global_config = {"workspace": "test"}
+        self.upserts = []
+        self.deletes = []
+
+    async def upsert(self, data):
+        self.upserts.append(data)
+        return None
+
+    async def delete(self, ids):
+        self.deletes.append(ids)
+        return None
+
+    async def get_by_id(self, id_):
+        return None
+
+    async def index_done_callback(self):
+        return True
+
+
+class _DummyMergeGraphStorage:
+    def __init__(self):
+        self.nodes = {
+            "Canonical": {
+                "entity_id": "Canonical",
+                "description": "canonical desc",
+                "entity_type": "ORG",
+                "source_id": "chunk-1",
+                "file_path": "canonical.md",
+            },
+            "Alias": {
+                "entity_id": "Alias",
+                "description": "alias desc",
+                "entity_type": "ORG",
+                "source_id": "chunk-2",
+                "file_path": "alias.md",
+            },
+            "Neighbor": {
+                "entity_id": "Neighbor",
+                "description": "neighbor desc",
+                "entity_type": "ORG",
+                "source_id": "chunk-3",
+                "file_path": "neighbor.md",
+            },
+        }
+        self.edges = {
+            ("Alias", "Neighbor"): {
+                "description": "rel desc",
+                "keywords": "alias",
+                "source_id": "chunk-rel",
+                "weight": 1.0,
+                "file_path": "rel.md",
+            }
+        }
+
+    async def has_node(self, node_id):
+        return node_id in self.nodes
+
+    async def get_node(self, node_id):
+        return self.nodes[node_id]
+
+    async def upsert_node(self, node_id, node_data):
+        self.nodes[node_id] = dict(node_data)
+
+    async def get_node_edges(self, node_id):
+        return [
+            (src, tgt) for src, tgt in self.edges if src == node_id or tgt == node_id
+        ]
+
+    async def get_edge(self, src, tgt):
+        return self.edges.get((src, tgt)) or self.edges.get((tgt, src))
+
+    async def upsert_edge(self, src, tgt, edge_data):
+        self.edges[(src, tgt)] = dict(edge_data)
+
+    async def delete_node(self, node_id):
+        self.nodes.pop(node_id, None)
+        self.edges = {
+            (src, tgt): data
+            for (src, tgt), data in self.edges.items()
+            if src != node_id and tgt != node_id
+        }
+
+    async def index_done_callback(self):
+        return True
+
+
+@pytest.mark.asyncio
+async def test_merge_nodes_then_upsert_handles_missing_legacy_description():
+    graph = _DummyGraphStorage(node={"source_id": "chunk-1"})
+    global_config = {
+        "source_ids_limit_method": SOURCE_IDS_LIMIT_METHOD_KEEP,
+        "max_source_ids_per_entity": 20,
+    }
+
+    result = await _merge_nodes_then_upsert(
+        entity_name="LegacyEntity",
+        nodes_data=[],
+        knowledge_graph_inst=graph,
+        entity_vdb=None,
+        global_config=global_config,
+    )
+
+    assert result["description"] == "Entity LegacyEntity"
+    assert graph.upserted_nodes[-1][1]["description"] == "Entity LegacyEntity"
+
+
+@pytest.mark.asyncio
+async def test_acreate_entity_rejects_empty_description():
+    with pytest.raises(ValueError, match="description cannot be empty"):
+        await utils_graph.acreate_entity(
+            chunk_entity_relation_graph=None,
+            entities_vdb=None,
+            relationships_vdb=None,
+            entity_name="EntityA",
+            entity_data={"description": "   "},
+        )
+
+
+@pytest.mark.asyncio
+async def test_acreate_relation_rejects_empty_description():
+    with pytest.raises(ValueError, match="description cannot be empty"):
+        await utils_graph.acreate_relation(
+            chunk_entity_relation_graph=None,
+            entities_vdb=None,
+            relationships_vdb=None,
+            source_entity="A",
+            target_entity="B",
+            relation_data={"description": ""},
+        )
+
+
+@pytest.mark.asyncio
+async def test_aedit_entity_rejects_empty_description():
+    with pytest.raises(ValueError, match="description cannot be empty"):
+        await utils_graph.aedit_entity(
+            chunk_entity_relation_graph=None,
+            entities_vdb=None,
+            relationships_vdb=None,
+            entity_name="EntityA",
+            updated_data={"description": None},
+        )
+
+
+@pytest.mark.asyncio
+async def test_aedit_relation_rejects_empty_description():
+    with pytest.raises(ValueError, match="description cannot be empty"):
+        await utils_graph.aedit_relation(
+            chunk_entity_relation_graph=None,
+            entities_vdb=None,
+            relationships_vdb=None,
+            source_entity="A",
+            target_entity="B",
+            updated_data={"description": "   "},
+        )
+
+
+@pytest.mark.asyncio
+async def test_aedit_entity_allows_updates_without_description(monkeypatch):
+    async def fake_edit_impl(*args, **kwargs):
+        return {"entity_name": "EntityA", "description": "kept", "source_id": "chunk-1"}
+
+    monkeypatch.setattr(
+        utils_graph, "get_storage_keyed_lock", lambda *a, **k: _NoopLock()
+    )
+    monkeypatch.setattr(utils_graph, "_edit_entity_impl", fake_edit_impl)
+
+    result = await utils_graph.aedit_entity(
+        chunk_entity_relation_graph=None,
+        entities_vdb=_DummyVectorStorage(),
+        relationships_vdb=_DummyVectorStorage(),
+        entity_name="EntityA",
+        updated_data={"entity_type": "ORG"},
+    )
+
+    assert result["operation_summary"]["operation_status"] == "success"
+
+
+def test_four_part_entity_row_remains_entity():
+    record = _normalize_text_extraction_record_attributes(
+        ["entity", "Alice", "Person", "Alice is the founder of Acme Corp."],
+        chunk_key="chunk-1",
+    )
+
+    entity = _handle_single_entity_extraction(
+        record,
+        chunk_key="chunk-1",
+        timestamp=1,
+    )
+
+    assert entity is not None
+    assert entity["entity_name"] == "Alice"
+
+
+def test_malformed_recovered_relation_still_fails():
+    record = _normalize_text_extraction_record_attributes(
+        ["entity", "Alice", "Acme Corp", "founded", "   "],
+        chunk_key="chunk-1",
+    )
+
+    relation = _handle_single_relationship_extraction(
+        record,
+        chunk_key="chunk-1",
+        timestamp=1,
+    )
+
+    assert relation is None
+
+
+def test_unrelated_five_part_prefix_remains_invalid():
+    record = _normalize_text_extraction_record_attributes(
+        ["edge", "Alice", "Acme Corp", "founded", "Alice founded Acme Corp."],
+        chunk_key="chunk-1",
+    )
+
+    relation = _handle_single_relationship_extraction(
+        record,
+        chunk_key="chunk-1",
+        timestamp=1,
+    )
+
+    assert relation is None
+
+
+@pytest.mark.asyncio
+async def test_merge_entities_preserves_file_path_in_vector_updates(monkeypatch):
+    graph = _DummyMergeGraphStorage()
+    entities_vdb = _DummyVectorStorage()
+    relationships_vdb = _DummyVectorStorage()
+
+    async def fake_get_entity_info(*args, **kwargs):
+        return {"entity_name": "Canonical"}
+
+    monkeypatch.setattr(utils_graph, "get_entity_info", fake_get_entity_info)
+
+    await utils_graph._merge_entities_impl(
+        chunk_entity_relation_graph=graph,
+        entities_vdb=entities_vdb,
+        relationships_vdb=relationships_vdb,
+        source_entities=["Alias", "Canonical"],
+        target_entity="Canonical",
+    )
+
+    relationship_payload = relationships_vdb.upserts[-1]
+    entity_payload = entities_vdb.upserts[-1]
+
+    assert next(iter(relationship_payload.values()))["file_path"] == "rel.md"
+    assert set(
+        next(iter(entity_payload.values()))["file_path"].split(GRAPH_FIELD_SEP)
+    ) == {
+        "alias.md",
+        "canonical.md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_merge_response_is_built_from_graph_without_reading_vdb():
+    graph = _DummyMergeGraphStorage()
+    entities_vdb = _DummyVectorStorage()
+    relationships_vdb = _DummyVectorStorage()
+
+    vdb_reads = []
+    inner_get_by_id = entities_vdb.get_by_id
+
+    async def _tracked_get_by_id(id_):
+        vdb_reads.append(id_)
+        return await inner_get_by_id(id_)
+
+    entities_vdb.get_by_id = _tracked_get_by_id
+
+    result = await utils_graph._merge_entities_impl(
+        chunk_entity_relation_graph=graph,
+        entities_vdb=entities_vdb,
+        relationships_vdb=relationships_vdb,
+        source_entities=["Alias", "Canonical"],
+        target_entity="Canonical",
+    )
+
+    assert "graph_data" in result
+    assert "vector_data" not in result
+    assert vdb_reads == []
+
+
+@pytest.mark.asyncio
+async def test_aedit_entity_merge_propagates_consistency_error(monkeypatch):
+    graph = _DummyMergeGraphStorage()
+    entities_vdb = _DummyVectorStorage()
+    relationships_vdb = _DummyVectorStorage()
+
+    async def _boom():
+        raise RuntimeError("embedder down")
+
+    relationships_vdb.index_done_callback = _boom
+
+    async def _single_attempt(operation, **kwargs):
+        await operation()
+
+    monkeypatch.setattr(
+        utils_graph, "safe_vdb_operation_with_exception", _single_attempt
+    )
+    monkeypatch.setattr(
+        utils_graph, "get_storage_keyed_lock", lambda *a, **k: _NoopLock()
+    )
+
+    async def fake_get_entity_info(*args, **kwargs):
+        return {"entity_name": "Canonical"}
+
+    monkeypatch.setattr(utils_graph, "get_entity_info", fake_get_entity_info)
+
+    with pytest.raises(VectorStorageConsistencyError) as excinfo:
+        await utils_graph.aedit_entity(
+            chunk_entity_relation_graph=graph,
+            entities_vdb=entities_vdb,
+            relationships_vdb=relationships_vdb,
+            entity_name="Alias",
+            updated_data={"entity_name": "Canonical"},
+            allow_rename=True,
+            allow_merge=True,
+        )
+
+    assert "lightrag-rebuild-vdb" in str(excinfo.value)
+    assert "Alias" in graph.nodes

@@ -22,7 +22,7 @@ module-level state, not about the environment — see `_pin_auth_profile`.
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.api.test_workspace_entry_mount import (
+from tests.api.test_webui_and_docs import (
     _ENV_VARS_TO_ISOLATE,
     _build_app,
     _stage_build,

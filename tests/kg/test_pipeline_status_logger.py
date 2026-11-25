@@ -1,45 +1,197 @@
-"""Unit tests for the operation-scoped ``PipelineStatusLogger``.
+"""Unit tests for ``PipelineStatusLogger`` and the bounded pipeline-history funnel.
 
 Coverage:
-
-  - history-handle caching: the first write fetches
-    ``pipeline_status.get("history_messages")`` exactly once; later writes
-    reuse the cached handle (the counting double proves the ``.get()`` is
-    cached — it does NOT claim to count total Manager round-trips);
-  - cache recovery: a failed/None fetch is retried on the next write, a
-    failed ``extend`` drops the cache, and messages of the failed call are
-    never re-sent;
-  - history identity: in-place resets (``del h[:]`` / ``h[:] = [...]``) keep
-    the cached handle live, while replacing the list object orphans it (the
-    documented limitation, pinned both ways);
-  - never-raise contract for ``log``, including a failing diagnostic logger;
-  - real Manager proxies: a fork-inherited cached ListProxy stays writable in
-    the child and visible in the parent, and concurrent cached-handle writers
-    lose no messages and never tear a multi-message group.
+- Ring-buffer message count cap and per-message UTF-8 byte cap in
+  ``append_pipeline_history`` / ``clamp_pipeline_history_message`` /
+  ``PipelineStatusLogger``, plus package-wide guard against raw
+  ``["history_messages"].append(...)`` writes.
+- History-handle caching, cache recovery on fetch/extend errors, in-place reset
+  identity preservation vs. replacement orphaning, and never-raise contract.
+- Real Manager ``DictProxy`` / ``ListProxy`` fork inheritance and concurrent
+  group integrity.
 """
 
+from __future__ import annotations
+
+import copy
 import logging
 import multiprocessing as mp
+import re
+from pathlib import Path
 
 import pytest
 
-from lightrag.kg.shared_storage import PipelineStatusLogger
+from lightrag.constants import (
+    PIPELINE_HISTORY_MAX_MESSAGES,
+    PIPELINE_HISTORY_MESSAGE_MAX_BYTES,
+)
+from lightrag.kg import shared_storage
+from lightrag.kg.shared_storage import (
+    PipelineStatusLogger,
+    append_pipeline_history,
+    clamp_pipeline_history_message,
+)
 
 pytestmark = pytest.mark.offline
 
+_INTERVAL = shared_storage._HISTORY_TRIM_CHECK_INTERVAL
+
+
+@pytest.fixture(autouse=True)
+def _reset_trim_counter():
+    """Reset the amortized trim counter between tests."""
+    shared_storage._history_appends_since_trim = 0
+    yield
+    shared_storage._history_appends_since_trim = 0
+
 
 # ---------------------------------------------------------------------------
-# Test doubles.
+# Bounded pipeline status history funnel
+# ---------------------------------------------------------------------------
+
+
+def test_a_writer_that_never_reaches_the_extraction_loop_is_still_bounded():
+    history = []
+    status = {"history_messages": history}
+
+    total = PIPELINE_HISTORY_MAX_MESSAGES + 3 * _INTERVAL
+    for i in range(total):
+        append_pipeline_history(status, f"deleting document {i}")
+
+    assert len(history) <= PIPELINE_HISTORY_MAX_MESSAGES + _INTERVAL
+    assert history[-1] == f"deleting document {total - 1}"
+    assert "deleting document 0" not in history
+    assert status["history_messages"] is history
+
+
+def test_a_group_write_advances_the_bound_by_its_own_length():
+    history = []
+    status = {"history_messages": history}
+
+    group = 8
+    for i in range(0, PIPELINE_HISTORY_MAX_MESSAGES + 3 * _INTERVAL, group):
+        append_pipeline_history(status, *[f"msg {i}.{k}" for k in range(group)])
+
+    assert len(history) <= PIPELINE_HISTORY_MAX_MESSAGES + _INTERVAL
+
+
+def test_a_traceback_sized_message_is_capped():
+    history = []
+    traceback_text = "Traceback (most recent call last):\n" + (
+        '  File "lightrag/pipeline.py", line 1, in _process\n    raise RuntimeError\n'
+        * 400
+    )
+    assert len(traceback_text.encode()) > 5 * PIPELINE_HISTORY_MESSAGE_MAX_BYTES
+
+    append_pipeline_history({"history_messages": history}, traceback_text)
+
+    stored = history[0]
+    assert len(stored.encode("utf-8")) <= PIPELINE_HISTORY_MESSAGE_MAX_BYTES
+    assert stored.startswith("Traceback (most recent call last):")
+    assert f"[truncated, {len(traceback_text.encode())} bytes]" in stored
+
+
+def test_a_cjk_message_is_cut_on_a_byte_boundary():
+    message = "文档解析失败：" + "中" * 5000
+    stored = clamp_pipeline_history_message(message)
+
+    assert len(stored.encode("utf-8")) <= PIPELINE_HISTORY_MESSAGE_MAX_BYTES
+    assert stored.startswith("文档解析失败：")
+    assert "\ufffd" not in stored
+
+
+def test_a_message_at_the_cap_is_stored_verbatim():
+    message = "x" * PIPELINE_HISTORY_MESSAGE_MAX_BYTES
+    assert clamp_pipeline_history_message(message) == message
+    assert "truncated" not in clamp_pipeline_history_message("short line")
+
+
+def test_no_raw_history_append_survives_in_the_package():
+    package = Path(shared_storage.__file__).resolve().parents[1]
+    raw_append = re.compile(r'\["history_messages"\]\s*\.\s*append\(')
+
+    offenders = []
+    for path in sorted(package.rglob("*.py")):
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if raw_append.search(line) and not line.lstrip().startswith("#"):
+                offenders.append(f"{path.relative_to(package)}:{lineno}")
+
+    assert offenders == [], "route these through append_pipeline_history: " + ", ".join(
+        offenders
+    )
+
+
+@pytest.mark.parametrize("status", [None, {}], ids=["none-status", "missing-key"])
+def test_a_missing_history_is_skipped_not_raised(status):
+    before = copy.deepcopy(status)
+    append_pipeline_history(status, "message")
+    assert status == before
+
+
+def test_a_failing_extend_is_swallowed():
+    class _DeadProxy(list):
+        """ListProxy double whose ``extend`` fails as if the Manager died."""
+
+        def extend(self, _iterable):
+            raise ConnectionRefusedError("manager is gone")
+
+    history = _DeadProxy()
+    append_pipeline_history({"history_messages": history}, "message")
+    assert history == []
+
+
+def test_a_failing_len_does_not_fail_the_append():
+    class _UnmeasurableProxy(list):
+        """ListProxy double whose ``__len__`` raises during the trim check."""
+
+        def __len__(self):
+            raise BrokenPipeError("manager is gone")
+
+    history = _UnmeasurableProxy()
+    shared_storage._history_appends_since_trim = _INTERVAL - 1
+
+    append_pipeline_history({"history_messages": history}, "message")
+    assert list.__len__(history) == 1
+
+
+def test_a_non_string_message_is_coerced_not_dropped():
+    history = []
+    append_pipeline_history({"history_messages": history}, RuntimeError("boom"), 42)
+    assert history == ["boom", "42"]
+
+
+def test_the_lock_free_logger_clamps_and_trims_too():
+    history = []
+    status = {"history_messages": history}
+    status_logger = PipelineStatusLogger(status)
+
+    for i in range(PIPELINE_HISTORY_MAX_MESSAGES + 2 * _INTERVAL):
+        status_logger.log(f"entity {i}")
+    status_logger.log("失败" * 5000)
+
+    assert len(history) <= PIPELINE_HISTORY_MAX_MESSAGES + _INTERVAL
+    assert status["history_messages"] is history
+    assert len(history[-1].encode("utf-8")) <= PIPELINE_HISTORY_MESSAGE_MAX_BYTES
+
+
+def test_latest_message_is_clamped_as_well():
+    status = {"history_messages": []}
+    PipelineStatusLogger(status).log("x" * (4 * PIPELINE_HISTORY_MESSAGE_MAX_BYTES))
+    assert (
+        len(status["latest_message"].encode("utf-8"))
+        <= PIPELINE_HISTORY_MESSAGE_MAX_BYTES
+    )
+
+
+# ---------------------------------------------------------------------------
+# PipelineStatusLogger test doubles & caching / recovery / never-raise tests
 # ---------------------------------------------------------------------------
 
 
 class _CountingStatus:
-    """Mapping-shaped double counting ``.get("history_messages")`` calls.
-
-    Each such call is the fetch the logger is supposed to cache. Set
-    ``history`` to None to simulate a missing/late-initialized key, and
-    ``fail_next_gets`` to make the next N fetches raise.
-    """
+    """Mapping-shaped double counting ``.get("history_messages")`` calls."""
 
     def __init__(self, history=()):
         self.get_calls = 0
@@ -78,13 +230,10 @@ class _FlakyHistory(list):
 
 
 class _RaisingSetitemStatus(_CountingStatus):
+    """Status double whose ``__setitem__`` always raises."""
+
     def __setitem__(self, key, value):
         raise RuntimeError("setitem boom")
-
-
-# ---------------------------------------------------------------------------
-# History-handle caching.
-# ---------------------------------------------------------------------------
 
 
 def test_construction_is_fetch_free():
@@ -101,7 +250,7 @@ def test_first_write_fetches_history_once_then_reuses_cached_handle():
     assert status.get_calls == 1
     for i in range(1, 11):
         status_logger.log(f"m{i}")
-    assert status.get_calls == 1  # cached handle, no re-fetch
+    assert status.get_calls == 1
     assert status.history == [f"m{i}" for i in range(11)]
     assert status.latest == "m10"
 
@@ -114,34 +263,29 @@ def test_multi_message_log_sets_latest_to_last_and_appends_in_order():
     assert status.history == ["a", "b", "c"]
 
 
-# ---------------------------------------------------------------------------
-# Cache recovery.
-# ---------------------------------------------------------------------------
-
-
 def test_get_failure_is_retried_next_write_without_resending_lost_message():
     status = _CountingStatus()
     status.fail_next_gets = 1
     status_logger = PipelineStatusLogger(status)
-    status_logger.log("lost")  # fetch raises; latest still written
+    status_logger.log("lost")
     assert status.get_calls == 1
     assert status.history == []
     assert status.latest == "lost"
-    status_logger.log("kept")  # fetch retried and now cached
+    status_logger.log("kept")
     assert status.get_calls == 2
-    assert status.history == ["kept"]  # "lost" is NOT re-sent
+    assert status.history == ["kept"]
     status_logger.log("more")
     assert status.get_calls == 2
 
 
 def test_get_returning_none_is_not_cached_and_retried_after_late_init():
     status = _CountingStatus()
-    status.history = None  # key missing / not yet initialized
+    status.history = None
     status_logger = PipelineStatusLogger(status)
     status_logger.log("lost")
     assert status.get_calls == 1
     assert status.latest == "lost"
-    status.history = []  # late initialization
+    status.history = []
     status_logger.log("kept")
     assert status.get_calls == 2
     assert status.history == ["kept"]
@@ -152,35 +296,28 @@ def test_extend_failure_drops_cache_and_refetches_without_resending():
     status = _CountingStatus()
     status.history = history
     status_logger = PipelineStatusLogger(status)
-    status_logger.log("lost")  # extend raises → cache dropped, no retry
+    status_logger.log("lost")
     assert status.get_calls == 1
     assert list(history) == []
-    status_logger.log("kept")  # re-fetches the handle
+    status_logger.log("kept")
     assert status.get_calls == 2
-    assert list(history) == ["kept"]  # "lost" is NOT re-sent
-
-
-# ---------------------------------------------------------------------------
-# History identity across in-place resets (repo invariant: never replaced).
-# ---------------------------------------------------------------------------
+    assert list(history) == ["kept"]
 
 
 def test_in_place_clear_keeps_cached_handle_live():
     status = _CountingStatus()
     status_logger = PipelineStatusLogger(status)
     status_logger.log("a")
-    # Reservation-style reset (acquire_processing_reservation).
     del status.history[:]
     status_logger.log("b")
     assert status.history == ["b"]
-    assert status.get_calls == 1  # no re-fetch needed
+    assert status.get_calls == 1
 
 
 def test_in_place_slice_assignment_keeps_cached_handle_live():
     status = _CountingStatus()
     status_logger = PipelineStatusLogger(status)
     status_logger.log("a")
-    # Document-routes-style reset.
     status.history[:] = ["preset"]
     status_logger.log("c")
     assert status.history == ["preset", "c"]
@@ -188,41 +325,27 @@ def test_in_place_slice_assignment_keeps_cached_handle_live():
 
 
 def test_replacing_history_object_orphans_the_cache():
-    """Pins the documented limitation: replacing ``history_messages`` (which
-    violates the in-place-only repo invariant) leaves the logger writing to
-    the orphaned list."""
     status = _CountingStatus()
     status_logger = PipelineStatusLogger(status)
     status_logger.log("a")
     old_history = status.history
-    status.history = []  # invariant violation: replaced, not reset in place
+    status.history = []
     status_logger.log("b")
-    assert old_history == ["a", "b"]  # went to the orphan
+    assert old_history == ["a", "b"]
     assert status.history == []
 
 
-# ---------------------------------------------------------------------------
-# Never-raise contract.
-# ---------------------------------------------------------------------------
-
-
-def test_none_status_is_noop():
-    status_logger = PipelineStatusLogger(None)
-    status_logger.log("x")
-
-
-def test_no_messages_is_noop_and_fetch_free():
+def test_none_status_and_empty_log_are_noops():
+    PipelineStatusLogger(None).log("x")
     status = _CountingStatus()
-    status_logger = PipelineStatusLogger(status)
-    status_logger.log()
+    PipelineStatusLogger(status).log()
     assert status.get_calls == 0
     assert status.latest is None
 
 
 def test_never_raises_when_setitem_fails_but_still_appends_history():
     status = _RaisingSetitemStatus()
-    status_logger = PipelineStatusLogger(status)
-    status_logger.log("a", "b")  # must not raise
+    PipelineStatusLogger(status).log("a", "b")
     assert status.history == ["a", "b"]
 
 
@@ -233,16 +356,14 @@ def test_never_raises_even_when_diagnostic_logging_itself_fails(monkeypatch):
     monkeypatch.setattr(logging.getLogger("lightrag"), "debug", _boom_debug)
     status = _CountingStatus()
     status.fail_next_gets = 1
-    status_logger = PipelineStatusLogger(status)
-    # Both the fetch AND its diagnostic logging fail — still must not raise.
-    status_logger.log("a")
-    assert status.fail_next_gets == 0  # the injected fetch failure was hit
-    assert status.latest == "a"  # written before the failing fetch
-    assert status.history == []  # fetch failed, so the append was skipped
+    PipelineStatusLogger(status).log("a")
+    assert status.fail_next_gets == 0
+    assert status.latest == "a"
+    assert status.history == []
 
 
 # ---------------------------------------------------------------------------
-# Real Manager DictProxy / ListProxy backing path.
+# Real Manager DictProxy / ListProxy backing path
 # ---------------------------------------------------------------------------
 
 
@@ -269,14 +390,11 @@ def _child_logs(status_logger, message):
     r"to deadlocks in the child\.:DeprecationWarning"
 )
 def test_fork_inherited_cached_proxy_writes_visible_in_parent():
-    """A logger whose history handle was cached BEFORE the fork keeps working
-    in the child (BaseProxy re-registers its connection after fork) and the
-    child's writes are visible to the parent."""
     mgr = _FORK.Manager()
     try:
         status = mgr.dict({"latest_message": "", "history_messages": mgr.list()})
         status_logger = PipelineStatusLogger(status)
-        status_logger.log("parent-1")  # warms the cache in the parent
+        status_logger.log("parent-1")
         proc = _FORK.Process(target=_child_logs, args=(status_logger, "child-1"))
         proc.start()
         proc.join(timeout=30)
@@ -288,8 +406,6 @@ def test_fork_inherited_cached_proxy_writes_visible_in_parent():
 
 
 def _mp_cached_writer(status, prefix, n):
-    # One logger per process: after the first call every write goes through
-    # the cached ListProxy, so this pins the cached-handle path specifically.
     status_logger = PipelineStatusLogger(status)
     for i in range(n):
         status_logger.log(f"{prefix}-{i}-begin", f"{prefix}-{i}-end")
@@ -301,8 +417,6 @@ def _mp_cached_writer(status, prefix, n):
     r"to deadlocks in the child\.:DeprecationWarning"
 )
 def test_concurrent_cached_writers_lose_no_messages_and_groups_stay_intact():
-    """Concurrent multi-message ``extend`` on cached ListProxies from several
-    processes never drops a message NOR tears a group."""
     mgr = _FORK.Manager()
     try:
         status = mgr.dict({"latest_message": "", "history_messages": mgr.list()})

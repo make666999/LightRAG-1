@@ -18,20 +18,22 @@ primary at all, which the repair endpoint cannot settle.
 from __future__ import annotations
 
 import asyncio
-from uuid import uuid4
 
-import numpy as np
 import pytest
 
 from lightrag import LightRAG
 from lightrag.base import DocStatus
 from lightrag.kg.json_doc_status_impl import JsonDocStatusStorage
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
-from lightrag.utils import EmbeddingFunc, Tokenizer, compute_mdhash_id
+from lightrag.utils import compute_mdhash_id
 from lightrag.utils_pipeline import (
+    compute_text_content_hash,
     get_duplicate_doc_by_content_hash,
     get_existing_doc_by_content_hash,
+    normalize_merged_text_for_hash,
 )
+
+from ._fakes import build_initialized_rag, raw_single_chunk_chunking
 
 pytestmark = pytest.mark.offline
 
@@ -43,47 +45,13 @@ class _DummyEmbeddingFunc:
         return [[0.0] * 8 for _ in texts]
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*args, **kwargs) -> str:
-    return "ok"
-
-
-def _chunking(
-    tokenizer,
-    content,
-    split_by_character,
-    split_by_character_only,
-    chunk_overlap_token_size,
-    chunk_token_size,
-) -> list[dict]:
-    return [{"tokens": 1, "content": content, "chunk_order_index": 0}]
-
-
 async def _build_rag(tmp_path) -> LightRAG:
-    rag = LightRAG(
-        working_dir=str(tmp_path / "wd"),
-        workspace=f"chd-{uuid4().hex[:8]}",
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
-        chunking_func=_chunking,
+    return await build_initialized_rag(
+        tmp_path,
+        workspace_prefix="chd",
+        chunking_func=raw_single_chunk_chunking,
         max_parallel_insert=1,
     )
-    await rag.initialize_storages()
-    return rag
 
 
 @pytest.fixture(autouse=True)
@@ -474,3 +442,49 @@ def test_the_repair_and_duplicate_marking_are_linearized_by_the_source_lock(tmp_
             await rag.finalize_storages()
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Cross-filename content_hash dedup via merged_text normalization
+# ---------------------------------------------------------------------------
+
+
+def _render_sidecar_merged_text(doc_hash: str, base_name: str) -> str:
+    return (
+        "标题 1\n\n"
+        f'正文段落引用表格 <table id="tb-{doc_hash}-0001" format="json">[[]]</table>。\n\n'
+        f'<drawing id="im-{doc_hash}-0001" format="png" '
+        f'path="{base_name}.blocks.assets/image1.png" src="rId4" />\n\n'
+        f'<equation id="eq-{doc_hash}-0001" format="latex">E=mc^2</equation>'
+    )
+
+
+def test_same_content_different_filename_dedupes():
+    text_a = _render_sidecar_merged_text("a" * 32, "report-A")
+    text_b = _render_sidecar_merged_text("b" * 32, "report-B")
+    assert text_a != text_b, "sanity: raw bodies must differ"
+    assert compute_text_content_hash(text_a) == compute_text_content_hash(text_b)
+
+
+def test_different_content_still_distinguishes():
+    text_a = _render_sidecar_merged_text("a" * 32, "doc-A") + "\n\n附加段落 X"
+    text_b = _render_sidecar_merged_text("a" * 32, "doc-A") + "\n\n附加段落 Y"
+    assert compute_text_content_hash(text_a) != compute_text_content_hash(text_b)
+
+
+def test_plain_text_unaffected():
+    plain = "纯文本上传，没有任何 sidecar 标签。"
+    assert normalize_merged_text_for_hash(plain) == plain
+
+
+def test_asset_filename_still_distinguishes():
+    h = "c" * 32
+    text_a = (
+        f'<drawing id="im-{h}-0001" format="png" '
+        f'path="doc.blocks.assets/image1.png" src="r1" />'
+    )
+    text_b = (
+        f'<drawing id="im-{h}-0001" format="png" '
+        f'path="doc.blocks.assets/image2.png" src="r1" />'
+    )
+    assert compute_text_content_hash(text_a) != compute_text_content_hash(text_b)

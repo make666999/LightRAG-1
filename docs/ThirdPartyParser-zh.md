@@ -214,4 +214,4 @@ API 上传时显式传 `parse_engine="myengine"` 则直接固定该引擎(存入
 
 - **单测引擎本体**:绕开 CLI,直接 `get_parser("myengine").parse(ParseContext(fake_rag, doc_id, file_path, content_data))`。`fake_rag` 只需提供 `_persist_parsed_full_docs` / `_resolve_source_file_for_parser` / `full_docs` / `doc_status`(参考 `lightrag/parser/debug.py` 的 `build_debug_rag()`,或 `tests/parser/test_legacy_parser.py` 的极简 `_FakeRag`);
 - **注册表是模块级单例**:测试中 `register_parser` 后,用 `finally: registry._REGISTRY.pop("myengine", None)` 清理(参考 `tests/parser/test_registry.py`);
-- **entry-point 加载逻辑**:参考 `tests/parser/test_plugins.py`(monkeypatch `lightrag.parser.plugins.entry_points` 注入 fake entry point;`plugins._loaded` 标志需复位)。
+- **entry-point 加载逻辑**:参考 `tests/parser/test_registry.py`(monkeypatch `lightrag.parser.plugins.entry_points` 注入 fake entry point;`plugins._loaded` 标志需复位)。

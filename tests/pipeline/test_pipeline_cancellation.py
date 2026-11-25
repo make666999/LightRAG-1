@@ -27,10 +27,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
-import numpy as np
 import pytest
 
-from lightrag import LightRAG, ROLES, RoleLLMConfig
+from lightrag import ROLES, LightRAG, RoleLLMConfig
 from lightrag.base import DocProcessingStatus, DocStatus
 from lightrag.exceptions import MultimodalAnalysisError, PipelineCancelledException
 from lightrag.kg.shared_storage import (
@@ -38,30 +37,14 @@ from lightrag.kg.shared_storage import (
     get_namespace_lock,
     get_pipeline_ingress,
 )
-from lightrag.pipeline import _BatchRunContext
 from lightrag.parser.exceptions import ParsePipelineCancelled
 from lightrag.parser.llm_bridge import SyncLLMBridge
 from lightrag.parser.registry import parser_specs_snapshot
-from lightrag.utils import EmbeddingFunc, Tokenizer
+from lightrag.pipeline import _BatchRunContext
 
+from ._fakes import PNG_BYTES, make_lightrag, noop_llm, shutdown_role_workers
 
 pytestmark = pytest.mark.offline
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _mock_embedding(texts: list[str]) -> np.ndarray:
-    return np.random.rand(len(texts), 8)
-
-
-async def _noop_llm(prompt, **kwargs):  # pragma: no cover - never invoked
-    return ""
 
 
 def _build_rag(tmp_path: Path, *, vlm_func=None) -> LightRAG:
@@ -71,40 +54,25 @@ def _build_rag(tmp_path: Path, *, vlm_func=None) -> LightRAG:
             role_configs[spec.name] = RoleLLMConfig(func=vlm_func)
         else:
             role_configs[spec.name] = RoleLLMConfig()
-    return LightRAG(
-        working_dir=str(tmp_path),
+    return make_lightrag(
+        tmp_path,
+        subdir=None,
         workspace=f"cancel-{tmp_path.name}",
-        llm_model_func=vlm_func or _noop_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8,
-            max_token_size=1024,
-            func=_mock_embedding,
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        llm_model_func=vlm_func or noop_llm,
+        max_token_size=1024,
         vlm_process_enable=True,
         role_llm_configs=role_configs,
     )
 
 
 async def _shutdown_role_workers(rag: LightRAG) -> None:
-    """Explicitly shut down each role wrapper's priority-queue workers.
-
-    finalize_storages() only finalizes storages — it does NOT touch the
-    per-role priority_limit worker pools. If a test triggered any role
-    LLM calls whose worker is still in ``await asyncio.sleep(...)`` when
-    pytest closes the function-scoped event loop, the leaked worker
-    tasks raise "Task was destroyed but it is pending" / "Event loop is
-    closed" and (worse, observed on macOS Python 3.12) prevent the
-    pytest process from exiting cleanly. Call this before
-    ``finalize_storages()`` to drain workers under a live loop first.
-    """
-    for func in rag.role_llm_funcs.values():
-        try:
-            await rag._shutdown_llm_wrapper(func)
-        except Exception as exc:
-            logging.getLogger("lightrag").warning(
-                f"role worker shutdown raised during test teardown: {exc}"
-            )
+    """Explicitly shut down each role wrapper's priority-queue workers."""
+    try:
+        await shutdown_role_workers(rag)
+    except Exception as exc:
+        logging.getLogger("lightrag").warning(
+            f"role worker shutdown raised during test teardown: {exc}"
+        )
 
 
 async def _make_ctx(rag: LightRAG) -> tuple[_BatchRunContext, dict, Any]:
@@ -482,8 +450,6 @@ async def test_analyze_multimodal_inflight_cancellation_polls_flag(tmp_path):
 
         # The real _analyze_drawing closure runs and validates the image
         # bytes before calling the VLM, so give each item a minimal PNG.
-        from .test_pipeline_analyze_multimodal import PNG_BYTES
-
         for letter in ("A", "B", "C"):
             (tmp_path / "parsed" / f"im-{letter}.png").write_bytes(PNG_BYTES)
         sidecar_path.write_text(
@@ -587,7 +553,6 @@ async def test_analyze_multimodal_fail_fast_preserves_successes(tmp_path):
     analyze_multimodal must not wait for the blocked item,
     must preserve the completed item's result in the sidecar, and must
     raise MultimodalAnalysisError (not PipelineCancelledException)."""
-    from .test_pipeline_analyze_multimodal import PNG_BYTES
 
     parsed_dir = tmp_path / "parsed"
     parsed_dir.mkdir()
@@ -732,7 +697,6 @@ async def test_analyze_multimodal_pre_schedule_cancellation_skips_task_creation(
     early-raise implementation from a poll-then-cancel implementation
     that would still construct and immediately cancel each task.
     """
-    from .test_pipeline_analyze_multimodal import PNG_BYTES
 
     parsed_dir = tmp_path / "parsed"
     parsed_dir.mkdir()

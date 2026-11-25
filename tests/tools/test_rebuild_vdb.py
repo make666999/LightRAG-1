@@ -615,93 +615,46 @@ def single_attempt_vdb_ops(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_merge_relation_vdb_delete_failure_raises_consistency_error(
-    single_attempt_vdb_ops,
+@pytest.mark.parametrize(
+    "fault_point",
+    [
+        "relation_delete",
+        "relation_upsert",
+        "entity_upsert",
+        "source_entity_delete",
+        "relation_deferred_flush",
+        "entity_deferred_flush",
+    ],
+)
+async def test_merge_pre_delete_vdb_failure_raises_consistency_error(
+    single_attempt_vdb_ops, fault_point
 ):
-    # The step-7 delete of stale relation records runs after the graph is
-    # updated; a failure there must fail loud (and not be swallowed upstream).
+    """Any VDB failure before source-node deletion (step 10) fails loud with
+    ``VectorStorageConsistencyError`` and leaves the graph's source nodes intact."""
     from lightrag.utils_graph import _merge_entities_impl
 
     graph = make_merge_graph()
     entities_vdb = MockVDB()
     relationships_vdb = MockVDB()
-    relationships_vdb.delete = AsyncMock(side_effect=RuntimeError("vdb delete down"))
 
-    with pytest.raises(VectorStorageConsistencyError) as excinfo:
-        await _merge_entities_impl(
-            graph, entities_vdb, relationships_vdb, ["Bob"], "Alice"
+    if fault_point == "relation_delete":
+        relationships_vdb.delete = AsyncMock(
+            side_effect=RuntimeError("vdb delete down")
         )
-
-    assert "lightrag-rebuild-vdb" in str(excinfo.value)
-    relationships_vdb.delete.assert_awaited()
-    # Failure is before source-entity deletion (step 10)
-    graph.delete_node.assert_not_awaited()
-    entities_vdb.delete.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_merge_relation_vdb_failure_raises_consistency_error(
-    single_attempt_vdb_ops,
-):
-    from lightrag.utils_graph import _merge_entities_impl
-
-    graph = make_merge_graph()
-    entities_vdb = MockVDB()
-    relationships_vdb = MockVDB()
-    relationships_vdb.upsert = AsyncMock(side_effect=RuntimeError("embedder down"))
-
-    with pytest.raises(VectorStorageConsistencyError) as excinfo:
-        await _merge_entities_impl(
-            graph, entities_vdb, relationships_vdb, ["Bob"], "Alice"
+    elif fault_point == "relation_upsert":
+        relationships_vdb.upsert = AsyncMock(side_effect=RuntimeError("embedder down"))
+    elif fault_point == "entity_upsert":
+        entities_vdb.upsert = AsyncMock(side_effect=RuntimeError("embedder down"))
+    elif fault_point == "source_entity_delete":
+        entities_vdb.delete = AsyncMock(side_effect=RuntimeError("vdb delete down"))
+    elif fault_point == "relation_deferred_flush":
+        relationships_vdb.index_done_callback = AsyncMock(
+            side_effect=RuntimeError("embedder down")
         )
-
-    # Fail-loud guidance in the message
-    assert "lightrag-rebuild-vdb" in str(excinfo.value)
-    # Graph state was written and is kept (no rollback)
-    graph.upsert_edge.assert_awaited()
-    # Source entities were NOT deleted (step 10 never reached)
-    graph.delete_node.assert_not_awaited()
-    entities_vdb.delete.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_merge_entity_vdb_failure_raises_consistency_error(
-    single_attempt_vdb_ops,
-):
-    from lightrag.utils_graph import _merge_entities_impl
-
-    graph = make_merge_graph()
-    entities_vdb = MockVDB()
-    relationships_vdb = MockVDB()
-    entities_vdb.upsert = AsyncMock(side_effect=RuntimeError("embedder down"))
-
-    with pytest.raises(VectorStorageConsistencyError) as excinfo:
-        await _merge_entities_impl(
-            graph, entities_vdb, relationships_vdb, ["Bob"], "Alice"
+    elif fault_point == "entity_deferred_flush":
+        entities_vdb.index_done_callback = AsyncMock(
+            side_effect=RuntimeError("embedder down")
         )
-
-    assert "lightrag-rebuild-vdb" in str(excinfo.value)
-    # Relation VDB write succeeded before the entity failure
-    relationships_vdb.upsert.assert_awaited()
-    graph.delete_node.assert_not_awaited()
-    entities_vdb.delete.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_merge_source_entity_delete_failure_raises_consistency_error(
-    single_attempt_vdb_ops,
-):
-    # Step 10 deletes the source entities' vector records BEFORE removing their
-    # nodes, so a delete failure here leaves the graph untouched: the sources
-    # are still present with their chunk tracking intact and a retry is safe.
-    # It still fails loud -- vector records deleted before the failure leave
-    # those entities without an embedding until a retry or an offline rebuild.
-    from lightrag.utils_graph import _merge_entities_impl
-
-    graph = make_merge_graph()
-    entities_vdb = MockVDB()
-    relationships_vdb = MockVDB()
-    entities_vdb.delete = AsyncMock(side_effect=RuntimeError("vdb delete down"))
 
     with pytest.raises(VectorStorageConsistencyError) as excinfo:
         await _merge_entities_impl(
@@ -710,12 +663,28 @@ async def test_merge_source_entity_delete_failure_raises_consistency_error(
 
     message = str(excinfo.value)
     assert "lightrag-rebuild-vdb" in message
-    # The node removal never ran, and the message must say so: claiming the
-    # source was already gone would send an operator looking for a repair that
-    # is not owed, and would hide that a plain retry is the fix.
     graph.delete_node.assert_not_awaited()
-    assert "were NOT removed from the knowledge graph" in message
-    entities_vdb.delete.assert_awaited()
+
+    if fault_point == "relation_delete":
+        relationships_vdb.delete.assert_awaited()
+        entities_vdb.delete.assert_not_awaited()
+    elif fault_point == "relation_upsert":
+        graph.upsert_edge.assert_awaited()
+        entities_vdb.delete.assert_not_awaited()
+    elif fault_point == "entity_upsert":
+        relationships_vdb.upsert.assert_awaited()
+        entities_vdb.delete.assert_not_awaited()
+    elif fault_point == "source_entity_delete":
+        entities_vdb.delete.assert_awaited()
+        assert "were NOT removed from the knowledge graph" in message
+    elif fault_point == "relation_deferred_flush":
+        relationships_vdb.upsert.assert_awaited()
+        relationships_vdb.index_done_callback.assert_awaited()
+        entities_vdb.delete.assert_not_awaited()
+    elif fault_point == "entity_deferred_flush":
+        relationships_vdb.index_done_callback.assert_awaited()
+        entities_vdb.index_done_callback.assert_awaited()
+        entities_vdb.delete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -781,63 +750,6 @@ async def test_merge_success_path_unaffected(single_attempt_vdb_ops):
     graph.delete_node.assert_awaited_with("Bob")
 
 
-@pytest.mark.asyncio
-async def test_merge_deferred_flush_failure_raises_before_delete(
-    single_attempt_vdb_ops,
-):
-    # Deferred-embedding backends (nano/faiss) buffer in upsert() and only embed
-    # in index_done_callback, so an embedder outage surfaces at flush time. The
-    # fail-loud guarantee must still hold: raise before deleting source entities.
-    from lightrag.utils_graph import _merge_entities_impl
-
-    graph = make_merge_graph()
-    entities_vdb = MockVDB()
-    relationships_vdb = MockVDB()
-    # upsert succeeds (buffers); the embedding failure happens at flush.
-    relationships_vdb.index_done_callback = AsyncMock(
-        side_effect=RuntimeError("embedder down")
-    )
-
-    with pytest.raises(VectorStorageConsistencyError) as excinfo:
-        await _merge_entities_impl(
-            graph, entities_vdb, relationships_vdb, ["Bob"], "Alice"
-        )
-
-    assert "lightrag-rebuild-vdb" in str(excinfo.value)
-    # upsert succeeded; the failure is the deferred flush
-    relationships_vdb.upsert.assert_awaited()
-    relationships_vdb.index_done_callback.assert_awaited()
-    # Source entities NOT deleted (step 10 never reached), so the message holds
-    graph.delete_node.assert_not_awaited()
-    entities_vdb.delete.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_merge_entity_deferred_flush_failure_raises_before_delete(
-    single_attempt_vdb_ops,
-):
-    from lightrag.utils_graph import _merge_entities_impl
-
-    graph = make_merge_graph()
-    entities_vdb = MockVDB()
-    relationships_vdb = MockVDB()
-    entities_vdb.index_done_callback = AsyncMock(
-        side_effect=RuntimeError("embedder down")
-    )
-
-    with pytest.raises(VectorStorageConsistencyError) as excinfo:
-        await _merge_entities_impl(
-            graph, entities_vdb, relationships_vdb, ["Bob"], "Alice"
-        )
-
-    assert "lightrag-rebuild-vdb" in str(excinfo.value)
-    # Relation flush succeeded before the entity flush failed
-    relationships_vdb.index_done_callback.assert_awaited()
-    entities_vdb.index_done_callback.assert_awaited()
-    graph.delete_node.assert_not_awaited()
-    entities_vdb.delete.assert_not_awaited()
-
-
 # ---------------------------------------------------------------------------
 # Setup: check-only (no api extra) stub embedding function
 # ---------------------------------------------------------------------------
@@ -864,22 +776,35 @@ def _register_json_workspace_for_fakes(working_dir: str, workspace: str) -> list
 
 
 @pytest.mark.asyncio
-async def test_check_only_stub_carries_embedding_model_name(monkeypatch):
-    # When the api extra is unavailable the tool runs check-only with a stub
-    # embedding function. Qdrant/PostgreSQL locate the collection/table from
-    # model_name + embedding_dim, so the stub must carry the configured
-    # EMBEDDING_MODEL — otherwise check-only probes the legacy-named collection
-    # and misreports records as missing.
+@pytest.mark.parametrize(
+    "env_model, env_dim, expected_model, expected_dim",
+    [
+        pytest.param(
+            "text-embedding-3-large",
+            "3072",
+            "text-embedding-3-large",
+            3072,
+            id="configured_model_and_dim",
+        ),
+        pytest.param(None, None, None, None, id="unset_model_is_none"),
+    ],
+)
+async def test_check_only_stub_embedding_model_name(
+    monkeypatch, env_model, env_dim, expected_model, expected_dim
+):
+    """In check-only mode (no api extra), the stub embedding carries
+    ``EMBEDDING_MODEL`` / ``EMBEDDING_DIM`` when set, or ``None`` when unset."""
     import lightrag.kg.factory as kg_factory
     from lightrag.tools.rebuild_vdb import RebuildTool
 
-    monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-3-large")
-    monkeypatch.setenv("EMBEDDING_DIM", "3072")
+    if env_model is None:
+        monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("EMBEDDING_MODEL", env_model)
+    if env_dim is not None:
+        monkeypatch.setenv("EMBEDDING_DIM", env_dim)
 
     captured_funcs = []
-
-    # The JSON configuration workspace must be registered, as a server start
-    # leaves it: the tool never registers one itself.
     shard_rows = _register_json_workspace_for_fakes(os.environ["WORKING_DIR"], "")
 
     class _DummyStorage(_FakeConfigStorage):
@@ -897,46 +822,15 @@ async def test_check_only_stub_carries_embedding_model_name(monkeypatch):
     monkeypatch.setattr(kg_factory, "get_storage_class", lambda name: _DummyStorage)
 
     tool = RebuildTool()
-    # Simulate the api extra being unavailable (check-only mode).
-    monkeypatch.setattr(tool, "build_embedding_func", lambda: None)
-
-    ok = await tool.setup_storages()
-
-    assert ok is True
-    assert tool.embedding_available is False
-    assert tool.embedding_func.model_name == "text-embedding-3-large"
-    assert tool.embedding_func.embedding_dim == 3072
-    # Every storage received the stub carrying the configured model name.
-    assert captured_funcs
-    assert all(f.model_name == "text-embedding-3-large" for f in captured_funcs)
-
-
-@pytest.mark.asyncio
-async def test_check_only_stub_model_name_none_when_unset(monkeypatch):
-    # EMBEDDING_MODEL unset -> model_name None (provider default), matching the
-    # server factory; "None" literal is also treated as unset.
-    import lightrag.kg.factory as kg_factory
-    from lightrag.tools.rebuild_vdb import RebuildTool
-
-    monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
-    shard_rows = _register_json_workspace_for_fakes(os.environ["WORKING_DIR"], "")
-
-    class _DummyStorage(_FakeConfigStorage):
-        def iter_rows(self, *, page_size=200):
-            async def gen():
-                for row in shard_rows:
-                    yield row
-
-            return gen()
-
-    monkeypatch.setattr(kg_factory, "get_storage_class", lambda name: _DummyStorage)
-
-    tool = RebuildTool()
     monkeypatch.setattr(tool, "build_embedding_func", lambda: None)
 
     assert await tool.setup_storages() is True
-
-    assert tool.embedding_func.model_name is None
+    assert tool.embedding_available is False
+    assert tool.embedding_func.model_name == expected_model
+    if expected_dim is not None:
+        assert tool.embedding_func.embedding_dim == expected_dim
+    assert captured_funcs
+    assert all(f.model_name == expected_model for f in captured_funcs)
 
 
 # ---------------------------------------------------------------------------
@@ -959,78 +853,67 @@ def _runnable_tool(monkeypatch, inputs):
 
 
 @pytest.mark.asyncio
-async def test_run_returns_true_on_user_cancel(monkeypatch):
-    tool = _runnable_tool(monkeypatch, iter([]))
-    monkeypatch.setattr(tool, "confirm_server_stopped", lambda: False)
-    tool.setup_storages = AsyncMock(return_value=True)
+@pytest.mark.parametrize(
+    "scenario, expected",
+    [
+        ("user_cancel", True),
+        ("setup_failure", False),
+        ("unhandled_exception", False),
+        ("rebuild_has_errors", False),
+        ("clean_rebuild", True),
+        ("check_only", True),
+    ],
+)
+async def test_run_return_code_by_outcome(monkeypatch, scenario, expected):
+    """``RebuildTool.run()`` returns True on cancel/clean/check-only and False
+    on setup failure, unhandled exceptions, or rebuild batch errors."""
+    if scenario == "user_cancel":
+        tool = _runnable_tool(monkeypatch, iter([]))
+        monkeypatch.setattr(tool, "confirm_server_stopped", lambda: False)
+        tool.setup_storages = AsyncMock(return_value=True)
+    elif scenario == "setup_failure":
+        tool = _runnable_tool(monkeypatch, iter([]))
+        tool.setup_storages = AsyncMock(return_value=False)
+    elif scenario == "unhandled_exception":
+        tool = _runnable_tool(monkeypatch, iter([]))
+        tool.setup_storages = AsyncMock(side_effect=RuntimeError("db down"))
+    elif scenario == "rebuild_has_errors":
+        tool = _runnable_tool(monkeypatch, iter(["2", "0"]))
+        tool.setup_storages = AsyncMock(return_value=True)
+        tool.embedding_available = True
+        tool.print_source_counts = AsyncMock()
+        monkeypatch.setattr(tool, "confirm_rebuild", lambda targets: True)
+        failed = rebuild_vdb._new_stats("entities", 3)
+        failed["failed_batches"] = 1
+        failed["errors"] = [
+            {
+                "batch": 1,
+                "records_lost": 3,
+                "error_type": "RuntimeError",
+                "error_msg": "embedder down",
+            }
+        ]
+        tool.run_rebuild_entities_relations = AsyncMock(return_value=[failed])
+    elif scenario == "clean_rebuild":
+        tool = _runnable_tool(monkeypatch, iter(["2", "0"]))
+        tool.setup_storages = AsyncMock(return_value=True)
+        tool.embedding_available = True
+        tool.print_source_counts = AsyncMock()
+        monkeypatch.setattr(tool, "confirm_rebuild", lambda targets: True)
+        ok = rebuild_vdb._new_stats("entities", 3)
+        ok["rebuilt"] = 3
+        tool.run_rebuild_entities_relations = AsyncMock(return_value=[ok])
+    elif scenario == "check_only":
+        tool = _runnable_tool(monkeypatch, iter(["1", "0"]))
+        tool.setup_storages = AsyncMock(return_value=True)
+        tool.embedding_available = False
+        tool.run_check = AsyncMock()
 
-    assert await tool.run() is True
-    tool.setup_storages.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_run_returns_false_on_setup_failure(monkeypatch):
-    tool = _runnable_tool(monkeypatch, iter([]))
-    tool.setup_storages = AsyncMock(return_value=False)
-
-    assert await tool.run() is False
-
-
-@pytest.mark.asyncio
-async def test_run_returns_false_on_unhandled_exception(monkeypatch):
-    tool = _runnable_tool(monkeypatch, iter([]))
-    tool.setup_storages = AsyncMock(side_effect=RuntimeError("db down"))
-
-    assert await tool.run() is False
-
-
-@pytest.mark.asyncio
-async def test_run_returns_false_when_rebuild_has_errors(monkeypatch):
-    tool = _runnable_tool(monkeypatch, iter(["2", "0"]))
-    tool.setup_storages = AsyncMock(return_value=True)
-    tool.embedding_available = True
-    tool.print_source_counts = AsyncMock()
-    monkeypatch.setattr(tool, "confirm_rebuild", lambda targets: True)
-
-    failed = rebuild_vdb._new_stats("entities", 3)
-    failed["failed_batches"] = 1
-    failed["errors"] = [
-        {
-            "batch": 1,
-            "records_lost": 3,
-            "error_type": "RuntimeError",
-            "error_msg": "embedder down",
-        }
-    ]
-    tool.run_rebuild_entities_relations = AsyncMock(return_value=[failed])
-
-    assert await tool.run() is False
-
-
-@pytest.mark.asyncio
-async def test_run_returns_true_on_clean_rebuild(monkeypatch):
-    tool = _runnable_tool(monkeypatch, iter(["2", "0"]))
-    tool.setup_storages = AsyncMock(return_value=True)
-    tool.embedding_available = True
-    tool.print_source_counts = AsyncMock()
-    monkeypatch.setattr(tool, "confirm_rebuild", lambda targets: True)
-
-    ok = rebuild_vdb._new_stats("entities", 3)
-    ok["rebuilt"] = 3
-    tool.run_rebuild_entities_relations = AsyncMock(return_value=[ok])
-
-    assert await tool.run() is True
-
-
-@pytest.mark.asyncio
-async def test_run_check_only_exits_true(monkeypatch):
-    tool = _runnable_tool(monkeypatch, iter(["1", "0"]))
-    tool.setup_storages = AsyncMock(return_value=True)
-    tool.embedding_available = False
-    tool.run_check = AsyncMock()
-
-    assert await tool.run() is True
-    tool.run_check.assert_awaited()
+    assert await tool.run() is expected
+    if scenario == "user_cancel":
+        tool.setup_storages.assert_not_awaited()
+    elif scenario == "check_only":
+        tool.run_check.assert_awaited()
 
 
 def test_main_exits_nonzero_on_failure(monkeypatch):
@@ -1183,21 +1066,25 @@ async def test_setup_records_a_refused_vdb_instead_of_aborting(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_setup_aborts_when_a_source_storage_fails(monkeypatch):
-    tool = _tool_with_storages(MockVDB(), MockVDB(), MockVDB())
-    tool.graph.initialize = AsyncMock(side_effect=RuntimeError("cluster down"))
-    assert await _setup_with(tool, monkeypatch) is False
-
-
-@pytest.mark.asyncio
-async def test_setup_aborts_on_a_non_typed_vector_failure(monkeypatch):
-    # A cluster outage must never be mistaken for a model change: the recovery
-    # for the typed refusal is destructive.
+@pytest.mark.parametrize(
+    "failing_target",
+    [
+        pytest.param("graph_source", id="source_storage_fails"),
+        pytest.param("entities_vdb_untyped", id="non_typed_vector_failure"),
+    ],
+)
+async def test_setup_aborts_on_unexpected_storage_failure(monkeypatch, failing_target):
+    """Source storage failures and untyped vector outages abort setup rather
+    than being mistaken for a typed vector-space refusal."""
     entities = MockVDB()
-    entities.initialize = AsyncMock(side_effect=RuntimeError("connection refused"))
+    if failing_target == "entities_vdb_untyped":
+        entities.initialize = AsyncMock(side_effect=RuntimeError("connection refused"))
     tool = _tool_with_storages(entities, MockVDB(), MockVDB())
-    for vdb in (tool.relationships_vdb, tool.chunks_vdb):
-        vdb.initialize = AsyncMock()
+    if failing_target == "graph_source":
+        tool.graph.initialize = AsyncMock(side_effect=RuntimeError("cluster down"))
+    else:
+        for vdb in (tool.relationships_vdb, tool.chunks_vdb):
+            vdb.initialize = AsyncMock()
 
     assert await _setup_with(tool, monkeypatch) is False
     assert tool.incompatible_vdbs == {}
@@ -1812,3 +1699,245 @@ async def test_check_reports_a_fresh_chunk_rebuild_consistent():
     assert (target["status"], target["skipped"]) == ("consistent", 2)
     assert (target["source_count"], target["target_count"]) == (1, 1)
     assert kv.page_sizes == [2, 2]
+
+
+# ---------------------------------------------------------------------------
+# Exact SDK workspace selection (--workspace flag and isolation)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv, expected",
+    [([], None), (["--workspace", "team-a"], "team-a"), (["--workspace", ""], "")],
+)
+def test_cli_passes_exact_workspace(monkeypatch, argv, expected):
+    selected = []
+
+    async def run(self):
+        selected.append(self._workspace_override)
+        return True
+
+    monkeypatch.setattr(rebuild_vdb.RebuildTool, "run", run)
+    monkeypatch.setattr(rebuild_vdb, "load_dotenv", lambda **kwargs: None)
+    monkeypatch.setattr(rebuild_vdb, "setup_logger", lambda *args, **kwargs: None)
+    rebuild_vdb.main(argv)
+    assert selected == [expected]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["--embedding-binding", "ollama"], ["--working-dir", "/elsewhere"]],
+    ids=["embedding-binding", "working-dir"],
+)
+def test_cli_refuses_every_option_but_workspace(monkeypatch, capsys, argv):
+    def unexpected(**kwargs):
+        pytest.fail("a refused flag must fail before loading the environment")
+
+    monkeypatch.setattr(rebuild_vdb, "load_dotenv", unexpected)
+    with pytest.raises(SystemExit) as error:
+        rebuild_vdb.main(argv)
+    assert error.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "workspace, reason",
+    [
+        ("../other", "path separators"),
+        ("$meta", "reserved"),
+    ],
+)
+def test_cli_refuses_invalid_workspace_before_run(
+    monkeypatch, capsys, workspace, reason
+):
+    def unexpected(**kwargs):
+        pytest.fail("invalid workspace must fail before loading the environment")
+
+    monkeypatch.setattr(rebuild_vdb, "load_dotenv", unexpected)
+    with pytest.raises(SystemExit) as error:
+        rebuild_vdb.main(["--workspace", workspace])
+    assert error.value.code == 2
+    assert reason in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "storages, refused",
+    [
+        pytest.param(
+            {"kv": "JsonKVStorage", "config": "JsonKVStorage"}, True, id="file-backed"
+        ),
+        pytest.param(
+            {
+                "graph": "PGGraphStorage",
+                "vector": "PGVectorStorage",
+                "kv": "PGKVStorage",
+                "config": "PGKVStorage",
+            },
+            False,
+            id="database-only",
+        ),
+    ],
+)
+async def test_directory_rules_follow_the_storage_selection(
+    monkeypatch, capsys, storages, refused
+):
+    tool = rebuild_vdb.RebuildTool(workspace="config_storage_anchor.json")
+    monkeypatch.setattr(tool, "resolve_storage_names", lambda: storages)
+
+    class _Stop(Exception):
+        """Sentinel raised once the directory check passes."""
+
+    def _past_the_check():
+        raise _Stop
+
+    monkeypatch.setattr(tool, "resolve_config_dir", _past_the_check)
+    if refused:
+        assert await tool.setup_storages() is False
+        assert "deployment-wide file" in capsys.readouterr().out
+    else:
+        with pytest.raises(_Stop):
+            await tool.setup_storages()
+
+
+async def test_a_reserved_workspace_from_the_environment_is_a_clean_refusal(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("WORKSPACE", "$prod")
+    tool = rebuild_vdb.RebuildTool()
+    monkeypatch.setattr(tool, "resolve_storage_names", lambda: {})
+
+    assert await tool.setup_storages() is False
+    assert "reserved" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "override, expected", [(None, "team_a"), ("team-a", "team-a"), ("", "")]
+)
+async def test_rebuild_selects_one_workspace_and_preserves_siblings(
+    monkeypatch, tmp_path, override, expected
+):
+    """Real JSON/NetworkX/Nano stores: read, rebuild and baseline share one scope."""
+    import json
+    import numpy as np
+
+    from lightrag import config_store as cs
+    from lightrag.config_shards import json_config_dir, json_config_path
+    from lightrag.kg.json_kv_impl import JsonKVStorage
+    from lightrag.kg.nano_vector_db_impl import NanoVectorDBStorage
+    from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
+    from lightrag.kg.working_dir_lock import (
+        holds_working_dir_lock,
+        release_working_dir_lock,
+    )
+    from lightrag.utils import EmbeddingFunc
+
+    for key, value in {
+        "WORKING_DIR": str(tmp_path),
+        "WORKSPACE": "team-a",
+        "LIGHTRAG_CONFIG_STORAGE": "JsonKVStorage",
+        "LIGHTRAG_KV_STORAGE": "JsonKVStorage",
+        "LIGHTRAG_GRAPH_STORAGE": "NetworkXStorage",
+        "LIGHTRAG_VECTOR_STORAGE": "NanoVectorDBStorage",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    async def embed(texts, **kwargs):
+        return np.ones((len(texts), 8), dtype=np.float32)
+
+    embedding = EmbeddingFunc(embedding_dim=8, func=embed, model_name="test-model")
+    monkeypatch.setattr(
+        rebuild_vdb.RebuildTool, "build_embedding_func", lambda self: embedding
+    )
+    initialize_share_data(workers=1)
+    tool = rebuild_vdb.RebuildTool(workspace=override)
+    try:
+        for workspace in ("team-a", "team_a", ""):
+            config = cs.create_configuration_storage(
+                JsonKVStorage,
+                global_config={"working_dir": str(tmp_path), "workspace": workspace},
+                embedding_func=None,
+            )
+            await config.initialize()
+            try:
+                await cs.bind_configuration_identity(
+                    config,
+                    working_dir=str(tmp_path),
+                    backend="JsonKVStorage",
+                    container=json_config_path(str(tmp_path), workspace),
+                    workspace=workspace,
+                )
+                await cs.record_embedding_baseline(
+                    config,
+                    workspace=workspace,
+                    target="chunks",
+                    embedding_func=EmbeddingFunc(
+                        embedding_dim=8, func=embed, model_name="old-model"
+                    ),
+                )
+            finally:
+                await config.finalize()
+
+        for sibling in {"team-a", "team_a", ""} - {expected}:
+            vector = NanoVectorDBStorage(
+                namespace="chunks",
+                workspace=sibling,
+                global_config={
+                    "working_dir": str(tmp_path),
+                    "embedding_batch_num": 10,
+                    "vector_db_storage_cls_kwargs": {
+                        "cosine_better_than_threshold": 0.2
+                    },
+                },
+                embedding_func=embedding,
+                meta_fields={"content"},
+            )
+            await vector.initialize()
+            try:
+                await vector.upsert({"sibling-chunk": {"content": "must survive"}})
+                await vector.index_done_callback()
+            finally:
+                await vector.finalize()
+
+        before = {path: path.read_bytes() for path in tmp_path.rglob("*.json")}
+        assert await tool.setup_storages() is True
+        assert tool.workspace == expected
+        assert tool.global_config["workspace"] == expected
+        assert tool.config_dir == json_config_dir(str(tmp_path), expected)
+        assert holds_working_dir_lock(tool.config_dir)
+        assert all(
+            storage.workspace == expected
+            for storage in (
+                tool.graph,
+                tool.text_chunks,
+                tool.entities_vdb,
+                tool.relationships_vdb,
+                tool.chunks_vdb,
+            )
+        )
+        await tool.text_chunks.upsert(
+            {"chunk-test": {"content": "selected workspace", "full_doc_id": "doc-test"}}
+        )
+        stats = await tool.run_rebuild_chunks()
+        assert not stats[0]["errors"]
+        assert stats[0]["prepared"] == 1
+        rows = json.loads(
+            (tmp_path / expected / "kv_workspace_config.json").read_text()
+        )
+        assert (
+            rows[cs.embedding_baseline_key(expected, "chunks")]["value"]["model"]
+            == "test-model"
+        )
+        assert (tmp_path / expected / "vdb_chunks.json").is_file()
+        for path, content in before.items():
+            if str(path) != json_config_path(str(tmp_path), expected):
+                assert path.read_bytes() == content
+        for sibling in {"team-a", "team_a", ""} - {expected}:
+            assert (tmp_path / sibling / "vdb_chunks.json").is_file()
+    finally:
+        for storage in tool.all_storages():
+            if storage is not None:
+                await storage.finalize()
+        if tool._holds_working_dir:
+            release_working_dir_lock(tool.config_dir)
+        tool.release_anchor_lock()
+        finalize_share_data()

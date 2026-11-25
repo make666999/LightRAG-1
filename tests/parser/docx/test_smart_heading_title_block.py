@@ -24,31 +24,15 @@ from lightrag.parser.docx.smart_heading.title_block import (
     judge_title_block,
 )
 
+from tests.parser.docx._smart_heading_helpers import (
+    make_empty_para as _empty,
+    make_para as _para,
+    stub_always_veto as _stub_always_veto,
+    stub_no_veto as _stub_no_veto,
+    stub_strong_body as _stub_strong_body,
+)
+
 pytestmark = pytest.mark.offline
-
-
-def _para(text: str, *, size: float = 12.0, **kw) -> ParagraphRecord:
-    return ParagraphRecord(kind="para", text=text, font_size_pt=size, **kw)
-
-
-def _empty() -> ParagraphRecord:
-    return ParagraphRecord(kind="empty_para")
-
-
-def _stub_strong_body(text: str) -> str | None:
-    """Deterministic stand-in: sentence enders / long text are body."""
-    stripped = text.strip()
-    if stripped.endswith(("。", "？", "！")) or len(stripped) > 60:
-        return "strong_body_stub"
-    return None
-
-
-def _stub_no_veto(_classification, _text) -> str | None:
-    return None
-
-
-def _stub_always_veto(_classification, _text) -> str | None:
-    return "homophone_stub"
 
 
 def _find(records, **kw):
@@ -63,45 +47,11 @@ def _find(records, **kw):
 # ---------------------------------------------------------------------------
 
 
-def test_multi_window_candidate_found() -> None:
-    records = [
-        _para("公司数字化转型白皮书", size=22.0),  # big main title
-        _para("（2026年版）", size=12.0),  # metadata line, body-sized
-        _empty(),
-        _para("某某咨询公司发布", size=12.0),
-        _para("正文从这里开始，介绍研究的背景与目标。", size=12.0),  # strong body
-    ]
-    cands = _find(records)
-    assert len(cands) == 1
-    c = cands[0]
-    assert not c.single
-    assert (c.start, c.end) == (0, 4)  # stops before the strong-body line
-
-
-def test_multi_window_requires_two_paragraphs_and_big_line() -> None:
-    # Only one non-body line → no multi window; also no boundary evidence
-    # beyond doc-start for a single candidate when size is not dominant.
-    records = [
-        _para("孤立小字号行", size=12.0),
-        _para("这是很长的正文，它明确地以句号结尾。", size=12.0),
-    ]
-    assert _find(records) == []
-
-
 @pytest.mark.requires_spacy_models
 def test_two_line_cover_with_decimal_lead_in_forms_window() -> None:
     """Regression (test13 事故调查报告): a two-line 22pt cover whose first line
-    is a lead-in carrying a decimal (广州市增城区"7.19"…) must form ONE
-    multi-window together with the main title. The pinned zh model pseudo-splits
-    that lead-in into ≥2 sentences (mid-word 索菲|亚); before the deterministic
-    internal-terminator gate in ``strong_body_reason`` it read as strong body,
-    was excluded from the window seed, and got demoted to Preface body while the
-    main title became a lone level-0 title.
-
-    Uses the REAL ``strong_body_reason`` on purpose — the default ``_stub_strong_body``
-    never marks the (short, non-terminated) lead-in strong, so it cannot
-    reproduce the bug and would pass against the old implementation too.
-    """
+    is a lead-in carrying a decimal must form ONE multi-window together with
+    the main title under the REAL ``strong_body_reason``."""
     records = [
         _para("广州市增城区“7.19”索菲亚定制家居项目", size=22.0),  # lead-in (引题)
         _para("建筑工地塔式起重机坍塌较大事故调查报告", size=22.0),  # main title
@@ -113,9 +63,6 @@ def test_two_line_cover_with_decimal_lead_in_forms_window() -> None:
         strong_body=guardrails.strong_body_reason,
         numbering_veto=lambda _cls, _t: None,
     )
-    # Old implementation: lead-in is strong → seed skips it → the lone main
-    # title cannot form a multi-window and the strong-body body line blocks the
-    # single-line channel → NO candidate at all.
     assert len(cands) == 1
     c = cands[0]
     assert (c.start, c.end, c.single, c.trigger) == (0, 2, False, "multi_window")
@@ -134,74 +81,85 @@ def test_single_candidate_first_eligible_paragraph() -> None:
     ]
     cands = _find(records, numbering_veto=_stub_always_veto)
     assert len(cands) == 1 and cands[0].single and cands[0].start == 2
-
-    # Without the veto the same line counts as genuinely numbered → excluded.
     assert _find(records, numbering_veto=_stub_no_veto) == []
-
-
-def test_single_candidate_does_not_scan_after_non_title_first_paragraph() -> None:
-    """A later big line is rejected when the first eligible paragraph is body."""
-    body = [_para(f"正文段落{i}，以句号结尾。", size=12.0) for i in range(3)]
-    records = (
-        body
-        + [_para("突然的大字号行", size=18.0)]
-        + [_para(f"后续正文{i}，以句号结尾。", size=12.0) for i in range(3)]
-    )
-    assert _find(records) == []
-
-
-def test_mid_document_centered_line_with_blank_flanks_rejected() -> None:
-    records = [
-        _para("开头正文，以句号结尾。", size=12.0),
-        _empty(),
-        _para("居中的独立标题", size=18.0, alignment="center"),
-        _empty(),
-        _para("后续正文，以句号结尾。", size=12.0),
-    ]
-    assert _find(records) == []
-
-
-def test_mid_document_single_candidate_after_page_break_rejected() -> None:
-    records = [
-        _para("前一篇正文结束。", size=12.0),
-        _para("另一篇文章的标题", size=18.0, page_break_before=True),
-        _para("这一篇正文开始，以句号结尾。", size=12.0),
-    ]
-    assert _find(records) == []
 
 
 @pytest.mark.parametrize(
     "records",
     [
-        [
-            _para("前文正文结束。", size=12.0),
-            _para(
-                "段内分页后的标题",
-                size=18.0,
-                has_leading_page_break_run=True,
-            ),
-            _para("后续正文开始。", size=12.0),
-        ],
-        [
-            _para("前文正文结束。", size=12.0),
-            ParagraphRecord(kind="section_break"),
-            _para("分节后的标题", size=18.0),
-            _para("后续正文开始。", size=12.0),
-        ],
-        [
-            _para("前文正文结束。", size=12.0, ends_section=True),
-            _para("段尾分节后的标题", size=18.0),
-            _para("后续正文开始。", size=12.0),
-        ],
-        [
-            _para("前文正文结束。", size=12.0),
-            _para("字号变化处的标题", size=18.0),
-            _para("后续正文开始。", size=10.5),
-        ],
+        pytest.param(
+            [_para(f"正文段落{i}，以句号结尾。", size=12.0) for i in range(3)]
+            + [_para("突然的大字号行", size=18.0)]
+            + [_para(f"后续正文{i}，以句号结尾。", size=12.0) for i in range(3)],
+            id="after-non-title-first-paragraph",
+        ),
+        pytest.param(
+            [
+                _para("开头正文，以句号结尾。", size=12.0),
+                _empty(),
+                _para("居中的独立标题", size=18.0, alignment="center"),
+                _empty(),
+                _para("后续正文，以句号结尾。", size=12.0),
+            ],
+            id="centered-line-with-blank-flanks",
+        ),
+        pytest.param(
+            [
+                _para("前一篇正文结束。", size=12.0),
+                _para("另一篇文章的标题", size=18.0, page_break_before=True),
+                _para("这一篇正文开始，以句号结尾。", size=12.0),
+            ],
+            id="after-page-break-before",
+        ),
+        pytest.param(
+            [
+                _para(
+                    "上一篇的收尾正文，以句号结尾。",
+                    size=12.0,
+                    has_page_break_run=True,
+                    has_nonleading_page_break_run=True,
+                ),
+                _para("下一篇文章的标题", size=18.0),
+                _para("下一篇正文开始，以句号结尾。", size=12.0),
+            ],
+            id="after-previous-nonleading-page-break-run",
+        ),
+        pytest.param(
+            [
+                _para("前文正文结束。", size=12.0),
+                _para("段内分页后的标题", size=18.0, has_leading_page_break_run=True),
+                _para("后续正文开始。", size=12.0),
+            ],
+            id="leading-page-run",
+        ),
+        pytest.param(
+            [
+                _para("前文正文结束。", size=12.0),
+                ParagraphRecord(kind="section_break"),
+                _para("分节后的标题", size=18.0),
+                _para("后续正文开始。", size=12.0),
+            ],
+            id="section-record",
+        ),
+        pytest.param(
+            [
+                _para("前文正文结束。", size=12.0, ends_section=True),
+                _para("段尾分节后的标题", size=18.0),
+                _para("后续正文开始。", size=12.0),
+            ],
+            id="paragraph-section",
+        ),
+        pytest.param(
+            [
+                _para("前文正文结束。", size=12.0),
+                _para("字号变化处的标题", size=18.0),
+                _para("后续正文开始。", size=10.5),
+            ],
+            id="font-change",
+        ),
     ],
-    ids=["leading-page-run", "section-record", "paragraph-section", "font-change"],
 )
-def test_other_mid_document_boundaries_do_not_seed_single_candidate(records) -> None:
+def test_mid_document_boundaries_do_not_seed_single_candidate(records) -> None:
     assert _find(records) == []
 
 
@@ -296,55 +254,138 @@ def test_title_font_colon_lead_in_absorbed_but_llm_gate_rejects() -> None:
     assert not decision.is_title_block
 
 
-def test_title_verdict_parsed_and_composed() -> None:
+@pytest.mark.parametrize(
+    (
+        "payload",
+        "records",
+        "candidate",
+        "expected_main",
+        "expected_sub",
+        "expected_doc_num",
+        "expected_members",
+        "expected_composed",
+        "expect_relaxed",
+    ),
+    [
+        pytest.param(
+            # Verbatim answer -> exact locate tier, no relaxed warning.
+            {
+                "is_title_block": True,
+                "main_title": "中华人民共和国某某管理办法",
+                "sub_title": "（2026年修订）",
+                "doc_number": "国某发〔2026〕12号",
+                "classification": None,
+                "publisher": None,
+                "date": "2026",
+            },
+            None,
+            None,
+            "中华人民共和国某某管理办法",
+            "（2026年修订）",
+            "国某发〔2026〕12号",
+            (0, 1, 3),
+            "中华人民共和国某某管理办法 — （2026年修订） — 国某发〔2026〕12号(2026)",
+            False,
+            id="parsed-and-composed-exact",
+        ),
+        pytest.param(
+            # Concatenated two-line main title locates cleanly.
+            {"is_title_block": True, "main_title": "中华人民共和国某某管理办法"},
+            [
+                _para("中华人民共和国", size=22.0),
+                _para("某某管理办法", size=22.0),
+                _para("正文开始。", size=12.0),
+            ],
+            TitleBlockCandidate(start=0, end=2, single=False, trigger="t"),
+            "中华人民共和国某某管理办法",
+            None,
+            None,
+            (0, 1),
+            None,
+            False,
+            id="concatenated-main-title-locates",
+        ),
+        pytest.param(
+            # Overlapping boundary word deduped by LLM -> assembled relaxed tier.
+            {
+                "is_title_block": True,
+                "main_title": "2027-2028年信息化运维项目方案",
+                "publisher": "广州市节能中心",
+            },
+            [
+                _para("广州市节能中心", size=24.0),
+                _para("2027-2028年信息化运维项目", size=24.0),
+                _para("项目方案", size=24.0),
+                _para("正文开始。", size=12.0),
+            ],
+            TitleBlockCandidate(start=0, end=3, single=False, trigger="t"),
+            "2027-2028年信息化运维项目方案",
+            None,
+            None,
+            (0, 1, 2),
+            None,
+            True,
+            id="overlap-dedup-main-title-relaxed",
+        ),
+        pytest.param(
+            # Full-width -> half-width punctuation and Latin case folding.
+            {
+                "is_title_block": True,
+                "main_title": "某某平台(2026年修订)",
+                "sub_title": "Q1-Q2 Roadmap",
+                "doc_number": "国某发[2026]12号",
+            },
+            [
+                _para("某某平台（2026年修订）", size=22.0),
+                _para("Q1—Q2 ROADMAP", size=16.0),
+                _para("国某发〔2026〕12号", size=12.0),
+                _para("正文开始。", size=12.0),
+            ],
+            TitleBlockCandidate(start=0, end=3, single=False, trigger="t"),
+            "某某平台(2026年修订)",
+            "Q1-Q2 Roadmap",
+            "国某发[2026]12号",
+            (0, 1, 2),
+            None,
+            True,
+            id="punctuation-and-case-normalized-relaxed",
+        ),
+    ],
+)
+def test_title_verdict_locate_and_parse_cases(
+    payload,
+    records,
+    candidate,
+    expected_main: str,
+    expected_sub: str | None,
+    expected_doc_num: str | None,
+    expected_members: tuple[int, ...],
+    expected_composed: str | None,
+    expect_relaxed: bool,
+) -> None:
     warnings: dict = {}
     decision = _judge_with(
-        {
-            "is_title_block": True,
-            "main_title": "中华人民共和国某某管理办法",
-            "sub_title": "（2026年修订）",
-            "doc_number": "国某发〔2026〕12号",
-            "classification": None,
-            "publisher": None,
-            "date": "2026",
-        },
-        warnings=warnings,
+        payload, records=records, candidate=candidate, warnings=warnings
     )
     assert decision.is_title_block
-    assert decision.member_indices == (0, 1, 3)  # blank line carries no index
-    # A verbatim answer takes the exact locate tier, so the audit counter stays
-    # clean and a drifting model remains visible.
-    assert "title_block_locate_relaxed" not in warnings
-    assert (
-        compose_title_heading(decision)
-        == "中华人民共和国某某管理办法 — （2026年修订） — 国某发〔2026〕12号(2026)"
-    )
-
-
-def test_title_verdict_concatenated_main_title_locates() -> None:
-    records = [
-        _para("中华人民共和国", size=22.0),
-        _para("某某管理办法", size=22.0),
-        _para("正文开始。", size=12.0),
-    ]
-    decision = _judge_with(
-        {"is_title_block": True, "main_title": "中华人民共和国某某管理办法"},
-        records=records,
-        candidate=TitleBlockCandidate(start=0, end=2, single=False, trigger="t"),
-    )
-    assert decision.main_title == "中华人民共和国某某管理办法"
+    assert decision.main_title == expected_main
+    assert decision.member_indices == expected_members
+    if expected_sub is not None:
+        assert decision.sub_title == expected_sub
+    if expected_doc_num is not None:
+        assert decision.doc_number == expected_doc_num
+    if expected_composed is not None:
+        assert compose_title_heading(decision) == expected_composed
+    if expect_relaxed:
+        assert warnings["title_block_locate_relaxed"] == 1
+    else:
+        assert "title_block_locate_relaxed" not in warnings
 
 
 def test_title_verdict_multiline_fields_flattened(monkeypatch) -> None:
-    """Title material renders single-line at verdict construction: an LLM
-    echoing a soft-break/multi-paragraph title must not ride ``\\n`` into the
-    heading stack (and thence every descendant's parent_headings). CJK
-    boundaries join without a space, others with one; locate-back still
-    passes (_canon strips ALL whitespace)."""
+    """Title material renders single-line at verdict construction."""
     from lightrag.constants import DEFAULT_DOCX_SMART_HEADING_MAX_CHARS
 
-    # compose_doc_title reads the (configurable) length cap live; pin it so the
-    # exact-value assertion below is deterministic regardless of ambient env.
     monkeypatch.setenv(
         "DOCX_SMART_HEADING_MAX_CHARS", str(DEFAULT_DOCX_SMART_HEADING_MAX_CHARS)
     )
@@ -365,8 +406,6 @@ def test_title_verdict_multiline_fields_flattened(monkeypatch) -> None:
     assert decision.main_title == "中华人民共和国某某管理办法"
     assert decision.sub_title == "Implementation Guide"
     assert "\n" not in compose_title_heading(decision)
-    # The doc-title heading feeds off the already-flattened fields, so it is
-    # single-line too (compose_doc_title does NOT flatten on its own).
     doc_title = compose_doc_title(decision.main_title, decision.sub_title)
     assert doc_title == "中华人民共和国某某管理办法  Implementation Guide"
     assert "\n" not in doc_title
@@ -375,13 +414,10 @@ def test_title_verdict_multiline_fields_flattened(monkeypatch) -> None:
 def test_compose_doc_title_joins_with_double_space(monkeypatch) -> None:
     from lightrag.constants import DEFAULT_DOCX_SMART_HEADING_MAX_CHARS
 
-    # Pin the live length cap so these exact-value assertions do not truncate
-    # under a small (but legal) ambient DOCX_SMART_HEADING_MAX_CHARS.
     monkeypatch.setenv(
         "DOCX_SMART_HEADING_MAX_CHARS", str(DEFAULT_DOCX_SMART_HEADING_MAX_CHARS)
     )
     assert compose_doc_title("广州市平台", "建设方案") == "广州市平台  建设方案"
-    # No sub-title -> just the main title, no trailing space.
     assert compose_doc_title("广州市平台", "") == "广州市平台"
     assert compose_doc_title("广州市平台", None) == "广州市平台"
 
@@ -395,12 +431,10 @@ def test_compose_doc_title_bounds_length(monkeypatch) -> None:
         "DOCX_SMART_HEADING_MAX_CHARS", str(DEFAULT_DOCX_SMART_HEADING_MAX_CHARS)
     )
     cap = DEFAULT_DOCX_SMART_HEADING_MAX_CHARS
-    merged = compose_doc_title("标" * 40, "案" * 40)  # weighted 120+2+120 = 242
+    merged = compose_doc_title("标" * 40, "案" * 40)
     assert guardrails.weighted_char_length(merged) <= cap
     assert merged.endswith("...")
-    # A concatenated main_title alone can exceed the cap too (the 90-per-line
-    # limit does not bound the concatenated whole).
-    main_only = compose_doc_title("则" * 70, None)  # weighted 210 > 180
+    main_only = compose_doc_title("则" * 70, None)
     assert guardrails.weighted_char_length(main_only) <= cap
     assert main_only.endswith("...")
 
@@ -412,175 +446,163 @@ def test_flatten_heading_line_unicode_breaks() -> None:
     assert flatten_heading_line("\n \n") == ""
 
 
-def test_title_verdict_overlap_dedup_main_title_locates() -> None:
-    """Fix proof: a cover whose two title lines SHARE a boundary word makes
-    verbatim concatenation read ``…运维项目项目方案``, so the LLM answers the
-    natural de-duplicated ``…运维项目方案``. Every character still comes from
-    the window in window order, so locate-back accepts it (assembled tier)
-    instead of hard-failing the whole document as a hallucination."""
-    records = [
-        _para("广州市节能中心", size=24.0),
-        _para("2027-2028年信息化运维项目", size=24.0),
-        _para("项目方案", size=24.0),
-        _para("正文开始。", size=12.0),
-    ]
-    warnings: dict = {}
-    decision = _judge_with(
-        {
-            "is_title_block": True,
-            "main_title": "2027-2028年信息化运维项目方案",
-            "publisher": "广州市节能中心",
-        },
-        records=records,
-        candidate=TitleBlockCandidate(start=0, end=3, single=False, trigger="t"),
-        warnings=warnings,
-    )
-    assert decision.main_title == "2027-2028年信息化运维项目方案"
-    # Relaxation is accepted but never silent.
-    assert warnings["title_block_locate_relaxed"] == 1
-
-
-def test_title_verdict_punctuation_and_case_normalized_locates() -> None:
-    """An LLM tidying the source punctuation (full-width → half-width, em dash
-    → hyphen) or Latin case is editorial polish, not invention: locate-back
-    matches on the folded form and counts ONE relaxation for the verdict."""
-    records = [
-        _para("某某平台（2026年修订）", size=22.0),
-        _para("Q1—Q2 ROADMAP", size=16.0),
-        _para("国某发〔2026〕12号", size=12.0),
-        _para("正文开始。", size=12.0),
-    ]
-    warnings: dict = {}
-    decision = _judge_with(
-        {
-            "is_title_block": True,
-            "main_title": "某某平台(2026年修订)",
-            "sub_title": "Q1-Q2 Roadmap",
-            "doc_number": "国某发[2026]12号",
-        },
-        records=records,
-        candidate=TitleBlockCandidate(start=0, end=3, single=False, trigger="t"),
-        warnings=warnings,
-    )
-    assert decision.main_title == "某某平台(2026年修订)"
-    assert decision.sub_title == "Q1-Q2 Roadmap"
-    assert decision.doc_number == "国某发[2026]12号"
-    assert warnings["title_block_locate_relaxed"] == 1
-
-
-def test_title_verdict_hallucinated_title_hard_fails() -> None:
-    with pytest.raises(TitleBlockLLMError, match="cannot be located"):
-        _judge_with({"is_title_block": True, "main_title": "完全虚构的标题"})
-
-
-def test_title_verdict_stitched_from_stray_chars_hard_fails() -> None:
-    """The relaxed tiers must not become a licence to invent: a title whose
-    characters all appear in the window but only as scattered SINGLE chars
-    cannot be assembled (each fragment must clear the minimum length), so it
-    is still rejected."""
-    records = [
-        _para("中某人办法某某共和国管理", size=22.0),
-        _para("正文开始。", size=12.0),
-    ]
-    with pytest.raises(TitleBlockLLMError, match="cannot be located"):
-        _judge_with(
-            {"is_title_block": True, "main_title": "中共某国某人管某某某和办"},
-            records=records,
-            candidate=TitleBlockCandidate(start=0, end=1, single=False, trigger="t"),
-        )
-
-
-def test_title_verdict_out_of_order_fragments_hard_fail() -> None:
-    """Assembly is order-preserving: the same two window fragments in REVERSE
-    source order are not the document's title."""
-    records = [
-        _para("信息化运维项目", size=22.0),
-        _para("广州市节能中心", size=22.0),
-        _para("正文开始。", size=12.0),
-    ]
-    with pytest.raises(TitleBlockLLMError, match="cannot be located"):
-        _judge_with(
-            {"is_title_block": True, "main_title": "广州市节能中心信息化运维项目"},
-            records=records,
-            candidate=TitleBlockCandidate(start=0, end=2, single=False, trigger="t"),
-        )
-
-
-def test_invalid_json_hard_fails() -> None:
-    with pytest.raises(TitleBlockLLMError, match="no JSON object"):
-        _judge_with("I think this is a title block.")
-
-
-def test_non_title_verdict_classifies_every_paragraph() -> None:
-    decision = _judge_with({"is_title_block": False, "headings": [0], "body": [1, 2]})
-    assert not decision.is_title_block
-    assert decision.heading_indices == (0,)
-    assert decision.body_indices == (1, 3)
-
-
-def test_non_title_verdict_incomplete_partition_recovers() -> None:
-    """A well-formed but UNDER-specified partition (window index 2 left in
-    neither list) no longer hard-fails: the unmentioned paragraph abstains
-    (named in neither list) and re-enters the normal flow; the omission is
-    counted via ``title_block_partition_incomplete``, not fatal."""
-    warnings: dict = {}
-    decision = _judge_with(
-        {"is_title_block": False, "headings": [0], "body": [1]},
-        warnings=warnings,
-    )
-    assert not decision.is_title_block
-    assert decision.heading_indices == (0,)  # named a heading (audit-only)
-    assert decision.body_indices == (1,)  # vetoed; window idx 2 (rec 3) abstains
-    assert warnings["title_block_partition_incomplete"] == 1
-
-
-def test_non_title_verdict_metadata_dropped_index_recovers() -> None:
-    """Regression (test9 国标范例): the LLM correctly rejects the title block
-    but routes the standard number into ``doc_number`` and forgets to place
-    its index in headings/body (headings=[1], body=[]). The dropped index now
-    abstains instead of failing the whole document."""
-    records = [
-        _para("GB/T 9704—2012", size=12.0),
-        _para("前　言", size=14.0),
-    ]
-    warnings: dict = {}
-    decision = _judge_with(
-        {
-            "is_title_block": False,
-            "headings": [1],
-            "body": [],
-            "doc_number": "GB/T 9704—2012",
-        },
-        records=records,
-        candidate=TitleBlockCandidate(
-            start=0, end=2, single=False, trigger="multi_window"
+@pytest.mark.parametrize(
+    ("payload", "records", "candidate", "match"),
+    [
+        pytest.param(
+            {"is_title_block": True, "main_title": "完全虚构的标题"},
+            None,
+            None,
+            "cannot be located",
+            id="hallucinated-title",
         ),
-        warnings=warnings,
+        pytest.param(
+            # Scattered single chars cannot be assembled into a title.
+            {"is_title_block": True, "main_title": "中共某国某人管某某某和办"},
+            [
+                _para("中某人办法某某共和国管理", size=22.0),
+                _para("正文开始。", size=12.0),
+            ],
+            TitleBlockCandidate(start=0, end=1, single=False, trigger="t"),
+            "cannot be located",
+            id="stitched-from-stray-chars",
+        ),
+        pytest.param(
+            # Reversed source fragments must not locate.
+            {"is_title_block": True, "main_title": "广州市节能中心信息化运维项目"},
+            [
+                _para("信息化运维项目", size=22.0),
+                _para("广州市节能中心", size=22.0),
+                _para("正文开始。", size=12.0),
+            ],
+            TitleBlockCandidate(start=0, end=2, single=False, trigger="t"),
+            "cannot be located",
+            id="out-of-order-fragments",
+        ),
+        pytest.param(
+            "I think this is a title block.",
+            None,
+            None,
+            "no JSON object",
+            id="invalid-json",
+        ),
+    ],
+)
+def test_title_verdict_invalid_hard_fails(
+    payload, records, candidate, match: str
+) -> None:
+    with pytest.raises(TitleBlockLLMError, match=match):
+        _judge_with(payload, records=records, candidate=candidate)
+
+
+@pytest.mark.parametrize(
+    (
+        "payload",
+        "records",
+        "candidate",
+        "expected_headings",
+        "expected_body",
+        "expect_incomplete",
+    ),
+    [
+        pytest.param(
+            {"is_title_block": False, "headings": [0], "body": [1, 2]},
+            None,
+            None,
+            (0,),
+            (1, 3),
+            False,
+            id="classifies-every-paragraph",
+        ),
+        pytest.param(
+            # Unmentioned window index 2 abstains rather than hard-failing.
+            {"is_title_block": False, "headings": [0], "body": [1]},
+            None,
+            None,
+            (0,),
+            (1,),
+            True,
+            id="incomplete-partition-recovers",
+        ),
+        pytest.param(
+            # Metadata-routed standard number omitted from headings/body abstains.
+            {
+                "is_title_block": False,
+                "headings": [1],
+                "body": [],
+                "doc_number": "GB/T 9704—2012",
+            },
+            [_para("GB/T 9704—2012", size=12.0), _para("前　言", size=14.0)],
+            TitleBlockCandidate(start=0, end=2, single=False, trigger="multi_window"),
+            (1,),
+            (),
+            True,
+            id="metadata-dropped-index-recovers",
+        ),
+    ],
+)
+def test_non_title_verdict_partition_cases(
+    payload,
+    records,
+    candidate,
+    expected_headings: tuple[int, ...],
+    expected_body: tuple[int, ...],
+    expect_incomplete: bool,
+) -> None:
+    warnings: dict = {}
+    decision = _judge_with(
+        payload, records=records, candidate=candidate, warnings=warnings
     )
     assert not decision.is_title_block
-    assert decision.heading_indices == (1,)  # 前言 named a heading (audit-only)
-    assert decision.body_indices == ()  # GB/T line (index 0) abstains, not vetoed
-    assert warnings["title_block_partition_incomplete"] == 1
+    assert decision.heading_indices == expected_headings
+    assert decision.body_indices == expected_body
+    if expect_incomplete:
+        assert warnings["title_block_partition_incomplete"] == 1
+    else:
+        assert "title_block_partition_incomplete" not in warnings
 
 
-def test_non_title_verdict_malformed_partition_hard_fails() -> None:
-    """Only OMISSION is forgiven; malformed output is still loud. A missing or
-    null field, a non-int (incl. bool) index, an out-of-range index, or the
-    same index in both lists cannot be reconciled and hard-fails."""
-    with pytest.raises(TitleBlockLLMError, match="malformed"):  # heading∩body
-        _judge_with({"is_title_block": False, "headings": [0, 1], "body": [1, 2]})
-    with pytest.raises(TitleBlockLLMError, match="malformed"):  # out of range
-        _judge_with({"is_title_block": False, "headings": [99], "body": []})
-    # Review D5: a duplicate inside one list is not a valid partition even
-    # though the deduped sets would appear to cover the window.
-    with pytest.raises(TitleBlockLLMError, match="malformed"):
-        _judge_with({"is_title_block": False, "headings": [0, 0], "body": [1, 2]})
-    with pytest.raises(TitleBlockLLMError, match="must be"):  # missing fields
-        _judge_with({"is_title_block": False})
-    with pytest.raises(TitleBlockLLMError, match="must be"):  # explicit null
-        _judge_with({"is_title_block": False, "headings": None, "body": None})
-    with pytest.raises(TitleBlockLLMError, match="must be"):  # bool is not an index
-        _judge_with({"is_title_block": False, "headings": [True], "body": [1]})
+@pytest.mark.parametrize(
+    ("payload", "match"),
+    [
+        pytest.param(
+            {"is_title_block": False, "headings": [0, 1], "body": [1, 2]},
+            "malformed",
+            id="overlap-heading-and-body",
+        ),
+        pytest.param(
+            {"is_title_block": False, "headings": [99], "body": []},
+            "malformed",
+            id="out-of-range-index",
+        ),
+        pytest.param(
+            {"is_title_block": False, "headings": [0, 0], "body": [1, 2]},
+            "malformed",
+            id="duplicate-in-one-list",
+        ),
+        pytest.param(
+            {"is_title_block": False},
+            "must be",
+            id="missing-fields",
+        ),
+        pytest.param(
+            {"is_title_block": False, "headings": None, "body": None},
+            "must be",
+            id="explicit-null",
+        ),
+        pytest.param(
+            {"is_title_block": False, "headings": [True], "body": [1]},
+            "must be",
+            id="bool-not-an-index",
+        ),
+    ],
+)
+def test_non_title_verdict_malformed_partition_hard_fails(
+    payload: dict, match: str
+) -> None:
+    """Only omission is forgiven; malformed partitions hard-fail."""
+    with pytest.raises(TitleBlockLLMError, match=match):
+        _judge_with(payload)
 
 
 def test_outline_paragraph_never_demoted_by_llm(monkeypatch) -> None:
@@ -745,45 +767,212 @@ def test_single_candidate_false_verdict_leaves_context_untouched() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_multi_window_requires_two_pt_over_body() -> None:
-    """A multi-paragraph title line must be at least 2pt over FS_base.
+@pytest.mark.parametrize(
+    ("records", "expected_span"),
+    [
+        pytest.param(
+            # Basic multi-window: big main title + metadata + blank + publisher.
+            [
+                _para("公司数字化转型白皮书", size=22.0),
+                _para("（2026年版）", size=12.0),
+                _empty(),
+                _para("某某咨询公司发布", size=12.0),
+                _para("正文从这里开始，介绍研究的背景与目标。", size=12.0),
+            ],
+            (0, 4),
+            id="basic-cover-stops-before-strong-body",
+        ),
+        pytest.param(
+            # +2pt over FS_base (12pt) clears the unified bar.
+            [
+                _para("产品技术白皮书", size=14.0),
+                _para("研发中心", size=12.0),
+                _para(
+                    "这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。",
+                    size=12.0,
+                ),
+            ],
+            (0, 2),
+            id="two-pt-over-body-clears-bar",
+        ),
+        pytest.param(
+            # Real outline heading terminates the cover window cleanly.
+            [
+                _para("公司数字化转型白皮书", size=22.0),
+                _para("研发中心发布", size=12.0),
+                _para("概述", size=14.0, outline_level_raw=0),
+                _para("这一段是以句号结尾的正文内容。", size=12.0),
+            ],
+            (0, 2),
+            id="stops-before-outline-heading",
+        ),
+        pytest.param(
+            # Genuine numbering (no physical outline) terminates the window.
+            [
+                _para("公司数字化转型白皮书", size=22.0),
+                _para("研发中心发布", size=12.0),
+                _para("第二章 总体设计", size=14.0),
+                _para("这一段是以句号结尾的正文内容。", size=12.0),
+            ],
+            (0, 2),
+            id="stops-before-numbered-heading",
+        ),
+        pytest.param(
+            # Length-demoted heading (outline_level=None, outline_level_raw=1)
+            # still serves as a boundary.
+            [
+                _para("公司数字化转型白皮书", size=22.0),
+                _para("研发中心发布", size=12.0),
+                _para(
+                    "某个被样式标成标题却因过长而被降级的段落标题行内容",
+                    size=14.0,
+                    outline_level=None,
+                    outline_level_raw=1,
+                ),
+                _para("这一段是以句号结尾的正文内容。", size=12.0),
+            ],
+            (0, 2),
+            id="boundary-uses-raw-outline-level",
+        ),
+        pytest.param(
+            # OR dominance: 18pt beats 16pt following heading (behind imprint).
+            [
+                _para("第一章 绪论", size=20.0, outline_level_raw=0),
+                _para("抄送：各相关单位", size=12.0),
+                _para("某某办公室 2026年6月30日 印发", size=12.0),
+                _para("某某产品发布公告", size=18.0),
+                _para("配套的说明行", size=12.0),
+                _para("一段以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
+                _para("第二章 概览", size=16.0, outline_level_raw=0),
+            ],
+            (3, 5),
+            id="dominant-over-one-flank",
+        ),
+        pytest.param(
+            # Unstructured doc (no neighbor headings): +2pt absolute bar suffices.
+            [
+                _para("公司数字化转型白皮书", size=14.0),
+                _para("研发中心发布", size=12.0),
+                _para("这一段是以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
+            ],
+            (0, 2),
+            id="dominance-passes-without-neighbor-headings",
+        ),
+    ],
+)
+def test_multi_window_admitted_cases(records, expected_span: tuple[int, int]) -> None:
+    cands = _find(records)
+    assert len(cands) == 1
+    c = cands[0]
+    assert not c.single and c.trigger == "multi_window"
+    assert (c.start, c.end) == expected_span
 
-    This matches the single-paragraph
-    channel. The old +1pt strong-signal tier let ordinary section-heading
-    sizes open windows, so it is no longer sufficient on its own."""
-    # +1pt over base: below the (now unified) +2pt bar → no title line.
-    plus_one = [
-        _para("产品技术白皮书", size=13.0),
-        _para("研发中心", size=12.0),
-        _para("这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。", size=12.0),
-    ]
-    assert _find(plus_one) == []
 
-    # +2pt over base clears the bar → a multi_window candidate.
-    plus_two = [
-        _para("产品技术白皮书", size=14.0),
-        _para("研发中心", size=12.0),
-        _para("这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。", size=12.0),
-    ]
-    assert [c.trigger for c in _find(plus_two)] == ["multi_window"]
-
-    # Control: at exactly base size the window carries no title line.
-    flat = [
-        _para("产品技术白皮书", size=12.0),
-        _para("研发中心", size=12.0),
-        _para("这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。", size=12.0),
-    ]
-    assert _find(flat) == []
+@pytest.mark.parametrize(
+    ("records", "assert_no_suppression_events"),
+    [
+        pytest.param(
+            # Only one non-body line at base size -> no multi or single candidate.
+            [
+                _para("孤立小字号行", size=12.0),
+                _para("这是很长的正文，它明确地以句号结尾。", size=12.0),
+            ],
+            False,
+            id="requires-two-paragraphs-and-big-line",
+        ),
+        pytest.param(
+            # +1pt over base: below the unified +2pt bar.
+            [
+                _para("产品技术白皮书", size=13.0),
+                _para("研发中心", size=12.0),
+                _para(
+                    "这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。",
+                    size=12.0,
+                ),
+            ],
+            False,
+            id="plus-one-pt-below-two-pt-bar",
+        ),
+        pytest.param(
+            # Flat at base size -> no title line.
+            [
+                _para("产品技术白皮书", size=12.0),
+                _para("研发中心", size=12.0),
+                _para(
+                    "这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。",
+                    size=12.0,
+                ),
+            ],
+            False,
+            id="flat-base-size-no-title-line",
+        ),
+        pytest.param(
+            # M1212 repro: body-sized references + numbered outline headings.
+            [
+                _para("GJB/Z 106A-2005  工艺标准化大纲编制指南", size=12.0),
+                _para("GJB/Z 114A-2015  产品标准化大纲编制指南", size=12.0),
+                _para("《M1212(ML001) 模块技术协议书》", size=12.0),
+                _para("1.4   产品简介", size=14.0, outline_level_raw=1),
+                _para("1.4.1   产品组成", size=14.0, outline_level_raw=2),
+                _para(
+                    "这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。",
+                    size=12.0,
+                ),
+            ],
+            False,
+            id="excludes-numbered-outline-headings",
+        ),
+        pytest.param(
+            # Window never starts on an outline heading, even an 18pt one.
+            [
+                _para("引言", size=18.0, outline_level_raw=0),
+                _para("研发中心", size=12.0),
+                _para("这一段是以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
+            ],
+            False,
+            id="outline-heading-not-window-start",
+        ),
+        pytest.param(
+            # Not dominant over 18pt outline headings on both flanks (ev == []).
+            [
+                _para("第一章 绪论", size=18.0, outline_level_raw=0),
+                _para("一段以句号结尾的正文内容，用来隔开上一个标题。", size=12.0),
+                _para("强调小标题", size=14.0),
+                _para("配套的说明行", size=12.0),
+                _para("一段以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
+                _para("第二章 概览", size=18.0, outline_level_raw=0),
+            ],
+            True,
+            id="not-dominant-over-outline-headings",
+        ),
+        pytest.param(
+            # Dominance reference includes numbered-but-unoutlined headings.
+            [
+                _para("第一章 绪论", size=18.0),
+                _para("一段以句号结尾的正文内容，用来隔开上一个标题。", size=12.0),
+                _para("强调小标题", size=14.0),
+                _para("配套的说明行", size=12.0),
+                _para("一段以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
+            ],
+            True,
+            id="not-dominant-over-numbered-heading",
+        ),
+    ],
+)
+def test_multi_window_rejected_cases(
+    records, assert_no_suppression_events: bool
+) -> None:
+    ev: list = []
+    assert _find(records, suppressed_events=ev) == []
+    if assert_no_suppression_events:
+        assert ev == []
 
 
 def test_title_line_uses_first_line_size_for_split_records() -> None:
-    """A soft-break-split heading is judged by its first line's size.
-
-    The whole-paragraph dominant size is not used because the
-    demoted body remainder dominates."""
+    """A soft-break-split heading is judged by its first line's size."""
     split = _para(
         "被拆分的超长主标题首行",
-        size=12.0,  # whole-paragraph dominant — swamped by the remainder
+        size=12.0,
         first_line_font_size_pt=15.0,
         demoted_body_text="降级为正文的余部内容",
     )
@@ -792,10 +981,8 @@ def test_title_line_uses_first_line_size_for_split_records() -> None:
         _para("编制单位", size=12.0),
         _para("这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。", size=12.0),
     ]
-    cands = _find(records)
-    assert [c.trigger for c in cands] == ["multi_window"]
+    assert [c.trigger for c in _find(records)] == ["multi_window"]
 
-    # Single-paragraph channel honours the same effective size (+2pt tier).
     single = _para(
         "整篇文档开头的孤立大标题",
         size=12.0,
@@ -806,110 +993,18 @@ def test_title_line_uses_first_line_size_for_split_records() -> None:
         _para("这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。", size=12.0)
         for _ in range(3)
     ]
-    cands = _find(solo)
-    assert [c.trigger for c in cands] == ["single_line"]
-
-
-# ---------------------------------------------------------------------------
-# multi-window boundary: real section headings are never title-block members
-# ---------------------------------------------------------------------------
-
-
-def test_multi_window_excludes_numbered_outline_headings() -> None:
-    """Repro (M1212 标准化大纲): body-sized reference lines followed by real
-    numbered+outlined section headings must NOT form a title block. The only
-    lines reaching the +1pt title tier were the section headings themselves;
-    excluding them leaves the reference run with no title line → no candidate,
-    so the headings keep their standing and the reference text stays body."""
-    records = [
-        _para("GJB/Z 106A-2005  工艺标准化大纲编制指南", size=12.0),
-        _para("GJB/Z 114A-2015  产品标准化大纲编制指南", size=12.0),
-        _para("《M1212(ML001) 模块技术协议书》", size=12.0),
-        _para("1.4   产品简介", size=14.0, outline_level_raw=1),
-        _para("1.4.1   产品组成", size=14.0, outline_level_raw=2),
-        _para("这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。", size=12.0),
-    ]
-    assert _find(records) == []
-
-
-def test_multi_window_stops_before_outline_heading() -> None:
-    """A real section heading TERMINATES the window rather than nuking the
-    whole candidate: a genuine cover run before it still yields a candidate
-    whose ``end`` stops at the heading."""
-    records = [
-        _para("公司数字化转型白皮书", size=22.0),  # title line
-        _para("研发中心发布", size=12.0),
-        _para("概述", size=14.0, outline_level_raw=0),  # outline heading — boundary
-        _para("这一段是以句号结尾的正文内容。", size=12.0),
-    ]
-    cands = _find(records)
-    assert len(cands) == 1 and not cands[0].single
-    assert (cands[0].start, cands[0].end) == (0, 2)  # stops before the heading
-
-
-def test_multi_window_outline_heading_not_a_window_start() -> None:
-    """A window never STARTS on a real section heading (even a big one).
-
-    Without the start guard, ``[0, 2)`` would be a multi_window candidate
-    (18pt title line + a body-sized companion); the outline heading blocks it.
-    """
-    records = [
-        _para("引言", size=18.0, outline_level_raw=0),  # outline heading — big
-        _para("研发中心", size=12.0),
-        _para("这一段是以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
-    ]
-    assert _find(records) == []
-
-
-def test_multi_window_stops_before_numbered_heading() -> None:
-    """Genuine numbering (no physical outline) is also a boundary — the
-    single-line channel already excludes it; multi-window now matches."""
-    records = [
-        _para("公司数字化转型白皮书", size=22.0),
-        _para("研发中心发布", size=12.0),
-        _para("第二章 总体设计", size=14.0),  # genuine numbering, no outline
-        _para("这一段是以句号结尾的正文内容。", size=12.0),
-    ]
-    # numbering_veto defaults to _stub_no_veto → the numbering stays genuine.
-    cands = _find(records)
-    assert len(cands) == 1 and (cands[0].start, cands[0].end) == (0, 2)
-
-
-def test_multi_window_boundary_uses_raw_outline_level() -> None:
-    """Field-choice pin: a length-demoted heading (``outline_level`` None,
-    ``outline_level_raw`` set) is still a boundary. Using the post-policy
-    ``outline_level`` would miss it and sweep its text into the block, where
-    a title-block member's text is lost — so the raw level is the right test.
-    """
-    records = [
-        _para("公司数字化转型白皮书", size=22.0),
-        _para("研发中心发布", size=12.0),
-        _para(
-            "某个被样式标成标题却因过长而被降级的段落标题行内容",
-            size=14.0,
-            outline_level=None,
-            outline_level_raw=1,
-        ),
-        _para("这一段是以句号结尾的正文内容。", size=12.0),
-    ]
-    cands = _find(records)
-    assert len(cands) == 1 and (cands[0].start, cands[0].end) == (0, 2)
+    assert [c.trigger for c in _find(solo)] == ["single_line"]
 
 
 def test_single_candidate_outline_heading_excluded() -> None:
-    """The single-paragraph channel excludes real section headings too: an
-    outline-carrying heading at a boundary (here doc start) is a top-level
-    heading for the outline anchor path, not a level-0 title block — mirroring
-    the numbering exclusion so a genuine heading never splits sub-documents."""
+    """The single-paragraph channel excludes real outline headings."""
     records = [
-        _para("引言", size=18.0, outline_level_raw=0),  # Heading-1 at doc start
+        _para("引言", size=18.0, outline_level_raw=0),
         _para("正文第一段说明了总体情况。", size=12.0),
         _para("正文第二段继续说明。", size=12.0),
     ]
     assert _find(records) == []
 
-    # Control: the same lone big first line WITHOUT an outline is still a
-    # single-paragraph candidate (the feature is intact for non-headings).
     plain = [
         _para("某某产品发布公告", size=18.0),
         _para("正文第一段说明了总体情况。", size=12.0),
@@ -919,118 +1014,19 @@ def test_single_candidate_outline_heading_excluded() -> None:
     assert len(cands) == 1 and cands[0].single and cands[0].start == 0
 
 
-# ---------------------------------------------------------------------------
-# visual-dominance gate (Rule 2): a title block must out-size a neighbouring
-# section heading on at least one flank
-# ---------------------------------------------------------------------------
-
-
-def test_multi_window_rejected_when_not_dominant_over_headings() -> None:
-    """A cluster whose biggest line is SMALLER than the neighbouring section
-    headings is a mid-body emphasis block, not a cover title — rejected even
-    though the line clears +2pt over body."""
-    records = [
-        _para("第一章 绪论", size=18.0, outline_level_raw=0),  # heading before
-        _para("一段以句号结尾的正文内容，用来隔开上一个标题。", size=12.0),
-        _para("强调小标题", size=14.0),  # +2pt over body, but < 18pt headings
-        _para("配套的说明行", size=12.0),
-        _para("一段以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
-        _para("第二章 概览", size=18.0, outline_level_raw=0),  # heading after
-    ]
-    # window is [2, 4): 强调小标题(14) + 配套的说明行(12); flanked by 18pt
-    # headings on both sides → 14 is not dominant → no candidate. The empty
-    # suppression ledger proves DOMINANCE rejected it, not the position gate.
-    ev: list = []
-    assert _find(records, suppressed_events=ev) == []
-    assert ev == []
-
-
-def test_multi_window_admitted_when_dominant_over_one_flank() -> None:
-    """OR semantics: dominating the heading on EITHER flank is enough. The
-    window sits mid-document, so a real 抄送→印发 imprint tail precedes it to
-    clear the position gate (doubling as an imprint-adjacency opening test)."""
-    records = [
-        _para("第一章 绪论", size=20.0, outline_level_raw=0),  # bigger flank
-        _para("抄送：各相关单位", size=12.0),  # imprint anchor
-        _para("某某办公室 2026年6月30日 印发", size=12.0),  # imprint closer
-        _para("某某产品发布公告", size=18.0),  # title line
-        _para("配套的说明行", size=12.0),
-        _para("一段以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
-        _para("第二章 概览", size=16.0, outline_level_raw=0),  # smaller flank
-    ]
-    # 18pt beats the 16pt following heading (though not the 20pt preceding
-    # one) → dominant on one flank → candidate over [3, 5).
-    cands = _find(records)
-    assert len(cands) == 1 and (cands[0].start, cands[0].end) == (3, 5)
-
-
-def test_multi_window_dominance_passes_without_neighbor_headings() -> None:
-    """No comparable section heading flanks the window (unstructured doc) →
-    the relative rule is inapplicable and passes; the +2pt absolute bar still
-    guards the candidate."""
-    records = [
-        _para("公司数字化转型白皮书", size=14.0),  # +2pt, no heading neighbours
-        _para("研发中心发布", size=12.0),
-        _para("这一段是以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
-    ]
-    cands = _find(records)
-    assert len(cands) == 1 and (cands[0].start, cands[0].end) == (0, 2)
-
-
-def test_dominance_reference_includes_numbered_headings() -> None:
-    """The neighbour reference is a real heading = physical outline OR genuine
-    numbering; a numbered-but-un-outlined heading still counts."""
-    records = [
-        _para("第一章 绪论", size=18.0),  # genuine numbering, NO outline level
-        _para("一段以句号结尾的正文内容，用来隔开上一个标题。", size=12.0),
-        _para("强调小标题", size=14.0),  # +2pt, but < 18pt numbered heading
-        _para("配套的说明行", size=12.0),
-        _para("一段以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
-    ]
-    # Only flank heading is numbered (no outline) but still bounds dominance;
-    # 14 < 18 and no other neighbour → not dominant → no candidate. The empty
-    # suppression ledger proves DOMINANCE rejected it, not the position gate.
-    ev: list = []
-    assert _find(records, suppressed_events=ev) == []
-    assert ev == []
-
-
 def test_dominance_ignores_headings_beyond_flank_window(monkeypatch) -> None:
-    """Section headings farther than K=20 paragraphs from the window are not
-    compared against; with a small K the distant big heading is ignored and
-    the window (no near neighbour) passes on the fallback. The window sits at
-    the document head so the mid-document position gate stays out of play."""
+    """Section headings farther than ``_FLANK_WINDOW`` paragraphs are ignored."""
     import lightrag.parser.docx.smart_heading.title_block as tb
 
     monkeypatch.setattr(tb, "_FLANK_WINDOW", 1)
     records = [
-        _para("某某产品发布公告", size=14.0),  # title line, +2pt over body
+        _para("某某产品发布公告", size=14.0),
         _para("配套的说明行", size=12.0),
         _para("一段以句号结尾的正文内容，用来终止窗口生长。", size=12.0),
-        _para("第一章 绪论", size=20.0, outline_level_raw=0),  # 2 paras away
+        _para("第一章 绪论", size=20.0, outline_level_raw=0),
     ]
-    # With K=1 the 20pt heading (2 records past the window end) is out of
-    # reach → no comparable neighbour → dominance passes → candidate.
     cands = _find(records)
     assert len(cands) == 1 and (cands[0].start, cands[0].end) == (0, 2)
-
-
-def test_mid_document_candidate_after_previous_page_break_run_rejected() -> None:
-    """A trailing page-break run in the previous paragraph must not turn the
-    next big line into a level-0 candidate. The trailing break is expressed
-    on BOTH the aggregate and the nonleading field — the boundary helper
-    reads only ``has_nonleading_page_break_run``."""
-    records = [
-        _para(
-            "上一篇的收尾正文，以句号结尾。",
-            size=12.0,
-            has_page_break_run=True,
-            has_nonleading_page_break_run=True,
-        ),
-        _para("下一篇文章的标题", size=18.0),
-        _para("下一篇正文开始，以句号结尾。", size=12.0),
-    ]
-    assert _find(records) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1066,55 +1062,89 @@ def _cover_tables() -> list[ParagraphRecord]:
     ]
 
 
-def test_table_window_merges_adjacent_qualifying_tables() -> None:
-    """Adjacent member-qualifying tables (blank lines between are fine) merge
-    into ONE table_window candidate spanning form + title + publisher."""
-    records = _cover_tables() + [
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    cands = _find(records)
-    assert len(cands) == 1
-    c = cands[0]
-    assert c.table and c.trigger == "table_window" and not c.single
-    assert (c.start, c.end) == (0, 4)
-
-
-def test_table_window_prefix_breaks_at_disqualified_table() -> None:
-    """Rule 3: the first non-qualifying table ends the window AND the run —
-    a later qualifying table in the same run never seeds a new window."""
-    data_table = _table(
-        [[("序号", 10.5, False), ("这一格是以句号结尾的数据内容。", 10.5, False)]]
-    )
-    records = [
-        _table([[("产品标准化大纲", 22.0, False)]]),
-        data_table,
-        _table([[("另一份大字标题", 22.0, False)]]),  # after the break: ignored
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    cands = _find(records)
-    assert len(cands) == 1
-    assert (cands[0].start, cands[0].end) == (0, 1)  # prefix only
-
-
-def test_table_window_requires_qualifying_first_table() -> None:
-    """A run whose FIRST table is disqualified yields no candidate at all,
-    even though a qualifying title table follows in the same run."""
-    records = [
-        _table(
-            [[("序号", 10.5, False), ("这一格是以句号结尾的数据内容。", 10.5, False)]]
+@pytest.mark.parametrize(
+    ("records_factory", "expected_span"),
+    [
+        pytest.param(
+            # Adjacent qualifying tables (blank lines between ok) merge into one.
+            lambda: (
+                _cover_tables() + [_para("正文从这里开始，以句号结尾。", size=12.0)]
+            ),
+            (0, 4),
+            id="merges-adjacent-qualifying-tables",
         ),
-        _table([[("产品标准化大纲", 22.0, False)]]),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    assert _find(records) == []
+        pytest.param(
+            # First disqualified table ends the window AND the run.
+            lambda: [
+                _table([[("产品标准化大纲", 22.0, False)]]),
+                _table(
+                    [
+                        [
+                            ("序号", 10.5, False),
+                            ("这一格是以句号结尾的数据内容。", 10.5, False),
+                        ]
+                    ]
+                ),
+                _table([[("另一份大字标题", 22.0, False)]]),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            (0, 1),
+            id="prefix-breaks-at-disqualified-table",
+        ),
+        pytest.param(
+            # Disqualified first table yields no candidate even if another follows.
+            lambda: [
+                _table(
+                    [
+                        [
+                            ("序号", 10.5, False),
+                            ("这一格是以句号结尾的数据内容。", 10.5, False),
+                        ]
+                    ]
+                ),
+                _table([[("产品标准化大纲", 22.0, False)]]),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            None,
+            id="requires-qualifying-first-table",
+        ),
+        pytest.param(
+            # Dominance gate rejects table smaller than flanking section headings.
+            lambda: [
+                _para("第一章 绪论", size=20.0, outline_level_raw=0),
+                _para("一段以句号结尾的正文，用来隔开标题。", size=12.0),
+                _table([[("强调框标题", 14.0, False)]]),
+                _para("一段以句号结尾的正文。", size=12.0),
+                _para("第二章 概览", size=20.0, outline_level_raw=0),
+            ],
+            None,
+            id="dominance-gate-rejects-smaller-table",
+        ),
+    ],
+)
+def test_table_window_discovery_cases(
+    records_factory, expected_span: tuple[int, int] | None
+) -> None:
+    cands = _find(records_factory())
+    if expected_span is None:
+        assert cands == []
+    else:
+        assert len(cands) == 1
+        c = cands[0]
+        assert c.table and c.trigger == "table_window" and not c.single
+        assert (c.start, c.end) == expected_span
 
 
 @pytest.mark.parametrize(
     "bad_cell",
     [
-        ("这一格是以句号结尾的正文语句。", 10.5, False),  # strong body
-        ("超" * 40, 10.5, False),  # 40 CJK = 120 weighted > 90 cap
-        ("带物理大纲的格", 10.5, True),  # physical outline
+        pytest.param(("这一格是以句号结尾的正文语句。", 10.5, False), id="strong-body"),
+        pytest.param(("超" * 40, 10.5, False), id="over-90-weighted-cap"),
+        pytest.param(("带物理大纲的格", 10.5, True), id="physical-outline"),
+        pytest.param(("抄送：市委各部门", 10.5, False), id="imprint-marker"),
+        pytest.param(
+            ("某某办公室 2026年6月30日 印发", 10.5, False), id="imprint-closer"
+        ),
     ],
 )
 def test_table_member_gate_rejects_bad_cells(bad_cell) -> None:
@@ -1129,48 +1159,34 @@ def test_table_member_gate_rejects_bad_cells(bad_cell) -> None:
 def test_table_title_row_requires_single_big_unnumbered_cell() -> None:
     """Rule 1: the title row is a single-PHYSICAL-cell row at the +2pt tier
     whose text has no genuine numbering."""
-    # (a) all sizes below fs_base+2 → no title row.
+    # (a) all sizes below fs_base+2 -> no title row.
     records = [
         _table([[("产品标准化大纲", 13.0, False)]]),
         _para("正文从这里开始，以句号结尾。", size=12.0),
     ]
     assert _find(records) == []
 
-    # (b) big text but in a MULTI-cell row → not a title row.
+    # (b) big text but in a MULTI-cell row -> not a title row.
     records = [
         _table([[("产品标准化大纲", 22.0, False), ("旁边一格", 10.5, False)]]),
         _para("正文从这里开始，以句号结尾。", size=12.0),
     ]
     assert _find(records) == []
 
-    # (c) genuine numbering disqualifies the title row (consistent with the
-    # paragraph channels)…
+    # (c) genuine numbering disqualifies the title row...
     records = [
         _table([[("第二章 总体设计", 22.0, False)]]),
         _para("正文从这里开始，以句号结尾。", size=12.0),
     ]
     assert _find(records) == []
 
-    # …but the homophone veto keeps a date-opener title alive.
+    # ...but the homophone veto keeps a date-opener title alive.
     records = [
         _table([[("2026年度工作报告", 22.0, False)]]),
         _para("正文从这里开始，以句号结尾。", size=12.0),
     ]
     cands = _find(records, numbering_veto=_stub_always_veto)
     assert len(cands) == 1 and cands[0].table
-
-
-def test_table_window_dominance_gate() -> None:
-    """The table window shares the visual-dominance gate: a bigger real
-    heading on both flanks rejects the candidate."""
-    records = [
-        _para("第一章 绪论", size=20.0, outline_level_raw=0),
-        _para("一段以句号结尾的正文，用来隔开标题。", size=12.0),
-        _table([[("强调框标题", 14.0, False)]]),  # +2pt but < 20pt heading
-        _para("一段以句号结尾的正文。", size=12.0),
-        _para("第二章 概览", size=20.0, outline_level_raw=0),
-    ]
-    assert _find(records) == []
 
 
 # --- judge: table candidates ------------------------------------------------
@@ -1219,38 +1235,29 @@ def test_table_verdict_locates_against_cell_texts() -> None:
         )
 
 
-def test_table_non_title_verdict_ignored() -> None:
-    """A non-title verdict for a table window names/vetoes nothing (D3):
-    cells are not paragraph records, so the partition is ignored even when
-    it is malformed."""
-    decision = _judge_with(
-        {"is_title_block": False, "headings": [0, 0], "body": []},  # malformed
-        records=_TABLE_RECORDS,
-        candidate=_TABLE_CANDIDATE,
-    )
-    assert not decision.is_title_block
-    assert decision.heading_indices == () and decision.body_indices == ()
-
-
-def test_table_non_title_verdict_well_formed_partition_still_ignored() -> None:
-    """Guarantee boundary: even a WELL-FORMED non-empty partition never
-    escapes a table window — cell content can never be named a heading or
-    vetoed through this channel. The guarantee lives in judge_title_block's
-    short-circuit (before partition parsing), so it holds independent of any
-    downstream fallback path."""
-    decision = _judge_with(
-        {"is_title_block": False, "headings": [0, 1], "body": [2]},
-        records=_TABLE_RECORDS,
-        candidate=_TABLE_CANDIDATE,
-    )
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            {"is_title_block": False, "headings": [0, 0], "body": []},
+            id="malformed-partition",
+        ),
+        pytest.param(
+            {"is_title_block": False, "headings": [0, 1], "body": [2]},
+            id="well-formed-partition",
+        ),
+    ],
+)
+def test_table_non_title_verdict_always_ignored(payload: dict) -> None:
+    """A non-title verdict for a table window short-circuits before partition
+    parsing: cells can never be named headings or vetoed."""
+    decision = _judge_with(payload, records=_TABLE_RECORDS, candidate=_TABLE_CANDIDATE)
     assert not decision.is_title_block
     assert decision.heading_indices == () and decision.body_indices == ()
 
 
 # ---------------------------------------------------------------------------
-# font-size evidence legend (the M1212 regression: a metadata-heavy table
-# cover whose 22pt title the text-only window could not distinguish from
-# the surrounding form labels)
+# font-size evidence legend & table region separators
 # ---------------------------------------------------------------------------
 
 
@@ -1268,203 +1275,202 @@ def _prompt_for(records, candidate, *, fs_base_pt=None, payload=None):
     return seen["prompt"]
 
 
-def test_table_window_legend_tiers_largest_over_enlarged() -> None:
-    """M1212 regression shape: form-metadata tables + a 22pt title table +
-    a 16pt publisher table + an absorbed 16pt next-page heading. The legend
-    lists the 22pt lines as LARGEST and the 16pt lines one tier below, so
-    the enlarged-but-not-title lines never read as strongly."""
-    records = [
-        _table(
+@pytest.mark.parametrize(
+    ("records", "expected_snippets"),
+    [
+        pytest.param(
+            # M1212 shape: 22pt title table + 16pt publisher/absorbed heading.
             [
-                [("档 号", 10.5, False), ("", None, False)],
-                [("版 本 号", 10.5, False), ("1V1.0.0", 10.5, False)],
-            ]
+                _table(
+                    [
+                        [("档 号", 10.5, False), ("", None, False)],
+                        [("版 本 号", 10.5, False), ("1V1.0.0", 10.5, False)],
+                    ]
+                ),
+                _table(
+                    [[("产品标准化大纲", 22.0, False)], [("某某模块", 22.0, False)]]
+                ),
+                _table([[("某某电子股份有限公司", 16.0, False)]]),
+                _para("更 改 记 录", size=16.0),
+            ],
+            (
+                "Font-size evidence — largest tier: [3]=22pt, [4]=22pt",
+                "second tier: [5]=16pt, [6]=16pt",
+                "(body ≈ 12pt)",
+            ),
+            id="largest-over-enlarged",
         ),
-        _table([[("产品标准化大纲", 22.0, False)], [("某某模块", 22.0, False)]]),
-        _table([[("某某电子股份有限公司", 16.0, False)]]),
-        _para("更 改 记 录", size=16.0),  # absorbed next-page heading
-    ]
-    candidate = TitleBlockCandidate(
-        start=0,
-        end=4,
-        single=False,
-        trigger="table_window",
-        table=True,
-        members=(0, 1, 2, 3),
-    )
-    prompt = _prompt_for(records, candidate, fs_base_pt=12.0)
-    # Window lines: [0] 档 号, [1] 版 本 号, [2] 1V1.0.0, [3] 产品标准化大纲,
-    # [4] 某某模块, [5] 某某电子股份有限公司, [6] 更 改 记 录.
-    assert "Font-size evidence — largest tier: [3]=22pt, [4]=22pt" in prompt
-    assert "second tier: [5]=16pt, [6]=16pt" in prompt
-    assert "(body ≈ 12pt)" in prompt
-
-
-def test_dominance_legend_three_tiers() -> None:
-    """Three distinct enlarged sizes split into largest / second / other."""
-    records = [
-        _table([[("最大标题", 22.0, False)]]),
-        _table([[("第二大行", 16.0, False)]]),
-        _table([[("第三档行", 14.0, False)]]),
-    ]
+        pytest.param(
+            # Three distinct enlarged sizes split into largest / second / other.
+            [
+                _table([[("最大标题", 22.0, False)]]),
+                _table([[("第二大行", 16.0, False)]]),
+                _table([[("第三档行", 14.0, False)]]),
+            ],
+            (
+                "Font-size evidence — largest tier: [0]=22pt",
+                "second tier: [1]=16pt",
+                "other enlarged: [2]=14pt",
+                "two largest tiers",
+            ),
+            id="three-tiers",
+        ),
+    ],
+)
+def test_table_window_font_size_legend_tiers(
+    records, expected_snippets: tuple[str, ...]
+) -> None:
     cand = TitleBlockCandidate(
         start=0,
-        end=3,
+        end=len(records),
         single=False,
         trigger="table_window",
         table=True,
-        members=(0, 1, 2),
+        members=tuple(range(len(records))),
     )
     prompt = _prompt_for(records, cand, fs_base_pt=12.0)
-    assert "Font-size evidence — largest tier: [0]=22pt" in prompt
-    assert "second tier: [1]=16pt" in prompt
-    assert "other enlarged: [2]=14pt" in prompt
-    assert "two largest tiers" in prompt
+    for snippet in expected_snippets:
+        assert snippet in prompt
 
 
-def test_table_window_separators_isolate_each_frame() -> None:
-    """Each member table renders as its own region, delimited by an unindexed
-    separator, so the title frame stands alone (the M1212 fix). Indices stay
-    global/contiguous over emitted cells; separators carry no index and never
-    enter the canon."""
-    from lightrag.parser.docx.smart_heading.title_block import (
-        _TABLE_REGION_SEPARATOR,
-        _render_table_window,
-    )
-
-    records = [
-        _table([[("档 号", 12.0, False)], [("版 本 号", 12.0, False)]]),
-        _table([[("M1212(ML001) 模块", 22.0, False)], [("标准化大纲", 22.0, False)]]),
-        _table([[("长沙电子股份有限公司", 16.0, False)]]),
-    ]
-    cand = TitleBlockCandidate(
-        start=0,
-        end=3,
-        single=False,
-        trigger="table_window",
-        table=True,
-        members=(0, 1, 2),
-    )
-    window, members, canon, sizes, separated = _render_table_window(records, cand, {})
-    assert separated is True
-    assert window.count(_TABLE_REGION_SEPARATOR) == 2  # three frames, two gaps
-    # the title cells sit alone between two separators
-    assert "----------\n[2] M1212(ML001) 模块\n[3] 标准化大纲\n----------" in window
-    assert len(sizes) == 5  # 档号,版本号,标题,副标题,机关 — separators unindexed
-    assert not window.endswith(_TABLE_REGION_SEPARATOR)  # never dangling
-    assert _TABLE_REGION_SEPARATOR not in canon
-    # {indices} the LLM must classify counts emitted CELLS only (0..4), not the
-    # raw 7 lines — pre-fix splitlines() would have inflated to 0..6.
-    prompt = _prompt_for(records, cand, fs_base_pt=12.0)
-    assert "— 0, 1, 2, 3, 4 —" in prompt
-    assert "0, 1, 2, 3, 4, 5" not in prompt
-
-
-def test_table_window_pure_image_gap_yields_one_separator() -> None:
-    """table → pure-<drawing/> paragraph → table: the image renders nothing,
-    yet the two text tables keep EXACTLY ONE boundary (pending-boundary state
-    machine, not a naive adjacent-region check that would drop it)."""
-    from lightrag.parser.docx.smart_heading.title_block import (
-        _TABLE_REGION_SEPARATOR,
-        _render_table_window,
-    )
-
-    records = [
-        _table([[("甲表内容", 12.0, False)]]),
-        _para('<drawing id="1" name="印章"/>', size=12.0),  # renders no line
-        _table([[("乙表内容", 12.0, False)]]),
-    ]
-    cand = TitleBlockCandidate(
-        start=0,
-        end=3,
-        single=False,
-        trigger="table_window",
-        table=True,
-        members=(0, 1, 2),
-    )
-    window, members, canon, sizes, separated = _render_table_window(records, cand, {})
-    assert window.count(_TABLE_REGION_SEPARATOR) == 1
-    assert len(sizes) == 2  # only the two table cells are indexed
-    assert list(members) == [0, 1, 2]  # image paragraph stays a member
-
-
-def test_table_window_consecutive_paras_share_one_region() -> None:
-    """A run of consecutive absorbed paragraphs is ONE frame (inter-table text
-    flow): only the table↔paragraph transition opens a boundary, so no
-    separator falls between the two paragraphs."""
-    from lightrag.parser.docx.smart_heading.title_block import (
-        _TABLE_REGION_SEPARATOR,
-        _render_table_window,
-    )
-
-    records = [
-        _table([[("表格行", 12.0, False)]]),
-        _para("封面材料段一", size=12.0),
-        _para("封面材料段二", size=12.0),
-    ]
-    cand = TitleBlockCandidate(
-        start=0,
-        end=3,
-        single=False,
-        trigger="table_window",
-        table=True,
-        members=(0, 1, 2),
-    )
-    window, _members, _canon, _sizes, _sep = _render_table_window(records, cand, {})
-    assert window.count(_TABLE_REGION_SEPARATOR) == 1  # table -> para-run only
-    assert "[1] 封面材料段一\n[2] 封面材料段二" in window  # paras not separated
-
-
-def test_table_window_single_table_no_separator_no_note() -> None:
-    """A single-table window carries neither a separator nor the layout note —
-    it reads exactly as before the region change."""
+@pytest.mark.parametrize(
+    (
+        "records",
+        "expected_separated",
+        "expected_sep_count",
+        "expected_sizes_len",
+        "window_snippet",
+        "expect_layout_note",
+        "prompt_checks",
+    ),
+    [
+        pytest.param(
+            # Three tables -> two separators, unindexed, exact prompt index list.
+            [
+                _table([[("档 号", 12.0, False)], [("版 本 号", 12.0, False)]]),
+                _table(
+                    [
+                        [("M1212(ML001) 模块", 22.0, False)],
+                        [("标准化大纲", 22.0, False)],
+                    ]
+                ),
+                _table([[("长沙电子股份有限公司", 16.0, False)]]),
+            ],
+            True,
+            2,
+            5,
+            "----------\n[2] M1212(ML001) 模块\n[3] 标准化大纲\n----------",
+            True,
+            ("— 0, 1, 2, 3, 4 —", "0, 1, 2, 3, 4, 5"),
+            id="three-frames-two-separators",
+        ),
+        pytest.param(
+            # table -> pure-<drawing/> -> table: image renders nothing, 1 separator.
+            [
+                _table([[("甲表内容", 12.0, False)]]),
+                _para('<drawing id="1" name="印章"/>', size=12.0),
+                _table([[("乙表内容", 12.0, False)]]),
+            ],
+            True,
+            1,
+            2,
+            None,
+            None,
+            None,
+            id="pure-image-gap-yields-one-separator",
+        ),
+        pytest.param(
+            # Consecutive absorbed paragraphs share one region (no separator between).
+            [
+                _table([[("表格行", 12.0, False)]]),
+                _para("封面材料段一", size=12.0),
+                _para("封面材料段二", size=12.0),
+            ],
+            True,
+            1,
+            3,
+            "[1] 封面材料段一\n[2] 封面材料段二",
+            None,
+            None,
+            id="consecutive-paras-share-one-region",
+        ),
+        pytest.param(
+            # Single-table window: no separator and no layout note.
+            [_table([[("某某公司管理办法", 22.0, False)]])],
+            False,
+            0,
+            1,
+            None,
+            False,
+            None,
+            id="single-table-no-separator-no-note",
+        ),
+        pytest.param(
+            # Two tables: layout note appears and precedes the font-size legend.
+            [
+                _table([[("档 号", 12.0, False)]]),
+                _table([[("某某白皮书", 22.0, False)]]),
+            ],
+            True,
+            1,
+            2,
+            None,
+            True,
+            None,
+            id="two-tables-layout-note-precedes-legend",
+        ),
+    ],
+)
+def test_table_window_region_separators(
+    records,
+    expected_separated: bool,
+    expected_sep_count: int,
+    expected_sizes_len: int,
+    window_snippet: str | None,
+    expect_layout_note: bool | None,
+    prompt_checks: tuple[str, str] | None,
+) -> None:
     from lightrag.parser.docx.smart_heading.title_block import (
         _TABLE_LAYOUT_NOTE,
         _TABLE_REGION_SEPARATOR,
         _render_table_window,
     )
 
-    records = [_table([[("某某公司管理办法", 22.0, False)]])]
     cand = TitleBlockCandidate(
         start=0,
-        end=1,
+        end=len(records),
         single=False,
         trigger="table_window",
         table=True,
-        members=(0,),
+        members=tuple(range(len(records))),
     )
-    window, _m, _c, _s, separated = _render_table_window(records, cand, {})
-    assert separated is False
-    assert _TABLE_REGION_SEPARATOR not in window
-    assert _TABLE_LAYOUT_NOTE not in _prompt_for(records, cand, fs_base_pt=12.0)
+    window, members, canon, sizes, separated = _render_table_window(records, cand, {})
+    assert separated is expected_separated
+    assert window.count(_TABLE_REGION_SEPARATOR) == expected_sep_count
+    assert len(sizes) == expected_sizes_len
+    assert list(members) == list(range(len(records)))
+    assert not window.endswith(_TABLE_REGION_SEPARATOR)
+    assert _TABLE_REGION_SEPARATOR not in canon
+    if window_snippet is not None:
+        assert window_snippet in window
+    if expect_layout_note is not None or prompt_checks is not None:
+        prompt = _prompt_for(records, cand, fs_base_pt=12.0)
+        if expect_layout_note is True:
+            assert _TABLE_LAYOUT_NOTE in prompt
+            assert prompt.index(_TABLE_LAYOUT_NOTE) < prompt.index("Font-size evidence")
+        elif expect_layout_note is False:
+            assert _TABLE_LAYOUT_NOTE not in prompt
+        if prompt_checks is not None:
+            present, absent = prompt_checks
+            assert present in prompt
+            assert absent not in prompt
 
 
-def test_table_window_layout_note_only_when_separated() -> None:
-    """The frame-layout note precedes the font-size legend, and only when the
-    window actually carries a separator."""
-    from lightrag.parser.docx.smart_heading.title_block import _TABLE_LAYOUT_NOTE
-
-    records = [
-        _table([[("档 号", 12.0, False)]]),
-        _table([[("某某白皮书", 22.0, False)]]),
-    ]
-    cand = TitleBlockCandidate(
-        start=0,
-        end=2,
-        single=False,
-        trigger="table_window",
-        table=True,
-        members=(0, 1),
-    )
-    prompt = _prompt_for(records, cand, fs_base_pt=12.0)
-    assert _TABLE_LAYOUT_NOTE in prompt
-    assert prompt.index(_TABLE_LAYOUT_NOTE) < prompt.index("Font-size evidence")
-
-
-def test_table_window_truncation_at_boundary_drops_separator_whole() -> None:
+def test_table_window_truncation_at_boundary_drops_separator_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A cap hit at a region boundary drops the separator AND its following
-    line together — never a dangling separator; the index count stays equal to
-    the emitted-cell count and the canon is separator-free."""
+    line together — never a dangling separator."""
     from lightrag.parser.docx.smart_heading.title_block import (
         _TABLE_REGION_SEPARATOR,
         _render_table_window,
@@ -1482,25 +1488,13 @@ def test_table_window_truncation_at_boundary_drops_separator_whole() -> None:
         table=True,
         members=(0, 1),
     )
-    monkey_cap = "5"
-    import os
-
-    prev = os.environ.get("DOCX_SMART_LLM_WINDOW_TOKENS")
-    os.environ["DOCX_SMART_LLM_WINDOW_TOKENS"] = monkey_cap
-    try:
-        warnings: dict = {}
-        window, _m, canon, sizes, separated = _render_table_window(
-            records, cand, warnings
-        )
-    finally:
-        if prev is None:
-            os.environ.pop("DOCX_SMART_LLM_WINDOW_TOKENS", None)
-        else:
-            os.environ["DOCX_SMART_LLM_WINDOW_TOKENS"] = prev
-    assert separated is False  # boundary dropped whole with its line
+    monkeypatch.setenv("DOCX_SMART_LLM_WINDOW_TOKENS", "5")
+    warnings: dict = {}
+    window, _m, canon, sizes, separated = _render_table_window(records, cand, warnings)
+    assert separated is False
     assert _TABLE_REGION_SEPARATOR not in window
     assert not window.endswith(_TABLE_REGION_SEPARATOR)
-    assert len(window.splitlines()) == len(sizes) == 1  # only 甲 survived
+    assert len(window.splitlines()) == len(sizes) == 1
     assert _TABLE_REGION_SEPARATOR not in canon
     assert warnings.get("title_block_window_truncated") == 1
 
@@ -1656,85 +1650,76 @@ def test_imprint_line_never_single_candidate() -> None:
     assert len(cands) == 1 and cands[0].single and cands[0].start == 0
 
 
-def test_imprint_neighbor_veto_blocks_single_candidate() -> None:
-    """Tail signature/date lines above an imprint line stop being title
-    candidates; without the imprint line the same area yields one."""
-    body = [_para(f"正文段落{i}，以句号结尾。", size=12.0) for i in range(3)]
-    records = body + [
-        _empty(),
-        _para("某某市人民政府办公室", size=18.0, alignment="center"),  # 4
-        _empty(),
-        _para("二〇二六年七月一日", size=12.0),  # 6 ← vetoed
-        _para("抄送：各县区人民政府", size=12.0),  # 7 anchor
-    ]
-    assert _find(records) == []
-    # Control: drop the imprint line → the signature line is a candidate.
-    # The window is mid-document; a stub boundary index (the last body
-    # paragraph) props the position gate open so the control isolates the
-    # preceding-veto behavior under test, not the gate.
-    cands = _find(records[:-1], imprint_boundary_indices={2})
-    assert len(cands) == 1 and cands[0].start == 4
-
-
-def test_imprint_neighbor_walk_skips_blank_paras() -> None:
-    """The backward walk skips empty/whitespace-only paragraphs without
-    consuming the 2-paragraph budget."""
-    records = [
-        _para("某某公司发文稿纸", size=22.0),  # 0 ← vetoed (2nd preceding)
-        _empty(),
-        _para("某某办公室", size=12.0),  # 2 ← vetoed (1st preceding)
-        _para("   ", size=12.0),  # whitespace-only para: skipped, not counted
-        _para("抄送：各成员单位", size=12.0),  # 4 anchor
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    assert _find(records) == []
-    assert len(_find(records, imprint_marker=lambda t: None)) == 1
-
-
-def test_imprint_neighbor_walk_stops_at_table() -> None:
-    """A non-paragraph record is a structural boundary: the veto never leaks
-    across it, so the window above the table survives intact."""
-    records = [
-        _para("产品发布白皮书", size=22.0),  # 0
-        _para("某某公司编", size=12.0),  # 1
-        _table([[("附件清单", 10.5, False)]]),  # 2 boundary
-        _para("某某办公室代拟", size=12.0),  # 3 ← vetoed (walk stops at table)
-        _para("抄送：各部门", size=12.0),  # 4 anchor
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
+@pytest.mark.parametrize(
+    ("records", "expected_spans", "control_records", "control_kwargs", "control_start"),
+    [
+        pytest.param(
+            # Tail signature/date lines above an imprint line are vetoed.
+            [_para(f"正文段落{i}，以句号结尾。", size=12.0) for i in range(3)]
+            + [
+                _empty(),
+                _para("某某市人民政府办公室", size=18.0, alignment="center"),
+                _empty(),
+                _para("二〇二六年七月一日", size=12.0),
+                _para("抄送：各县区人民政府", size=12.0),
+            ],
+            [],
+            [_para(f"正文段落{i}，以句号结尾。", size=12.0) for i in range(3)]
+            + [
+                _empty(),
+                _para("某某市人民政府办公室", size=18.0, alignment="center"),
+                _empty(),
+                _para("二〇二六年七月一日", size=12.0),
+            ],
+            {"imprint_boundary_indices": {2}},
+            4,
+            id="veto-blocks-single-candidate",
+        ),
+        pytest.param(
+            # Backward walk skips empty/whitespace paras without spending budget.
+            [
+                _para("某某公司发文稿纸", size=22.0),
+                _empty(),
+                _para("某某办公室", size=12.0),
+                _para("   ", size=12.0),
+                _para("抄送：各成员单位", size=12.0),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            [],
+            None,
+            {"imprint_marker": lambda t: None},
+            0,
+            id="walk-skips-blank-paras",
+        ),
+        pytest.param(
+            # Non-paragraph record (table) stops backward veto walk.
+            [
+                _para("产品发布白皮书", size=22.0),
+                _para("某某公司编", size=12.0),
+                _table([[("附件清单", 10.5, False)]]),
+                _para("某某办公室代拟", size=12.0),
+                _para("抄送：各部门", size=12.0),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            [(0, 2)],
+            None,
+            None,
+            None,
+            id="walk-stops-at-table",
+        ),
+    ],
+)
+def test_imprint_neighbor_veto_walk_cases(
+    records, expected_spans, control_records, control_kwargs, control_start
+) -> None:
     cands = _find(records)
-    assert len(cands) == 1
-    assert (cands[0].start, cands[0].end) == (0, 2)
-
-
-def test_table_member_rejects_imprint_cell() -> None:
-    """One imprint cell disqualifies the whole table from the table channel
-    (a short imprint cell is not caught by the strong-body stub)."""
-    records = [
-        _table(
-            [
-                [("产品标准化大纲", 22.0, False)],
-                [("抄送：市委各部门", 10.5, False)],
-            ]
-        ),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    assert _find(records) == []
-
-
-def test_table_member_rejects_closer_cell() -> None:
-    """A 印发-family CLOSER cell also disqualifies the table (no anchor-above
-    context in a table, so the closer must veto on its own here)."""
-    records = [
-        _table(
-            [
-                [("产品标准化大纲", 22.0, False)],
-                [("某某办公室 2026年6月30日 印发", 10.5, False)],
-            ]
-        ),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    assert _find(records) == []
+    assert [(c.start, c.end) for c in cands] == expected_spans
+    if control_kwargs is not None:
+        ctrl = _find(
+            control_records if control_records is not None else records,
+            **control_kwargs,
+        )
+        assert len(ctrl) == 1 and ctrl[0].start == control_start
 
 
 # ---------------------------------------------------------------------------
@@ -1749,186 +1734,160 @@ _FORM_TABLE_ROWS = [
 _PUB_TABLE_ROWS = [[("某某电子股份有限公司", 16.0, False)]]
 
 
-def test_image_para_no_longer_breaks_table_run() -> None:
-    """A pure <drawing/> paragraph (印章/logo) between cover tables is absorbed
-    instead of splitting the cover; members carry it in source order."""
-    records = [
-        _table([[("产品标准化大纲", 22.0, False)]]),
-        _para('<drawing id="1" name="图"/>', size=12.0),
-        _table(_PUB_TABLE_ROWS),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
+@pytest.mark.parametrize(
+    ("records", "expected_span", "expected_members"),
+    [
+        pytest.param(
+            # Pure <drawing/> between cover tables is absorbed in source order.
+            [
+                _table([[("产品标准化大纲", 22.0, False)]]),
+                _para('<drawing id="1" name="图"/>', size=12.0),
+                _table(_PUB_TABLE_ROWS),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            (0, 3),
+            (0, 1, 2),
+            id="image-para-between-tables",
+        ),
+        pytest.param(
+            # Paragraph carries the 22pt main title between two tables.
+            [
+                _table(_FORM_TABLE_ROWS),
+                _para("某某管理办法", size=22.0),
+                _table(_PUB_TABLE_ROWS),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            (0, 3),
+            (0, 1, 2),
+            id="paragraph-carries-main-title",
+        ),
+        pytest.param(
+            # Mixed <drawing/> + title text stands on semantic text length.
+            [
+                _table(_FORM_TABLE_ROWS),
+                _para(
+                    '<drawing id="1" name="logo" path="assets/very-long-path-to-'
+                    'image-file-name-here.png"/> 某某管理办法',
+                    size=22.0,
+                ),
+                _table(_PUB_TABLE_ROWS),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            (0, 3),
+            (0, 1, 2),
+            id="mixed-image-and-title-para",
+        ),
+        pytest.param(
+            # Cover-material paragraph with inline formula joins the cover.
+            [
+                _table([[("产品标准化大纲", 22.0, False)]]),
+                _para("副标题 <equation>x</equation>", size=16.0),
+                _table(_PUB_TABLE_ROWS),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            (0, 3),
+            (0, 1, 2),
+            id="cover-material-para-with-formula",
+        ),
+        pytest.param(
+            # Cover ending in a paragraph (no trailing table) stays one candidate.
+            [
+                _table(_FORM_TABLE_ROWS),
+                _para("某某管理办法", size=22.0),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            (0, 2),
+            (0, 1),
+            id="paragraph-tail-cover",
+        ),
+        pytest.param(
+            # Trailing pure-image paragraph joins the cover members.
+            [
+                _table([[("产品标准化大纲", 22.0, False)]]),
+                _para('<drawing id="9" name="印章"/>', size=12.0),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            (0, 2),
+            (0, 1),
+            id="trailing-image-para-joins-cover",
+        ),
+        pytest.param(
+            # Imprint-preceding signature line is barred from table absorption.
+            [
+                _table([[("产品标准化大纲", 22.0, False)]]),
+                _para("某某市人民政府办公室", size=12.0),
+                _para("抄送：各区人民政府", size=12.0),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            (0, 1),
+            (0,),
+            id="imprint-preceding-line-not-absorbed",
+        ),
+    ],
+)
+def test_mixed_table_cover_absorption_cases(
+    records, expected_span: tuple[int, int], expected_members: tuple[int, ...]
+) -> None:
     cands = _find(records)
     assert len(cands) == 1
     c = cands[0]
-    assert c.table and (c.start, c.end) == (0, 3)
-    assert c.members == (0, 1, 2)
+    assert c.table
+    assert (c.start, c.end) == expected_span
+    assert c.members == expected_members
 
 
-def test_mixed_cover_paragraph_carries_main_title() -> None:
-    """档号表(小字,无 title row) + 主标题段(22pt) + 发文机关表: the candidate
-    stands on the PARAGRAPH's size — the table channel is no longer
-    tables-only."""
-    records = [
-        _table(_FORM_TABLE_ROWS),
-        _para("某某管理办法", size=22.0),
-        _table(_PUB_TABLE_ROWS),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    cands = _find(records)
-    assert len(cands) == 1
-    assert cands[0].members == (0, 1, 2)
-
-
-def test_mixed_image_and_title_para_stands_on_semantic_text() -> None:
-    """logo 与主标题同段: the long drawing tag must not push the title line
-    over the length cap — length judges the semantic text, size the real
-    paragraph size."""
-    records = [
-        _table(_FORM_TABLE_ROWS),
-        _para(
-            '<drawing id="1" name="logo" path="assets/very-long-path-to-'
-            'image-file-name-here.png"/> 某某管理办法',
-            size=22.0,
+@pytest.mark.parametrize(
+    ("middle_para", "kwargs", "expected_spans"),
+    [
+        pytest.param(
+            _para("这是一段以句号结尾的正文。", size=12.0),
+            {"imprint_boundary_indices": {1}},
+            [(0, 1), (2, 3)],
+            id="strong-body-para-splits-run",
         ),
-        _table(_PUB_TABLE_ROWS),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    cands = _find(records)
-    assert len(cands) == 1
-    assert cands[0].members == (0, 1, 2)
-
-
-def test_cover_material_para_with_formula_absorbed() -> None:
-    """A short cover-material paragraph carrying an inline formula joins the
-    cover (情形 2 user ruling); the formula text rides along losslessly."""
+        pytest.param(
+            _para("第一章 总则", size=12.0, outline_level_raw=0),
+            {},
+            None,
+            id="outline-heading-para-splits-run",
+        ),
+        pytest.param(
+            _para('<drawing id="1" name="装饰"/> 第一章 总则', size=12.0),
+            {},
+            None,
+            id="drawing-prefixed-numbered-heading-splits-run",
+        ),
+    ],
+)
+def test_mixed_table_cover_breaks_on_non_cover_para(
+    middle_para, kwargs, expected_spans
+) -> None:
     records = [
         _table([[("产品标准化大纲", 22.0, False)]]),
-        _para("副标题 <equation>x</equation>", size=16.0),
+        middle_para,
         _table(_PUB_TABLE_ROWS),
         _para("正文从这里开始，以句号结尾。", size=12.0),
     ]
-    cands = _find(records)
-    assert len(cands) == 1
-    assert cands[0].members == (0, 1, 2)
-
-
-def test_body_para_still_breaks_table_run() -> None:
-    """Control: a strong-body paragraph between tables still splits the run —
-    absorption is for cover material only. A stub boundary index (the body
-    paragraph) props the mid-document gate open for the second run so the
-    assertion isolates run-splitting, not the position gate."""
-    records = [
-        _table([[("产品标准化大纲", 22.0, False)]]),
-        _para("这是一段以句号结尾的正文。", size=12.0),
-        _table(_PUB_TABLE_ROWS),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    cands = _find(records, imprint_boundary_indices={1})
-    assert [(c.start, c.end) for c in cands] == [(0, 1), (2, 3)]
-
-
-def test_real_heading_para_still_breaks_table_run() -> None:
-    """Control: a physical-outline paragraph between tables is a real section
-    heading, never cover material — the run splits."""
-    records = [
-        _table([[("产品标准化大纲", 22.0, False)]]),
-        _para("第一章 总则", size=12.0, outline_level_raw=0),
-        _table(_PUB_TABLE_ROWS),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    cands = _find(records)
+    cands = _find(records, **kwargs)
     assert all(1 not in c.members for c in cands)
+    if expected_spans is not None:
+        assert [(c.start, c.end) for c in cands] == expected_spans
 
 
-def test_drawing_prefixed_numbered_heading_still_breaks_table_run() -> None:
-    """A leading <drawing/> tag must not smuggle a genuinely NUMBERED heading
-    into the cover: raw-text numbering classification is defeated by the tag,
-    so the absorbable gate re-checks real numbering on the semantic text."""
-    records = [
-        _table([[("产品标准化大纲", 22.0, False)]]),
-        _para('<drawing id="1" name="装饰"/> 第一章 总则', size=12.0),
-        _table(_PUB_TABLE_ROWS),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    cands = _find(records)
-    assert all(1 not in c.members for c in cands)
-
-
-def test_paragraph_tail_cover() -> None:
-    """A cover ending in a paragraph (档号表 + 主标题段, no trailing table)
-    still forms one candidate — no tail trimming (user ruling)."""
+@pytest.mark.parametrize(
+    "title_text",
+    [
+        pytest.param("某某管理办法", id="plain-paragraph-main-title"),
+        pytest.param(
+            '某某<drawing id="1" name="纹章"/>管理办法',
+            id="mixed-drawing-semantic-main-title",
+        ),
+    ],
+)
+def test_table_verdict_locates_absorbed_paragraph_main_title(title_text: str) -> None:
     records = [
         _table(_FORM_TABLE_ROWS),
-        _para("某某管理办法", size=22.0),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    cands = _find(records)
-    assert len(cands) == 1
-    assert (cands[0].start, cands[0].end) == (0, 2)
-    assert cands[0].members == (0, 1)
-
-
-def test_trailing_image_para_joins_cover() -> None:
-    """标题表 + 尾随印章图片段: the trailing image joins the cover members."""
-    records = [
-        _table([[("产品标准化大纲", 22.0, False)]]),
-        _para('<drawing id="9" name="印章"/>', size=12.0),
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    cands = _find(records)
-    assert len(cands) == 1
-    assert cands[0].members == (0, 1)
-
-
-def test_imprint_preceding_line_not_absorbed_by_table_run() -> None:
-    """版记 region neighbourhood protection reaches the table channel: the
-    signature line PRECEDING a 抄送 anchor sits in imprint_excluded and is
-    never absorbed as cover material."""
-    records = [
-        _table([[("产品标准化大纲", 22.0, False)]]),
-        _para("某某市人民政府办公室", size=12.0),  # preceding of the anchor below
-        _para("抄送：各区人民政府", size=12.0),  # imprint anchor
-        _para("正文从这里开始，以句号结尾。", size=12.0),
-    ]
-    cands = _find(records)
-    assert len(cands) == 1
-    assert cands[0].members == (0,)  # the signature line stayed out
-
-
-def test_table_verdict_locates_paragraph_main_title() -> None:
-    """judge 层: a members-bearing candidate renders the absorbed paragraph
-    into the LLM window and canon, so a paragraph-borne main_title passes
-    locate-back and lands in member_indices in source order."""
-    records = [
-        _table(_FORM_TABLE_ROWS),
-        _para("某某管理办法", size=22.0),
-        _table(_PUB_TABLE_ROWS),
-    ]
-    candidate = TitleBlockCandidate(
-        start=0,
-        end=3,
-        single=False,
-        trigger="table_window",
-        table=True,
-        members=(0, 1, 2),
-    )
-    decision = _judge_with(
-        {"is_title_block": True, "main_title": "某某管理办法"},
-        records=records,
-        candidate=candidate,
-    )
-    assert decision.is_title_block
-    assert decision.member_indices == (0, 1, 2)
-
-
-def test_mixed_para_locates_semantic_main_title() -> None:
-    """A mid-line drawing tag must not break locate-back: the canon carries
-    the para's SEMANTIC text, so the LLM's tag-free main_title ("某某管理办法"
-    out of "某某<drawing/>管理办法") still matches contiguously."""
-    records = [
-        _table(_FORM_TABLE_ROWS),
-        _para('某某<drawing id="1" name="纹章"/>管理办法', size=22.0),
+        _para(title_text, size=22.0),
         _table(_PUB_TABLE_ROWS),
     ]
     candidate = TitleBlockCandidate(
@@ -2015,120 +1974,163 @@ def _regions(records, **kw):
     return detect_imprint_regions(records, **kw)
 
 
-def test_imprint_region_closer_within_forward_window() -> None:
-    """A 抄送 anchor closes on the first 印发 line inside the 3-paragraph
-    forward window; the middle lines join the region."""
-    records = [
-        _para("抄送：各区人民政府", size=12.0),  # 0 anchor
-        _para("中间行一", size=12.0),  # 1 middle
-        _para("某某办公室 2026年6月30日 印发", size=12.0),  # 2 closer (trailing)
-    ]
-    regs = _regions(records)
-    assert len(regs) == 1
-    assert regs[0].anchor == 0 and regs[0].closer == 2
-    assert regs[0].members == {0, 1, 2}
-
-
-def test_imprint_region_closer_beyond_window_falls_back() -> None:
-    """A 印发 line as the 4th non-blank paragraph is out of window → no closer,
-    region degrades to the anchor alone (pre-region behaviour)."""
-    records = [
-        _para("抄送：各区人民政府", size=12.0),  # 0 anchor
-        _para("中间行一", size=12.0),  # 1
-        _para("中间行二", size=12.0),  # 2
-        _para("中间行三", size=12.0),  # 3
-        _para("某某办公室 2026年 印发", size=12.0),  # 4 closer (too far)
-    ]
-    regs = _regions(records)
-    assert len(regs) == 1
-    assert regs[0].closer is None
-    assert regs[0].members == {0}
-
-
-def test_imprint_region_walks_skip_toc(monkeypatch) -> None:
-    """N2: TOC lines (skip_indices) are stepped over WITHOUT spending the
-    backward-2 / forward budget and never join a region."""
-    records = [
-        _para("上文", size=12.0),  # 0 ← preceding (2nd)
-        _para("目录行", size=12.0),  # 1 TOC — skipped, not counted
-        _para("署名行", size=12.0),  # 2 ← preceding (1st)
-        _para("抄送：各区", size=12.0),  # 3 anchor
-        _para("目录行二", size=12.0),  # 4 TOC — skipped, not counted
-        _para("某某 2026年 印发", size=12.0),  # 5 closer
-    ]
-    regs = _regions(records, skip_indices={1, 4})
+@pytest.mark.parametrize(
+    (
+        "records",
+        "kwargs",
+        "expected_anchor",
+        "expected_closer",
+        "expected_members",
+        "expected_preceding",
+        "non_anchor_idx",
+    ),
+    [
+        pytest.param(
+            # 抄送 anchor closes on first 印发 inside 3-para forward window.
+            [
+                _para("抄送：各区人民政府", size=12.0),
+                _para("中间行一", size=12.0),
+                _para("某某办公室 2026年6月30日 印发", size=12.0),
+            ],
+            {},
+            0,
+            2,
+            {0, 1, 2},
+            None,
+            None,
+            id="closer-within-forward-window",
+        ),
+        pytest.param(
+            # 印发 as 4th non-blank paragraph is out of window -> anchor alone.
+            [
+                _para("抄送：各区人民政府", size=12.0),
+                _para("中间行一", size=12.0),
+                _para("中间行二", size=12.0),
+                _para("中间行三", size=12.0),
+                _para("某某办公室 2026年 印发", size=12.0),
+            ],
+            {},
+            0,
+            None,
+            {0},
+            None,
+            None,
+            id="closer-beyond-window-falls-back",
+        ),
+        pytest.param(
+            # N2: TOC lines (skip_indices) are stepped over without spending budget.
+            [
+                _para("上文", size=12.0),
+                _para("目录行", size=12.0),
+                _para("署名行", size=12.0),
+                _para("抄送：各区", size=12.0),
+                _para("目录行二", size=12.0),
+                _para("某某 2026年 印发", size=12.0),
+            ],
+            {"skip_indices": {1, 4}},
+            3,
+            5,
+            {3, 5},
+            {0, 2},
+            None,
+            id="walks-skip-toc",
+        ),
+        pytest.param(
+            # Non-paragraph record (table) stops forward walk -> anchor alone.
+            [
+                _para("抄送：各部门", size=12.0),
+                _table([[("附件清单", 10.5, False)]]),
+                _para("某某办公室 2026年 印发", size=12.0),
+            ],
+            {},
+            0,
+            None,
+            {0},
+            None,
+            None,
+            id="forward-walk-stops-at-table",
+        ),
+        pytest.param(
+            # 印发机关 is a closer (never an anchor) that closes 抄送.
+            [
+                _para("抄送：各区", size=12.0),
+                _para("印发机关　某某市人民政府办公厅", size=12.0),
+            ],
+            {},
+            0,
+            1,
+            {0, 1},
+            None,
+            1,
+            id="closer-is-yinfa-jiguan",
+        ),
+        pytest.param(
+            # Mis-ordered 成文日期 right after 印发 closer is absorbed.
+            [
+                _para("抄送：各设区市城乡规划局", size=12.0),
+                _para("河北省住房和城乡建设厅办公室   2009年7月6日印发", size=12.0),
+                _para("二○○九年七月六日", size=12.0),
+                _para("正文从这里开始，以句号结尾。", size=12.0),
+            ],
+            {},
+            0,
+            1,
+            {0, 1, 2},
+            None,
+            None,
+            id="absorbs-trailing-document-date",
+        ),
+        pytest.param(
+            # Date walk stops at first non-date paragraph (later date stays out).
+            [
+                _para("抄送：各区", size=12.0),
+                _para("某某办公室 2009年 印发", size=12.0),
+                _para("二○○九年七月六日", size=12.0),
+                _para("附件：", size=12.0),
+                _para("2009年7月7日", size=12.0),
+            ],
+            {},
+            0,
+            1,
+            {0, 1, 2},
+            None,
+            None,
+            id="date-absorb-stops-at-non-date",
+        ),
+    ],
+)
+def test_imprint_region_detection_cases(
+    records,
+    kwargs,
+    expected_anchor: int,
+    expected_closer: int | None,
+    expected_members: set[int],
+    expected_preceding: set[int] | None,
+    non_anchor_idx: int | None,
+) -> None:
+    if non_anchor_idx is not None:
+        assert guardrails.imprint_marker_reason(records[non_anchor_idx].text) is None
+    regs = _regions(records, **kwargs)
     assert len(regs) == 1
     r = regs[0]
-    assert r.preceding == {0, 2}  # TOC(1) skipped without eating budget
-    assert r.closer == 5 and r.members == {3, 5}  # TOC(4) not a member
-
-
-def test_imprint_region_forward_walk_stops_at_table() -> None:
-    """A non-paragraph record ends the forward walk: a closer beyond a table
-    is unreachable, region falls back to the anchor."""
-    records = [
-        _para("抄送：各部门", size=12.0),  # 0 anchor
-        _table([[("附件清单", 10.5, False)]]),  # 1 boundary
-        _para("某某办公室 2026年 印发", size=12.0),  # 2 (past the table)
-    ]
-    regs = _regions(records)
-    assert regs[0].closer is None and regs[0].members == {0}
+    assert r.anchor == expected_anchor
+    assert r.closer == expected_closer
+    assert r.members == expected_members
+    if expected_preceding is not None:
+        assert r.preceding == expected_preceding
 
 
 def test_imprint_region_start_marker_is_middle_content() -> None:
     """A 主题词-opened region runs THROUGH a following 抄送 (middle content, not
     a closer) to reach the 印发 closer; both anchors are vetoed."""
     records = [
-        _para("主题词：经济 管理", size=12.0),  # 0 anchor (主题词)
-        _para("抄送：各区人民政府", size=12.0),  # 1 middle content (own anchor too)
-        _para("某某办公室 2026年 印发", size=12.0),  # 2 closer
+        _para("主题词：经济 管理", size=12.0),
+        _para("抄送：各区人民政府", size=12.0),
+        _para("某某办公室 2026年 印发", size=12.0),
     ]
     by_anchor = {r.anchor: r for r in _regions(records)}
     assert by_anchor[0].closer == 2 and by_anchor[0].members == {0, 1, 2}
     assert by_anchor[1].closer == 2 and by_anchor[1].members == {1, 2}
-
-
-def test_imprint_region_closer_is_yinfa_jiguan() -> None:
-    """印发机关 is a CLOSER (not an anchor): it ends a 抄送-opened region — the
-    old space-class anchor knob (DOCX_SMART_IMPRINT_SPACE_PREFIXES) is gone."""
-    from lightrag.parser.docx.smart_heading.guardrails import imprint_marker_reason
-
-    records = [
-        _para("抄送：各区", size=12.0),  # 0 anchor
-        _para("印发机关　某某市人民政府办公厅", size=12.0),  # 1 closer
-    ]
-    assert imprint_marker_reason(records[1].text) is None  # never an anchor
-    regs = _regions(records)
-    assert len(regs) == 1
-    assert regs[0].closer == 1 and regs[0].members == {0, 1}
-
-
-def test_imprint_region_absorbs_trailing_document_date() -> None:
-    """A mis-ordered 成文日期 right after the 印发 closer (版记 THEN date — not the
-    GB/T order) is pulled into the region; it belongs to THIS document."""
-    records = [
-        _para("抄送：各设区市城乡规划局", size=12.0),  # 0 anchor
-        _para("河北省住房和城乡建设厅办公室   2009年7月6日印发", size=12.0),  # 1 closer
-        _para("二○○九年七月六日", size=12.0),  # 2 成文日期 → absorbed
-        _para("正文从这里开始，以句号结尾。", size=12.0),  # 3 not a date → stop
-    ]
-    regs = _regions(records)
-    assert len(regs) == 1
-    assert regs[0].closer == 1 and regs[0].members == {0, 1, 2}
-
-
-def test_imprint_region_date_absorb_stops_at_non_date() -> None:
-    """Only bare date-only lines right after the closer are pulled in; the walk
-    stops at the first non-date paragraph (a later date does not leak in)."""
-    records = [
-        _para("抄送：各区", size=12.0),  # 0 anchor
-        _para("某某办公室 2009年 印发", size=12.0),  # 1 closer
-        _para("二○○九年七月六日", size=12.0),  # 2 date → absorbed
-        _para("附件：", size=12.0),  # 3 NOT a date → stop
-        _para("2009年7月7日", size=12.0),  # 4 date, but past the stop → not absorbed
-    ]
-    regs = _regions(records)
-    assert regs[0].members == {0, 1, 2}
 
 
 def test_trailing_document_date_vetoed_from_next_cover() -> None:

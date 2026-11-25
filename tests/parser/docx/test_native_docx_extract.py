@@ -988,3 +988,133 @@ def test_empty_docx_file_reports_truncation(tmp_path) -> None:
     assert "Package not found" not in message
     assert "empty" in message
     assert str(docx_path) in message
+
+
+# ---------------------------------------------------------------------------
+# Table cell markup preservation through NativeParser.parse
+# ---------------------------------------------------------------------------
+
+
+def _parse_native_table_markup(source: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import asyncio
+
+    import lightrag.pipeline as pipeline_module
+    from lightrag.constants import FULL_DOCS_FORMAT_PENDING_PARSE, PARSED_DIR_NAME
+    from lightrag.parser.base import ParseContext
+    from lightrag.parser.debug import build_debug_rag
+    from lightrag.parser.registry import get_parser
+
+    async def _noop_archive(_p: str) -> None:
+        return None
+
+    monkeypatch.setenv("INPUT_DIR", str(source.parent))
+    monkeypatch.setattr(
+        pipeline_module, "archive_docx_source_after_full_docs_sync", _noop_archive
+    )
+    asyncio.run(
+        get_parser("native").parse(
+            ParseContext(
+                build_debug_rag(),
+                "doc-table-markup",
+                str(source),
+                {"parse_format": FULL_DOCS_FORMAT_PENDING_PARSE, "content": ""},
+            )
+        )
+    )
+    return source.parent / PARSED_DIR_NAME / f"{source.name}.parsed"
+
+
+@pytest.mark.offline
+def test_cell_text_with_closing_table_tag_keeps_every_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    rows = [["Tag", "Meaning"], ["</table>", "closes an HTML table"], ["<tr>", "row"]]
+    document = Document()
+    table = document.add_table(rows=len(rows), cols=2)
+    for r, row in enumerate(rows):
+        for c, text in enumerate(row):
+            table.cell(r, c).text = text
+    source = tmp_path / "markup.docx"
+    document.save(source)
+
+    parsed_dir = _parse_native_table_markup(source, monkeypatch)
+
+    tables = json.loads(
+        (parsed_dir / "markup.tables.json").read_text(encoding="utf-8")
+    )["tables"]
+    assert len(tables) == 1
+    entry = next(iter(tables.values()))
+    assert entry["format"] == "json"
+    assert entry["dimension"] == [3, 2]
+    assert json.loads(entry["content"]) == rows
+
+
+@pytest.mark.offline
+def test_cell_inner_markup_is_written_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only literal ``</table>`` is escaped in a cell; inner tags like
+    ``<sup>...</sup>`` reach the block as written."""
+    import json
+
+    document = Document()
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Room"
+    table.cell(0, 1).text = "Area"
+    table.cell(1, 0).text = "Lab"
+    paragraph = table.cell(1, 1).paragraphs[0]
+    paragraph.add_run("25 m")
+    paragraph.add_run("2").font.superscript = True
+    source = tmp_path / "markup.docx"
+    document.save(source)
+
+    parsed_dir = _parse_native_table_markup(source, monkeypatch)
+
+    lines = (parsed_dir / "markup.blocks.jsonl").read_text(encoding="utf-8")
+    contents = [
+        row["content"]
+        for row in map(json.loads, lines.splitlines())
+        if row.get("type") == "content"
+    ]
+    assert contents == [
+        '<table id="tb-table-markup-0001" format="json">'
+        '[["Room", "Area"], ["Lab", "25 m<sup>2</sup>"]]</table>'
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Content-limit validation raises DocxContentError (never sys.exit)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.offline
+def test_docx_content_error_is_an_exception_not_just_baseexception() -> None:
+    assert issubclass(DocxContentError, Exception)
+
+
+@pytest.mark.offline
+def test_validate_heading_length_raises_instead_of_exiting() -> None:
+    from lightrag.parser.docx.parse_document import (
+        MAX_HEADING_LENGTH,
+        validate_heading_length,
+    )
+
+    long_heading = "x" * (MAX_HEADING_LENGTH + 213)
+    with pytest.raises(DocxContentError) as exc_info:
+        validate_heading_length(long_heading, "p1")
+    message = str(exc_info.value)
+    assert f"Heading too long ({len(long_heading)} characters" in message
+    assert "SOLUTION:" in message
+
+
+@pytest.mark.offline
+def test_validate_heading_length_does_not_raise_within_limit() -> None:
+    from lightrag.parser.docx.parse_document import (
+        MAX_HEADING_LENGTH,
+        validate_heading_length,
+    )
+
+    validate_heading_length("x" * MAX_HEADING_LENGTH, "p2")
+    validate_heading_length("short heading", "p3")

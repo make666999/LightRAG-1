@@ -11,44 +11,22 @@ so the two fields must never share a value or a fallback.
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 
-from lightrag import LightRAG
 from lightrag.constants import DEFAULT_EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE
-from lightrag.utils import EmbeddingFunc, Tokenizer
+
+from ._fakes import make_lightrag
 
 pytestmark = pytest.mark.offline
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*_args, **_kwargs) -> str:
-    return "mock"
-
-
 def _make_rag(tmp_path, **overrides):
-    kwargs = dict(
-        working_dir=str(tmp_path / "embedding-overlap-cfg"),
+    return make_lightrag(
+        tmp_path,
+        subdir="embedding-overlap-cfg",
         workspace="embedding-overlap-cfg",
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        **overrides,
     )
-    kwargs.update(overrides)
-    return LightRAG(**kwargs)
 
 
 def test_default_matches_chunk_overlap_token_size_magnitude(tmp_path):

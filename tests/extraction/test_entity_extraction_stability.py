@@ -1,12 +1,14 @@
-"""Tests for entity extraction stability after refactoring.
+"""Tests for entity extraction prompt stability, prompt profiles, and section context.
 
 Covers:
-- entity_types_guidance injected into prompts (text mode and JSON mode)
-- custom entity_types_guidance via addon_params overrides default
-- ENTITY_TYPES env var raises SystemExit at LightRAG init
-- EntityExtractionResult Pydantic schema used in JSON mode (entity_extraction kwarg)
-- Default entity type guidance constant is present and non-empty
+- Default/custom ``entity_types_guidance`` and prompt-file injection (text & JSON modes)
+- Format-only built-in templates and quantity-limit prompt rules
+- ``ENTITY_TYPES`` env var guard and prompt-file validation / runtime refresh
+- Section Context (heading breadcrumb) injection, cleaning, per-level capping,
+  and token-budget truncation across extraction and query stages
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -18,15 +20,9 @@ import pytest
 
 from lightrag.utils import EmbeddingFunc, Tokenizer, TokenizerInterface
 
+from ._helpers import make_chunks, make_dummy_tokenizer, make_extract_global_config
 
-class DummyTokenizer(TokenizerInterface):
-    """Simple 1:1 character-to-token mapping for testing."""
-
-    def encode(self, content: str):
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens):
-        return "".join(chr(token) for token in tokens)
+pytestmark = pytest.mark.offline
 
 
 def _make_global_config(
@@ -35,37 +31,17 @@ def _make_global_config(
     max_gleaning: int = 0,
     prompt_profile: dict | None = None,
 ) -> dict:
-    tokenizer = Tokenizer("dummy", DummyTokenizer())
-    extract_func = AsyncMock(return_value="")
-    return {
-        "llm_model_func": extract_func,
-        "role_llm_funcs": {
-            "extract": extract_func,
-            "keyword": extract_func,
-            "query": extract_func,
-            "vlm": extract_func,
-        },
-        "entity_extract_max_gleaning": max_gleaning,
-        "entity_extract_max_records": 100,
-        "entity_extract_max_entities": 40,
-        "addon_params": addon_params if addon_params is not None else {},
-        "tokenizer": tokenizer,
-        "max_extract_input_tokens": 20480,
-        "llm_model_max_async": 1,
-        "entity_extraction_use_json": use_json,
-        "_entity_extraction_prompt_profile": prompt_profile,
-    }
+    return make_extract_global_config(
+        addon_params=addon_params,
+        use_json=use_json,
+        entity_extract_max_gleaning=max_gleaning,
+        prompt_profile=prompt_profile,
+        max_extract_input_tokens=20480,
+    )
 
 
 def _make_chunks(content: str = "Alice founded Acme Corp in 1990.") -> dict[str, dict]:
-    return {
-        "chunk-001": {
-            "tokens": len(content),
-            "content": content,
-            "full_doc_id": "doc-001",
-            "chunk_order_index": 0,
-        }
-    }
+    return make_chunks(1, content=content)
 
 
 def _require_yaml() -> None:
@@ -146,8 +122,6 @@ def _json_profile_example(label: str) -> str:
 }}"""
 
 
-# --- Minimal valid LLM responses ---
-
 _TEXT_MODE_RESPONSE = (
     "entity<|#|>Alice<|#|>Person<|#|>Alice is the founder of Acme Corp."
     "\nentity<|#|>Acme Corp<|#|>Organization<|#|>Acme Corp is a company founded by Alice."
@@ -204,12 +178,11 @@ class _DummyTextChunksStorage:
         return {"file_path": "test.md"}
 
 
-# ---------------------------------------------------------------------------
-# 1. Default entity_types_guidance constant
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# 1. Built-in prompt templates & guidance constants
+# --------------------------------------------------------------------------- #
 
 
-@pytest.mark.offline
 def test_default_entity_types_guidance_covers_all_types():
     """Default guidance must mention all 11 canonical entity types."""
     from lightrag.prompt import PROMPTS
@@ -228,22 +201,14 @@ def test_default_entity_types_guidance_covers_all_types():
         "Artifact",
         "NaturalObject",
     ]
-    for t in expected_types:
-        assert t in guidance, (
-            f"Expected entity type '{t}' missing from default_entity_types_guidance"
+    for entity_type in expected_types:
+        assert entity_type in guidance, (
+            f"Expected entity type '{entity_type}' missing from default_entity_types_guidance"
         )
 
 
-@pytest.mark.offline
 def test_builtin_entity_extraction_examples_are_format_only():
-    """Built-in examples must be placeholder templates, not extractable demos.
-
-    Rather than denylisting specific sample names (brittle: any new concrete
-    content with different names would slip through), assert the structural
-    shape of a format-only template: no per-example section headers that would
-    reintroduce a sample ``---Input Text---`` / ``---Output---`` demo, and every
-    data value is an angle-bracket placeholder rather than concrete prose.
-    """
+    """Built-in text and JSON examples must be placeholder-only templates."""
     from lightrag.prompt import PROMPTS
 
     section_markers = ("---Input Text---", "---Output---", "---Entity Types---")
@@ -251,8 +216,6 @@ def test_builtin_entity_extraction_examples_are_format_only():
     tuple_delimiter = PROMPTS["DEFAULT_TUPLE_DELIMITER"]
     completion_delimiter = PROMPTS["DEFAULT_COMPLETION_DELIMITER"]
 
-    # Text examples: every field after the leading entity/relation tag must be a
-    # bare placeholder; concrete sample values would not match.
     for example in PROMPTS["entity_extraction_examples"]:
         for marker in section_markers:
             assert marker not in example
@@ -266,11 +229,10 @@ def test_builtin_entity_extraction_examples_are_format_only():
                 continue
             tag, *fields = line.split(tuple_delimiter)
             assert tag in {"entity", "relation"}
-            assert fields  # data rows must carry at least one value field
+            assert fields
             for field in fields:
                 assert placeholder.fullmatch(field), field
 
-    # JSON examples: every entity/relationship field value must be a placeholder.
     for example in PROMPTS["entity_extraction_json_examples"]:
         for marker in section_markers:
             assert marker not in example
@@ -282,7 +244,6 @@ def test_builtin_entity_extraction_examples_are_format_only():
                 assert placeholder.fullmatch(value), value
 
 
-@pytest.mark.offline
 def test_entity_extraction_system_prompts_label_examples_as_format_templates():
     from lightrag.prompt import PROMPTS
 
@@ -298,7 +259,6 @@ def test_entity_extraction_system_prompts_label_examples_as_format_templates():
         assert "must never be used as extraction content" in prompt
 
 
-@pytest.mark.offline
 def test_text_examples_render_tuple_and_completion_delimiters():
     from lightrag.prompt import PROMPTS
 
@@ -320,7 +280,6 @@ def test_text_examples_render_tuple_and_completion_delimiters():
     assert "{completion_delimiter}" not in rendered
 
 
-@pytest.mark.offline
 def test_json_examples_are_parseable_format_templates():
     """JSON examples must be raw JSON templates with valid endpoint references."""
     from lightrag.prompt import PROMPTS
@@ -342,19 +301,69 @@ def test_json_examples_are_parseable_format_templates():
         assert "<entity_name>" in entity_names
 
 
-# ---------------------------------------------------------------------------
-# 2. DEFAULT_ENTITY_TYPES is gone from constants
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("prompt_key", "required_substrings", "forbidden_substrings"),
+    [
+        pytest.param(
+            "entity_extraction_user_prompt",
+            (
+                "output at most {max_total_records} total rows and at most {max_entity_records} entity rows",
+                "If the row limit is reached, output `{completion_delimiter}` immediately",
+            ),
+            (),
+            id="text_user",
+        ),
+        pytest.param(
+            "entity_continue_extraction_user_prompt",
+            (
+                "Any corrected relationship row must be emitted with the literal `relation` prefix",
+                "output at most {max_total_records} total rows and at most {max_entity_records} entity rows",
+                "may reference entities that were already extracted correctly in the previous response",
+            ),
+            ("whose source and target entities are both included in this response",),
+            id="text_continue",
+        ),
+        pytest.param(
+            "entity_extraction_json_user_prompt",
+            (
+                "output at most {max_total_records} total records and at most {max_entity_records} entity objects",
+                "Only output relationship objects whose `source` and `target` are both included",
+            ),
+            (),
+            id="json_user",
+        ),
+        pytest.param(
+            "entity_continue_extraction_json_user_prompt",
+            (
+                "output at most {max_total_records} total records and at most {max_entity_records} entity objects",
+                "may reference entities already extracted correctly in the previous response",
+            ),
+            (),
+            id="json_continue",
+        ),
+    ],
+)
+def test_extraction_user_and_continue_prompts_enforce_limits_and_rules(
+    prompt_key: str,
+    required_substrings: tuple[str, ...],
+    forbidden_substrings: tuple[str, ...],
+):
+    from lightrag.prompt import PROMPTS
+
+    prompt = PROMPTS[prompt_key]
+    for expected in required_substrings:
+        assert expected in prompt
+    for forbidden in forbidden_substrings:
+        assert forbidden not in prompt
 
 
-# ---------------------------------------------------------------------------
-# 3. ENTITY_TYPES env var raises SystemExit
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# 2. ENTITY_TYPES env var guard & text/JSON guidance injection
+# --------------------------------------------------------------------------- #
 
 
-@pytest.mark.offline
 def test_entity_types_env_var_raises_system_exit(tmp_path):
-    """LightRAG.__post_init__ must raise SystemExit when ENTITY_TYPES env var is set."""
+    """LightRAG.__post_init__ raises SystemExit when ENTITY_TYPES env var is set."""
     from lightrag import LightRAG
 
     with patch.dict(os.environ, {"ENTITY_TYPES": '["Person"]'}):
@@ -367,110 +376,97 @@ def test_entity_types_env_var_raises_system_exit(tmp_path):
     assert "ENTITY_TYPES" in str(exc_info.value)
 
 
-# ---------------------------------------------------------------------------
-# 4. Text mode: entity_types_guidance injected into prompt
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.offline
 @pytest.mark.asyncio
-async def test_text_mode_default_guidance_injected_into_prompt():
-    """Default entity_types_guidance is passed to LLM system prompt in text mode."""
+@pytest.mark.parametrize(
+    ("use_json", "response", "mode_substrings"),
+    [
+        pytest.param(
+            False,
+            _TEXT_MODE_RESPONSE,
+            (
+                "must start with `relation`, never `entity`",
+                "After the last entity row, switch prefixes to `relation`",
+                "Output at most 100 total rows",
+                "Output at most 40 entity rows",
+            ),
+            id="text_mode",
+        ),
+        pytest.param(
+            True,
+            _JSON_MODE_RESPONSE,
+            (
+                "Output at most 100 total records",
+                "Output at most 40 entity objects",
+            ),
+            id="json_mode",
+        ),
+    ],
+)
+async def test_default_guidance_injected_into_prompt(
+    use_json: bool, response: str, mode_substrings: tuple[str, ...]
+):
+    """Default entity_types_guidance and mode-specific kwargs/limits reach the LLM."""
     from lightrag.operate import extract_entities
     from lightrag.prompt import PROMPTS
 
-    global_config = _make_global_config(use_json=False)
+    global_config = _make_global_config(use_json=use_json)
     llm_func = global_config["llm_model_func"]
-    llm_func.return_value = _TEXT_MODE_RESPONSE
+    llm_func.return_value = response
 
     with patch("lightrag.operate.logger"):
-        await extract_entities(
-            chunks=_make_chunks(),
-            global_config=global_config,
-        )
+        await extract_entities(chunks=_make_chunks(), global_config=global_config)
 
-    # The system prompt passed to the LLM must contain the default guidance
     assert llm_func.await_count >= 1
     call_kwargs = llm_func.call_args_list[0][1]
     system_prompt = call_kwargs.get("system_prompt", "")
     assert PROMPTS["default_entity_types_guidance"] in system_prompt
-    assert "must start with `relation`, never `entity`" in system_prompt
-    assert "After the last entity row, switch prefixes to `relation`" in system_prompt
-    assert "Output at most 100 total rows" in system_prompt
-    assert "Output at most 40 entity rows" in system_prompt
-    # Text mode must NOT pass entity_extraction=True to the LLM function.
-    assert not call_kwargs.get("entity_extraction", False)
+    for substring in mode_substrings:
+        assert substring in system_prompt
+    if use_json:
+        assert call_kwargs.get("response_format") == {"type": "json_object"}
+        assert call_kwargs.get("entity_extraction") is not True
+    else:
+        assert not call_kwargs.get("entity_extraction", False)
 
 
-@pytest.mark.offline
 @pytest.mark.asyncio
-async def test_text_mode_custom_guidance_overrides_default():
-    """Custom entity_types_guidance in addon_params overrides default."""
+@pytest.mark.parametrize(
+    ("use_json", "response", "custom_guidance"),
+    [
+        pytest.param(
+            False,
+            _TEXT_MODE_RESPONSE,
+            "- Widget: A test widget type",
+            id="text_mode",
+        ),
+        pytest.param(
+            True,
+            _JSON_MODE_RESPONSE,
+            "- Gadget: A test gadget type",
+            id="json_mode",
+        ),
+    ],
+)
+async def test_custom_guidance_overrides_default(
+    use_json: bool, response: str, custom_guidance: str
+):
+    """Custom entity_types_guidance in addon_params overrides default in both modes."""
     from lightrag.operate import extract_entities
 
-    custom_guidance = "- Widget: A test widget type"
     global_config = _make_global_config(
         addon_params={"entity_types_guidance": custom_guidance},
-        use_json=False,
+        use_json=use_json,
     )
     llm_func = global_config["llm_model_func"]
-    llm_func.return_value = _TEXT_MODE_RESPONSE
+    llm_func.return_value = response
 
     with patch("lightrag.operate.logger"):
-        await extract_entities(
-            chunks=_make_chunks(),
-            global_config=global_config,
-        )
+        await extract_entities(chunks=_make_chunks(), global_config=global_config)
 
-    call_kwargs = llm_func.call_args_list[0][1]
-    system_prompt = call_kwargs.get("system_prompt", "")
+    system_prompt = llm_func.call_args_list[0][1].get("system_prompt", "")
     assert custom_guidance in system_prompt
 
 
-@pytest.mark.offline
-def test_text_continue_prompt_requires_relation_prefix_for_corrections():
-    from lightrag.prompt import PROMPTS
-
-    prompt = PROMPTS["entity_continue_extraction_user_prompt"]
-    assert (
-        "Any corrected relationship row must be emitted with the literal `relation` prefix"
-        in prompt
-    )
-    assert (
-        "output at most {max_total_records} total rows and at most {max_entity_records} entity rows"
-        in prompt
-    )
-    assert (
-        "may reference entities that were already extracted correctly in the previous response"
-        in prompt
-    )
-    assert (
-        "whose source and target entities are both included in this response"
-        not in prompt
-    )
-
-
-@pytest.mark.offline
-def test_text_user_prompt_includes_quantity_limits():
-    from lightrag.prompt import PROMPTS
-
-    prompt = PROMPTS["entity_extraction_user_prompt"]
-    assert (
-        "output at most {max_total_records} total rows and at most {max_entity_records} entity rows"
-        in prompt
-    )
-    assert (
-        "If the row limit is reached, output `{completion_delimiter}` immediately"
-        in prompt
-    )
-
-
-# ---------------------------------------------------------------------------
-# 5. JSON mode: entity_types_guidance injected + entity_extraction kwarg set
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_rebuild_from_cached_fenced_json_uses_json_parser():
     """Cached JSON wrapped in markdown fences must not fall back to text parsing."""
@@ -494,146 +490,35 @@ async def test_rebuild_from_cached_fenced_json_uses_json_parser():
     assert nodes["Alice"][0]["file_path"] == "test.md"
 
 
-@pytest.mark.offline
 @pytest.mark.asyncio
-async def test_json_mode_default_guidance_injected_into_prompt():
-    """Default entity_types_guidance is passed to LLM system prompt in JSON mode."""
-    from lightrag.operate import extract_entities
-    from lightrag.prompt import PROMPTS
-
-    global_config = _make_global_config(use_json=True)
-    llm_func = global_config["llm_model_func"]
-    llm_func.return_value = _JSON_MODE_RESPONSE
-
-    with patch("lightrag.operate.logger"):
-        await extract_entities(
-            chunks=_make_chunks(),
-            global_config=global_config,
-        )
-
-    assert llm_func.await_count >= 1
-    call_kwargs = llm_func.call_args_list[0][1]
-    system_prompt = call_kwargs.get("system_prompt", "")
-    assert PROMPTS["default_entity_types_guidance"] in system_prompt
-    assert "Output at most 100 total records" in system_prompt
-    assert "Output at most 40 entity objects" in system_prompt
-    # JSON mode asks for a JSON object, never the legacy entity_extraction flag.
-    assert call_kwargs.get("response_format") == {"type": "json_object"}
-    assert call_kwargs.get("entity_extraction") is not True
-
-
-@pytest.mark.offline
-@pytest.mark.asyncio
-async def test_json_mode_custom_guidance_overrides_default():
-    """Custom entity_types_guidance in addon_params overrides default in JSON mode."""
+@pytest.mark.parametrize(
+    ("max_gleaning", "responses"),
+    [
+        pytest.param(
+            0,
+            [_TEXT_MODE_MISPREFIXED_RELATION_RESPONSE],
+            id="misprefixed_relation_recovered",
+        ),
+        pytest.param(
+            1,
+            _TEXT_MODE_GLEANED_RELATION_RESPONSES,
+            id="gleaned_relation_merges_after_recovery",
+        ),
+        pytest.param(
+            1,
+            _TEXT_MODE_CROSS_PASS_RELATION_RESPONSES,
+            id="gleaned_relation_references_prior_entity",
+        ),
+    ],
+)
+async def test_text_mode_relation_recovery_and_gleaning(
+    max_gleaning: int, responses: list[str]
+):
     from lightrag.operate import extract_entities
 
-    custom_guidance = "- Gadget: A test gadget type"
-    global_config = _make_global_config(
-        addon_params={"entity_types_guidance": custom_guidance},
-        use_json=True,
-    )
+    global_config = _make_global_config(use_json=False, max_gleaning=max_gleaning)
     llm_func = global_config["llm_model_func"]
-    llm_func.return_value = _JSON_MODE_RESPONSE
-
-    with patch("lightrag.operate.logger"):
-        await extract_entities(
-            chunks=_make_chunks(),
-            global_config=global_config,
-        )
-
-    call_kwargs = llm_func.call_args_list[0][1]
-    system_prompt = call_kwargs.get("system_prompt", "")
-    assert custom_guidance in system_prompt
-
-
-@pytest.mark.offline
-def test_json_user_prompt_includes_quantity_limits():
-    from lightrag.prompt import PROMPTS
-
-    prompt = PROMPTS["entity_extraction_json_user_prompt"]
-    assert (
-        "output at most {max_total_records} total records and at most {max_entity_records} entity objects"
-        in prompt
-    )
-    assert (
-        "Only output relationship objects whose `source` and `target` are both included"
-        in prompt
-    )
-
-
-@pytest.mark.offline
-def test_json_continue_prompt_includes_quantity_limits():
-    from lightrag.prompt import PROMPTS
-
-    prompt = PROMPTS["entity_continue_extraction_json_user_prompt"]
-    assert (
-        "output at most {max_total_records} total records and at most {max_entity_records} entity objects"
-        in prompt
-    )
-    assert (
-        "may reference entities already extracted correctly in the previous response"
-        in prompt
-    )
-
-
-# ---------------------------------------------------------------------------
-# 6. Text mode: entity_extraction kwarg NOT passed (only JSON mode uses it)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.offline
-@pytest.mark.asyncio
-async def test_text_mode_recovers_mis_prefixed_relationship_row():
-    from lightrag.operate import extract_entities
-
-    global_config = _make_global_config(use_json=False)
-    llm_func = global_config["llm_model_func"]
-    llm_func.return_value = _TEXT_MODE_MISPREFIXED_RELATION_RESPONSE
-
-    with patch("lightrag.operate.logger"):
-        chunk_results = await extract_entities(
-            chunks=_make_chunks(),
-            global_config=global_config,
-        )
-
-    entities, relationships = chunk_results[0]
-    assert len(entities) == 2
-    assert len(relationships) == 1
-    assert next(iter(relationships.keys())) == ("Alice", "Acme Corp")
-
-
-@pytest.mark.offline
-@pytest.mark.asyncio
-async def test_text_mode_gleaned_relation_merges_cleanly_after_recovery():
-    from lightrag.operate import extract_entities
-
-    global_config = _make_global_config(use_json=False, max_gleaning=1)
-    llm_func = global_config["llm_model_func"]
-    llm_func.side_effect = _TEXT_MODE_GLEANED_RELATION_RESPONSES
-
-    with patch("lightrag.operate.logger"):
-        chunk_results = await extract_entities(
-            chunks=_make_chunks(),
-            global_config=global_config,
-        )
-
-    entities, relationships = chunk_results[0]
-    assert len(entities) == 2
-    assert len(relationships) == 1
-    relation_data = next(iter(relationships.values()))[0]
-    assert relation_data["src_id"] == "Alice"
-    assert relation_data["tgt_id"] == "Acme Corp"
-
-
-@pytest.mark.offline
-@pytest.mark.asyncio
-async def test_text_mode_gleaned_relation_can_reference_prior_entity():
-    from lightrag.operate import extract_entities
-
-    global_config = _make_global_config(use_json=False, max_gleaning=1)
-    llm_func = global_config["llm_model_func"]
-    llm_func.side_effect = _TEXT_MODE_CROSS_PASS_RELATION_RESPONSES
+    llm_func.side_effect = responses
 
     with patch("lightrag.operate.logger"):
         chunk_results = await extract_entities(
@@ -644,12 +529,17 @@ async def test_text_mode_gleaned_relation_can_reference_prior_entity():
     entities, relationships = chunk_results[0]
     assert set(entities.keys()) == {"Alice", "Acme Corp"}
     assert len(relationships) == 1
+    assert next(iter(relationships.keys())) == ("Alice", "Acme Corp")
     relation_data = next(iter(relationships.values()))[0]
     assert relation_data["src_id"] == "Alice"
     assert relation_data["tgt_id"] == "Acme Corp"
 
 
-@pytest.mark.offline
+# --------------------------------------------------------------------------- #
+# 3. Prompt profile files, validation, and runtime cache refresh
+# --------------------------------------------------------------------------- #
+
+
 def test_addon_params_default_includes_entity_type_prompt_file_env(tmp_path):
     _require_yaml()
 
@@ -682,69 +572,58 @@ def test_addon_params_default_includes_entity_type_prompt_file_env(tmp_path):
     )
 
 
-@pytest.mark.offline
 @pytest.mark.asyncio
-async def test_text_mode_prompt_file_injects_examples_and_guidance():
+@pytest.mark.parametrize(
+    ("use_json", "guidance", "example_label", "response"),
+    [
+        pytest.param(
+            False,
+            "- ExampleType: Injected guidance",
+            "Custom Text Example",
+            _TEXT_MODE_RESPONSE,
+            id="text_mode",
+        ),
+        pytest.param(
+            True,
+            "- ExampleType: Injected JSON guidance",
+            "Custom Json Example",
+            _JSON_MODE_RESPONSE,
+            id="json_mode",
+        ),
+    ],
+)
+async def test_prompt_file_injects_examples_and_guidance(
+    use_json: bool, guidance: str, example_label: str, response: str
+):
     _require_yaml()
 
     from lightrag.operate import extract_entities
 
-    guidance = "- ExampleType: Injected guidance"
-    example_label = "Custom Text Example"
     prompt_profile = {
         "entity_types_guidance": guidance,
-        "entity_extraction_examples": [_text_profile_example(example_label)],
-        "entity_extraction_json_examples": [],
+        "entity_extraction_examples": (
+            [] if use_json else [_text_profile_example(example_label)]
+        ),
+        "entity_extraction_json_examples": (
+            [_json_profile_example(example_label)] if use_json else []
+        ),
     }
 
     global_config = _make_global_config(
         prompt_profile=prompt_profile,
-        use_json=False,
+        use_json=use_json,
     )
     llm_func = global_config["llm_model_func"]
-    llm_func.return_value = _TEXT_MODE_RESPONSE
+    llm_func.return_value = response
 
     with patch("lightrag.operate.logger"):
         await extract_entities(chunks=_make_chunks(), global_config=global_config)
 
-    call_kwargs = llm_func.call_args_list[0][1]
-    system_prompt = call_kwargs.get("system_prompt", "")
+    system_prompt = llm_func.call_args_list[0][1].get("system_prompt", "")
     assert guidance in system_prompt
     assert example_label in system_prompt
 
 
-@pytest.mark.offline
-@pytest.mark.asyncio
-async def test_json_mode_prompt_file_injects_examples_and_guidance():
-    _require_yaml()
-
-    from lightrag.operate import extract_entities
-
-    guidance = "- ExampleType: Injected JSON guidance"
-    example_label = "Custom Json Example"
-    prompt_profile = {
-        "entity_types_guidance": guidance,
-        "entity_extraction_examples": [],
-        "entity_extraction_json_examples": [_json_profile_example(example_label)],
-    }
-
-    global_config = _make_global_config(
-        prompt_profile=prompt_profile,
-        use_json=True,
-    )
-    llm_func = global_config["llm_model_func"]
-    llm_func.return_value = _JSON_MODE_RESPONSE
-
-    with patch("lightrag.operate.logger"):
-        await extract_entities(chunks=_make_chunks(), global_config=global_config)
-
-    call_kwargs = llm_func.call_args_list[0][1]
-    system_prompt = call_kwargs.get("system_prompt", "")
-    assert guidance in system_prompt
-    assert example_label in system_prompt
-
-
-@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_prompt_file_guidance_falls_back_to_default_when_missing():
     _require_yaml()
@@ -768,18 +647,15 @@ async def test_prompt_file_guidance_falls_back_to_default_when_missing():
     with patch("lightrag.operate.logger"):
         await extract_entities(chunks=_make_chunks(), global_config=global_config)
 
-    call_kwargs = llm_func.call_args_list[0][1]
-    system_prompt = call_kwargs.get("system_prompt", "")
+    system_prompt = llm_func.call_args_list[0][1].get("system_prompt", "")
     assert PROMPTS["default_entity_types_guidance"] in system_prompt
 
 
-@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_cached_prompt_profile_supplies_merged_guidance():
     from lightrag.operate import extract_entities
 
     merged_guidance = "- ExampleType: Addon override"
-
     global_config = _make_global_config(
         prompt_profile={
             "entity_types_guidance": merged_guidance,
@@ -794,148 +670,135 @@ async def test_cached_prompt_profile_supplies_merged_guidance():
     with patch("lightrag.operate.logger"):
         await extract_entities(chunks=_make_chunks(), global_config=global_config)
 
-    call_kwargs = llm_func.call_args_list[0][1]
-    system_prompt = call_kwargs.get("system_prompt", "")
+    system_prompt = llm_func.call_args_list[0][1].get("system_prompt", "")
     assert merged_guidance in system_prompt
 
 
-@pytest.mark.offline
-def test_text_mode_prompt_file_can_omit_json_examples(tmp_path):
+@pytest.mark.parametrize(
+    ("use_json", "filename", "writer_kwargs"),
+    [
+        pytest.param(
+            False,
+            "text_only.yml",
+            {"text_examples": [_text_profile_example("Text Only Example")]},
+            id="text_mode_omits_json_examples",
+        ),
+        pytest.param(
+            True,
+            "json_only.yml",
+            {"json_examples": [_json_profile_example("Json Only Example")]},
+            id="json_mode_omits_text_examples",
+        ),
+    ],
+)
+def test_prompt_file_can_omit_other_mode_examples(
+    tmp_path, use_json: bool, filename: str, writer_kwargs: dict
+):
     _require_yaml()
 
     from lightrag import LightRAG
 
     prompt_dir = tmp_path / "entity_type"
     prompt_dir.mkdir()
-    _write_prompt_profile(
-        prompt_dir / "text_only.yml",
-        text_examples=[_text_profile_example("Text Only Example")],
-    )
+    _write_prompt_profile(prompt_dir / filename, **writer_kwargs)
 
     with _patch_prompt_dir(prompt_dir):
         rag = LightRAG(
-            working_dir=str(tmp_path / "rag-text"),
+            working_dir=str(tmp_path / f"rag-{use_json}"),
             llm_model_func=AsyncMock(),
             embedding_func=_dummy_embedding_func(),
-            entity_extraction_use_json=False,
-            addon_params={"entity_type_prompt_file": "text_only.yml"},
+            entity_extraction_use_json=use_json,
+            addon_params={"entity_type_prompt_file": filename},
         )
 
-    assert rag.addon_params["entity_type_prompt_file"] == "text_only.yml"
+    assert rag.addon_params["entity_type_prompt_file"] == filename
 
 
-@pytest.mark.offline
-def test_json_mode_prompt_file_can_omit_text_examples(tmp_path):
+@pytest.mark.parametrize(
+    ("use_json", "filename", "writer_kwargs", "expected_missing_key"),
+    [
+        pytest.param(
+            False,
+            "missing_text_examples.yml",
+            {"json_examples": [_json_profile_example("Wrong Mode Only")]},
+            "entity_extraction_examples",
+            id="text_mode_requires_text_examples",
+        ),
+        pytest.param(
+            True,
+            "missing_json_examples.yml",
+            {"text_examples": [_text_profile_example("Wrong Mode Only")]},
+            "entity_extraction_json_examples",
+            id="json_mode_requires_json_examples",
+        ),
+    ],
+)
+def test_prompt_file_requires_active_mode_examples(
+    tmp_path,
+    use_json: bool,
+    filename: str,
+    writer_kwargs: dict,
+    expected_missing_key: str,
+):
     _require_yaml()
 
     from lightrag import LightRAG
 
     prompt_dir = tmp_path / "entity_type"
     prompt_dir.mkdir()
-    _write_prompt_profile(
-        prompt_dir / "json_only.yml",
-        json_examples=[_json_profile_example("Json Only Example")],
-    )
-
-    with _patch_prompt_dir(prompt_dir):
-        rag = LightRAG(
-            working_dir=str(tmp_path / "rag-json"),
-            llm_model_func=AsyncMock(),
-            embedding_func=_dummy_embedding_func(),
-            entity_extraction_use_json=True,
-            addon_params={"entity_type_prompt_file": "json_only.yml"},
-        )
-
-    assert rag.addon_params["entity_type_prompt_file"] == "json_only.yml"
-
-
-@pytest.mark.offline
-def test_text_mode_prompt_file_requires_text_examples(tmp_path):
-    _require_yaml()
-
-    from lightrag import LightRAG
-
-    prompt_dir = tmp_path / "entity_type"
-    prompt_dir.mkdir()
-    _write_prompt_profile(
-        prompt_dir / "missing_text_examples.yml",
-        json_examples=[_json_profile_example("Wrong Mode Only")],
-    )
+    _write_prompt_profile(prompt_dir / filename, **writer_kwargs)
 
     with _patch_prompt_dir(prompt_dir):
         with pytest.raises(ValueError) as exc_info:
             LightRAG(
-                working_dir=str(tmp_path / "rag-missing-text"),
+                working_dir=str(tmp_path / f"rag-missing-{use_json}"),
                 llm_model_func=AsyncMock(),
                 embedding_func=None,
-                entity_extraction_use_json=False,
-                addon_params={"entity_type_prompt_file": "missing_text_examples.yml"},
+                entity_extraction_use_json=use_json,
+                addon_params={"entity_type_prompt_file": filename},
             )
 
-    assert "entity_extraction_examples" in str(exc_info.value)
+    assert expected_missing_key in str(exc_info.value)
 
 
-@pytest.mark.offline
-def test_json_mode_prompt_file_requires_json_examples(tmp_path):
+@pytest.mark.parametrize(
+    ("kind", "expected_match"),
+    [
+        pytest.param("directory_segment", "file name only", id="directory_segments"),
+        pytest.param("absolute_path", "file name only", id="absolute_paths"),
+        pytest.param(
+            "unsupported_extension", "'.yml' or '.yaml'", id="unsupported_extension"
+        ),
+        pytest.param("malformed_yaml", "invalid YAML", id="malformed_yaml"),
+    ],
+)
+def test_prompt_file_rejects_invalid_inputs(tmp_path, kind: str, expected_match: str):
     _require_yaml()
 
     from lightrag import LightRAG
+    from lightrag.prompt import load_entity_extraction_prompt_profile
 
-    prompt_dir = tmp_path / "entity_type"
-    prompt_dir.mkdir()
-    _write_prompt_profile(
-        prompt_dir / "missing_json_examples.yml",
-        text_examples=[_text_profile_example("Wrong Mode Only")],
-    )
+    if kind == "malformed_yaml":
+        bad_file = tmp_path / "broken.yml"
+        bad_file.write_text("entity_types_guidance: [unclosed", encoding="utf-8")
+        with pytest.raises(ValueError, match=expected_match):
+            load_entity_extraction_prompt_profile(bad_file)
+        return
 
-    with _patch_prompt_dir(prompt_dir):
-        with pytest.raises(ValueError) as exc_info:
-            LightRAG(
-                working_dir=str(tmp_path / "rag-missing-json"),
-                llm_model_func=AsyncMock(),
-                embedding_func=None,
-                entity_extraction_use_json=True,
-                addon_params={"entity_type_prompt_file": "missing_json_examples.yml"},
-            )
-
-    assert "entity_extraction_json_examples" in str(exc_info.value)
-
-
-@pytest.mark.offline
-def test_prompt_file_rejects_directory_segments(tmp_path):
-    _require_yaml()
-
-    from lightrag import LightRAG
-
-    with pytest.raises(ValueError) as exc_info:
+    bad_name = {
+        "directory_segment": "../outside.yml",
+        "absolute_path": str(tmp_path / "abs.yml"),
+        "unsupported_extension": "profile.txt",
+    }[kind]
+    with pytest.raises(ValueError, match=expected_match):
         LightRAG(
-            working_dir=str(tmp_path / "rag-bad-path"),
+            working_dir=str(tmp_path / f"rag-{kind}"),
             llm_model_func=AsyncMock(),
             embedding_func=None,
-            addon_params={"entity_type_prompt_file": "../outside.yml"},
+            addon_params={"entity_type_prompt_file": bad_name},
         )
 
-    assert "file name only" in str(exc_info.value)
 
-
-@pytest.mark.offline
-def test_prompt_file_rejects_absolute_paths(tmp_path):
-    _require_yaml()
-
-    from lightrag import LightRAG
-
-    with pytest.raises(ValueError) as exc_info:
-        LightRAG(
-            working_dir=str(tmp_path / "rag-abs-path"),
-            llm_model_func=AsyncMock(),
-            embedding_func=None,
-            addon_params={"entity_type_prompt_file": str(tmp_path / "abs.yml")},
-        )
-
-    assert "file name only" in str(exc_info.value)
-
-
-@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_extract_entities_uses_cached_prompt_profile_without_reloading():
     from lightrag.operate import extract_entities
@@ -962,7 +825,6 @@ async def test_extract_entities_uses_cached_prompt_profile_without_reloading():
     assert "Cached guidance" in system_prompt
 
 
-@pytest.mark.offline
 def test_sample_prompt_file_matches_builtin_prompt_data():
     _require_yaml()
 
@@ -982,7 +844,6 @@ def test_sample_prompt_file_matches_builtin_prompt_data():
     assert loaded_profile == get_default_entity_extraction_prompt_profile()
 
 
-@pytest.mark.offline
 def test_prompt_dir_env_var_overrides_default(tmp_path, monkeypatch):
     _require_yaml()
 
@@ -998,7 +859,6 @@ def test_prompt_dir_env_var_overrides_default(tmp_path, monkeypatch):
     assert resolved == expected_dir / "custom.yml"
 
 
-@pytest.mark.offline
 def test_prompt_dir_defaults_to_cwd_relative(tmp_path, monkeypatch):
     _require_yaml()
 
@@ -1011,35 +871,6 @@ def test_prompt_dir_defaults_to_cwd_relative(tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.offline
-def test_prompt_file_rejects_unsupported_extension(tmp_path):
-    _require_yaml()
-
-    from lightrag import LightRAG
-
-    with pytest.raises(ValueError, match="'.yml' or '.yaml'"):
-        LightRAG(
-            working_dir=str(tmp_path / "rag-bad-ext"),
-            llm_model_func=AsyncMock(),
-            embedding_func=None,
-            addon_params={"entity_type_prompt_file": "profile.txt"},
-        )
-
-
-@pytest.mark.offline
-def test_prompt_file_malformed_yaml_raises_valueerror(tmp_path):
-    _require_yaml()
-
-    from lightrag.prompt import load_entity_extraction_prompt_profile
-
-    bad_file = tmp_path / "broken.yml"
-    bad_file.write_text("entity_types_guidance: [unclosed", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="invalid YAML"):
-        load_entity_extraction_prompt_profile(bad_file)
-
-
-@pytest.mark.offline
 def test_addon_guidance_overrides_file_profile(tmp_path):
     _require_yaml()
 
@@ -1063,13 +894,11 @@ def test_addon_guidance_overrides_file_profile(tmp_path):
         )
 
     assert profile["entity_types_guidance"] == "- AddonType: from addon_params"
-    # File-provided examples must still be honored.
     assert any(
         "Merged Example" in example for example in profile["entity_extraction_examples"]
     )
 
 
-@pytest.mark.offline
 def test_explicit_addon_params_still_picks_up_env_defaults(tmp_path, monkeypatch):
     """Passing addon_params explicitly must not drop env-based defaults."""
     _require_yaml()
@@ -1097,7 +926,6 @@ def test_explicit_addon_params_still_picks_up_env_defaults(tmp_path, monkeypatch
     assert rag.addon_params["entity_type_prompt_file"] == "from_env.yml"
 
 
-@pytest.mark.offline
 def test_runtime_addon_params_item_update_refreshes_cached_values(tmp_path):
     _require_yaml()
 
@@ -1144,7 +972,6 @@ def test_runtime_addon_params_item_update_refreshes_cached_values(tmp_path):
     )
 
 
-@pytest.mark.offline
 def test_runtime_addon_params_replacement_refreshes_cached_values(tmp_path):
     _require_yaml()
 
@@ -1172,7 +999,6 @@ def test_runtime_addon_params_replacement_refreshes_cached_values(tmp_path):
     )
 
 
-@pytest.mark.offline
 def test_runtime_mode_flip_invalidates_cached_prompt_profile(tmp_path):
     _require_yaml()
 
@@ -1203,34 +1029,30 @@ def test_runtime_mode_flip_invalidates_cached_prompt_profile(tmp_path):
     assert "entity_extraction_json_examples" in str(exc_info.value)
 
 
-# ---------------------------------------------------------------------------
-# Section Context (heading breadcrumb) injection into extraction user prompts
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# 4. Section Context (heading breadcrumb) injection, cleaning, and truncation
+# --------------------------------------------------------------------------- #
 
 _SECTION_MARKER = "---Section Context---"
 
 
-def _render_text_user_prompt(heading_context_block: str) -> str:
+def _render_user_prompt(use_json: bool, heading_context_block: str) -> str:
     from lightrag.prompt import PROMPTS
 
+    if use_json:
+        return PROMPTS["entity_extraction_json_user_prompt"].format(
+            max_total_records=100,
+            max_entity_records=40,
+            language="English",
+            entity_types_guidance="- Person: humans",
+            input_text="Alice founded Acme Corp.",
+            heading_context_block=heading_context_block,
+        )
     return PROMPTS["entity_extraction_user_prompt"].format(
         max_total_records=100,
         max_entity_records=40,
         completion_delimiter="<|COMPLETE|>",
         language="English",
-        input_text="Alice founded Acme Corp.",
-        heading_context_block=heading_context_block,
-    )
-
-
-def _render_json_user_prompt(heading_context_block: str) -> str:
-    from lightrag.prompt import PROMPTS
-
-    return PROMPTS["entity_extraction_json_user_prompt"].format(
-        max_total_records=100,
-        max_entity_records=40,
-        language="English",
-        entity_types_guidance="- Person: humans",
         input_text="Alice founded Acme Corp.",
         heading_context_block=heading_context_block,
     )
@@ -1244,90 +1066,60 @@ def _section_block(heading_path: str) -> str:
     )
 
 
-@pytest.mark.offline
 def test_user_prompts_keep_single_real_input_text_section():
     """Only the rendered task prompt should carry the real input section marker."""
-
-    text_markers = [
-        line
-        for line in _render_text_user_prompt("").splitlines()
-        if line == "---Input Text---"
-    ]
-    json_markers = [
-        line
-        for line in _render_json_user_prompt("").splitlines()
-        if line == "---Input Text---"
-    ]
-
-    assert len(text_markers) == 1
-    assert len(json_markers) == 1
+    for use_json in (False, True):
+        markers = [
+            line
+            for line in _render_user_prompt(use_json, "").splitlines()
+            if line == "---Input Text---"
+        ]
+        assert len(markers) == 1
 
 
-@pytest.mark.offline
-def test_text_user_prompt_section_context_hidden_and_byte_identical_when_no_heading():
-    """No heading -> the whole `---Section Context---` block disappears and the
-    rendered text user prompt is byte-identical to the placeholder-free form."""
+@pytest.mark.parametrize("use_json", [False, True], ids=["text_mode", "json_mode"])
+def test_user_prompt_section_context_hidden_and_byte_identical_when_no_heading(
+    use_json: bool,
+):
+    """Empty heading_context_block disappears and matches the placeholder-free template."""
     from lightrag.prompt import PROMPTS
 
-    rendered = _render_text_user_prompt("")
+    rendered = _render_user_prompt(use_json, "")
     assert _SECTION_MARKER not in rendered
 
-    # The placeholder is the ONLY change to this template, so rendering it empty
-    # must equal a version with the placeholder physically removed (i.e. the
-    # pre-change template). This is the hard no-noise regression guard.
-    baseline_template = PROMPTS["entity_extraction_user_prompt"].replace(
-        "{heading_context_block}", ""
+    key = (
+        "entity_extraction_json_user_prompt"
+        if use_json
+        else "entity_extraction_user_prompt"
     )
-    baseline = baseline_template.format(
-        max_total_records=100,
-        max_entity_records=40,
-        completion_delimiter="<|COMPLETE|>",
-        language="English",
-        input_text="Alice founded Acme Corp.",
-    )
-    assert rendered == baseline
+    baseline_template = PROMPTS[key].replace("{heading_context_block}", "")
+    format_kwargs = {
+        "max_total_records": 100,
+        "max_entity_records": 40,
+        "language": "English",
+        "input_text": "Alice founded Acme Corp.",
+    }
+    if use_json:
+        format_kwargs["entity_types_guidance"] = "- Person: humans"
+    else:
+        format_kwargs["completion_delimiter"] = "<|COMPLETE|>"
+    assert rendered == baseline_template.format(**format_kwargs)
 
 
-@pytest.mark.offline
-def test_json_user_prompt_section_context_hidden_and_byte_identical_when_no_heading():
-    from lightrag.prompt import PROMPTS
-
-    rendered = _render_json_user_prompt("")
-    assert _SECTION_MARKER not in rendered
-
-    baseline_template = PROMPTS["entity_extraction_json_user_prompt"].replace(
-        "{heading_context_block}", ""
-    )
-    baseline = baseline_template.format(
-        max_total_records=100,
-        max_entity_records=40,
-        language="English",
-        entity_types_guidance="- Person: humans",
-        input_text="Alice founded Acme Corp.",
-    )
-    assert rendered == baseline
-
-
-@pytest.mark.offline
 def test_json_user_prompt_includes_section_context_when_heading_present():
-    rendered = _render_json_user_prompt(_section_block("Methods → Data Collection"))
+    rendered = _render_user_prompt(True, _section_block("Methods → Data Collection"))
     assert _SECTION_MARKER in rendered
     assert "Methods → Data Collection" in rendered
     assert "Methods → Data Collection\n\n---Input Text---" in rendered
 
 
-@pytest.mark.offline
 def test_section_context_breadcrumb_is_not_at_line_start():
-    """A heading that looks like a prompt marker must be rendered inline (as
-    data), never at the start of a line where it could forge a new section."""
+    """A heading resembling a prompt marker stays inline and cannot forge a section."""
     block = _section_block("---Output---")
-    # The breadcrumb follows a label on the same line, so the marker text never
-    # begins a line of its own.
     assert "\n---Output---" not in block
-    assert "---Output---" in block  # still present, just inert/inline
+    assert "---Output---" in block
 
 
-@pytest.mark.offline
 def test_extraction_system_prompts_reference_section_context():
     """Both system prompts carry the static conditional instruction."""
     from lightrag.prompt import PROMPTS
@@ -1340,156 +1132,130 @@ def test_extraction_system_prompts_reference_section_context():
         assert "only as background" in PROMPTS[key]
 
 
-@pytest.mark.offline
 @pytest.mark.asyncio
-async def test_extract_entities_injects_section_context_for_chunk_with_heading():
-    """End-to-end: a chunk carrying a heading produces a user prompt containing
-    its full section breadcrumb; a heading-free chunk does not."""
+@pytest.mark.parametrize(
+    ("heading", "expect_present"),
+    [
+        pytest.param(
+            {"level": 2, "heading": "Data Collection", "parent_headings": ["Methods"]},
+            True,
+            id="with_heading",
+        ),
+        pytest.param(None, False, id="without_heading"),
+    ],
+)
+async def test_extract_entities_section_context_by_heading_presence(
+    heading: dict | None, expect_present: bool
+):
     from lightrag.operate import extract_entities
 
     global_config = _make_global_config(use_json=False)
     llm_func = global_config["llm_model_func"]
     llm_func.return_value = _TEXT_MODE_RESPONSE
 
-    chunks = {
-        "chunk-001": {
-            "tokens": 10,
-            "content": "Alice founded Acme Corp.",
-            "full_doc_id": "doc-001",
-            "chunk_order_index": 0,
-            "heading": {
-                "level": 2,
-                "heading": "Data Collection",
-                "parent_headings": ["Methods"],
-            },
-        }
-    }
+    chunks = _make_chunks("Alice founded Acme Corp.")
+    if heading is not None:
+        chunks["chunk-001"]["heading"] = heading
 
     with patch("lightrag.operate.logger"):
         await extract_entities(chunks=chunks, global_config=global_config)
 
     assert llm_func.await_count >= 1
     user_prompt = llm_func.call_args_list[0][0][0]
-    assert _SECTION_MARKER in user_prompt
-    assert "Methods → Data Collection\n\n---Input Text---" in user_prompt
+    if expect_present:
+        assert _SECTION_MARKER in user_prompt
+        assert "Methods → Data Collection\n\n---Input Text---" in user_prompt
+    else:
+        assert _SECTION_MARKER not in user_prompt
 
 
-@pytest.mark.offline
-@pytest.mark.asyncio
-async def test_extract_entities_omits_section_context_for_chunk_without_heading():
-    from lightrag.operate import extract_entities
+@pytest.mark.parametrize(
+    ("formatter_name", "disable_cap"),
+    [
+        pytest.param("format_heading_context", False, id="heading_context_capped"),
+        pytest.param("format_heading_context", True, id="heading_context_uncapped"),
+        pytest.param("format_parent_headings", False, id="parent_headings_capped"),
+        pytest.param("format_parent_headings", True, id="parent_headings_uncapped"),
+    ],
+)
+def test_heading_formatter_per_level_char_cap(formatter_name: str, disable_cap: bool):
+    from lightrag import chunk_schema
 
-    global_config = _make_global_config(use_json=False)
-    llm_func = global_config["llm_model_func"]
-    llm_func.return_value = _TEXT_MODE_RESPONSE
-
-    with patch("lightrag.operate.logger"):
-        await extract_entities(chunks=_make_chunks(), global_config=global_config)
-
-    assert llm_func.await_count >= 1
-    user_prompt = llm_func.call_args_list[0][0][0]
-    assert _SECTION_MARKER not in user_prompt
-
-
-# ---------------------------------------------------------------------------
-# Section Context length bounding: per-level char cap + overall token budget
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.offline
-def test_format_heading_context_caps_long_level():
-    """A single runaway heading level is truncated to the per-level char cap."""
-    from lightrag.chunk_schema import (
-        DEFAULT_HEADING_LEVEL_MAX_CHARS,
-        format_heading_context,
-    )
-
-    long_title = "A" * (DEFAULT_HEADING_LEVEL_MAX_CHARS + 50)
-    chunk = {"heading": {"level": 1, "heading": long_title, "parent_headings": []}}
-
-    out = format_heading_context(chunk)
-    assert out.endswith("…")
-    assert len(out) == DEFAULT_HEADING_LEVEL_MAX_CHARS
-
-
-@pytest.mark.offline
-def test_format_heading_context_per_level_cap_can_be_disabled():
-    from lightrag.chunk_schema import format_heading_context
-
-    long_title = "B" * 300
-    chunk = {"heading": {"level": 1, "heading": long_title, "parent_headings": []}}
-
-    assert format_heading_context(chunk, max_heading_len=0) == long_title
-
-
-# ---------------------------------------------------------------------------
-# Query-stage format_parent_headings: same per-level cap + cleaning as extraction
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.offline
-def test_format_parent_headings_caps_long_level():
-    """A runaway parent heading is truncated to the per-level char cap, matching
-    the extraction-stage format_heading_context."""
-    from lightrag.chunk_schema import (
-        DEFAULT_HEADING_LEVEL_MAX_CHARS,
-        format_parent_headings,
-    )
-
-    long_title = "A" * (DEFAULT_HEADING_LEVEL_MAX_CHARS + 50)
-    chunk = {
-        "heading": {"level": 2, "heading": "Leaf", "parent_headings": [long_title]}
-    }
-
-    out = format_parent_headings(chunk)
-    assert out.endswith("…")
-    assert len(out) == DEFAULT_HEADING_LEVEL_MAX_CHARS  # only the parent, capped
-
-
-@pytest.mark.offline
-def test_format_parent_headings_per_level_cap_can_be_disabled():
-    from lightrag.chunk_schema import format_parent_headings
-
-    long_title = "B" * 300
-    chunk = {
-        "heading": {"level": 2, "heading": "Leaf", "parent_headings": [long_title]}
-    }
-
-    assert format_parent_headings(chunk, max_heading_len=0) == long_title
-
-
-@pytest.mark.offline
-def test_format_parent_headings_cleaning_matches_extraction():
-    """Parent headings get the same cleaning as extraction: → folded to a space,
-    Cc/Cf control chars stripped (shared _clean_heading_text)."""
-    from lightrag.chunk_schema import format_parent_headings
-
-    # chr(0) is a Cc control; chr(0x200B) is ZWSP (Cf) — both stripped. Built
-    # via chr() so the source carries no literal invisible characters.
-    second_level = "x" + chr(0) + "y" + chr(0x200B) + "z"
-    chunk = {
-        "heading": {
-            "level": 2,
-            "heading": "Leaf",
-            "parent_headings": ["A→B", second_level],
+    formatter = getattr(chunk_schema, formatter_name)
+    max_chars = chunk_schema.DEFAULT_HEADING_LEVEL_MAX_CHARS
+    long_title = "B" * 300 if disable_cap else "A" * (max_chars + 50)
+    if formatter_name == "format_heading_context":
+        chunk = {"heading": {"level": 1, "heading": long_title, "parent_headings": []}}
+    else:
+        chunk = {
+            "heading": {"level": 2, "heading": "Leaf", "parent_headings": [long_title]}
         }
-    }
-    # "A→B" -> "A B"; control + format chars removed from the second level.
-    assert format_parent_headings(chunk) == "A B → xyz"
+
+    if disable_cap:
+        assert formatter(chunk, max_heading_len=0) == long_title
+    else:
+        out = formatter(chunk)
+        assert out.endswith("…")
+        assert len(out) == max_chars
 
 
-@pytest.mark.offline
-def test_format_parent_headings_basic_behavior_preserved():
-    """Existing behavior is unchanged: empty when no heading, normal multi-level
-    path joined with the breadcrumb separator."""
-    from lightrag.chunk_schema import format_parent_headings
+@pytest.mark.parametrize(
+    ("formatter_name", "chunk", "expected", "expected_levels"),
+    [
+        pytest.param(
+            "format_parent_headings",
+            {"content": "...", "chunk_order_index": 0},
+            "",
+            None,
+            id="parent_headings_empty",
+        ),
+        pytest.param(
+            "format_parent_headings",
+            {
+                "heading": {
+                    "level": 2,
+                    "heading": "Leaf",
+                    "parent_headings": ["h1", "h2"],
+                }
+            },
+            "h1 → h2",
+            None,
+            id="parent_headings_excludes_leaf",
+        ),
+        pytest.param(
+            "format_parent_headings",
+            {
+                "heading": {
+                    "level": 2,
+                    "heading": "Leaf",
+                    "parent_headings": ["A→B", "x" + chr(0) + "y" + chr(0x200B) + "z"],
+                }
+            },
+            "A B → xyz",
+            None,
+            id="parent_headings_cleaning_matches_extraction",
+        ),
+        pytest.param(
+            "format_heading_context",
+            {"heading": {"level": 2, "heading": "C", "parent_headings": ["A→B"]}},
+            "A B → C",
+            ["A B", "C"],
+            id="heading_context_arrow_does_not_forge_level",
+        ),
+    ],
+)
+def test_heading_formatting_preserves_structure_and_cleans_symbols(
+    formatter_name: str,
+    chunk: dict,
+    expected: str,
+    expected_levels: list[str] | None,
+):
+    from lightrag import chunk_schema
 
-    assert format_parent_headings({"content": "...", "chunk_order_index": 0}) == ""
-
-    chunk = {
-        "heading": {"level": 2, "heading": "Leaf", "parent_headings": ["h1", "h2"]}
-    }
-    assert format_parent_headings(chunk) == "h1 → h2"  # leaf NOT appended
+    out = getattr(chunk_schema, formatter_name)(chunk)
+    assert out == expected
+    if expected_levels is not None:
+        assert out.split(chunk_schema.HEADING_BREADCRUMB_SEP) == expected_levels
 
 
 class _FakeChunksDB:
@@ -1503,46 +1269,25 @@ class _FakeChunksDB:
         return [self._data.get(i) for i in ids]
 
 
-@pytest.mark.offline
 @pytest.mark.asyncio
-async def test_attach_content_headings_token_budgets_deep_path():
-    """A deep heading chain (per-level cap bounds length, not count) is collapsed
-    to fit DEFAULT_MAX_SECTION_CONTEXT_TOKENS, mirroring the extraction stage."""
+@pytest.mark.parametrize(
+    "deep_path", [True, False], ids=["deep_collapsed", "short_intact"]
+)
+async def test_attach_content_headings_budgeting(deep_path: bool):
     from lightrag.chunk_schema import HEADING_BREADCRUMB_SEP
     from lightrag.constants import DEFAULT_MAX_SECTION_CONTEXT_TOKENS
     from lightrag.operate import _attach_content_headings
 
-    tok = Tokenizer("dummy", DummyTokenizer())  # 1 char == 1 token
-    deep = [f"Level{i:02d}" for i in range(100)]  # well over the token budget
-    db = _FakeChunksDB(
-        {"c1": {"heading": {"level": 99, "heading": "Leaf", "parent_headings": deep}}},
-        tok,
-    )
-    chunks = [{"chunk_id": "c1"}]
-
-    await _attach_content_headings(chunks, db)
-
-    out = chunks[0]["content_headings"]
-    assert len(tok.encode(out)) <= DEFAULT_MAX_SECTION_CONTEXT_TOKENS
-    # Collapsed to first → … → leaf, so a middle level is gone.
-    assert f"{HEADING_BREADCRUMB_SEP}…{HEADING_BREADCRUMB_SEP}" in out
-    assert "Level50" not in out
-
-
-@pytest.mark.offline
-@pytest.mark.asyncio
-async def test_attach_content_headings_keeps_short_path_intact():
-    """A within-budget path is attached unchanged (no token collapsing)."""
-    from lightrag.operate import _attach_content_headings
-
-    tok = Tokenizer("dummy", DummyTokenizer())
+    tok = make_dummy_tokenizer()
+    parents = [f"Level{i:02d}" for i in range(100)] if deep_path else ["h1", "h2"]
+    level = 99 if deep_path else 2
     db = _FakeChunksDB(
         {
             "c1": {
                 "heading": {
-                    "level": 2,
+                    "level": level,
                     "heading": "Leaf",
-                    "parent_headings": ["h1", "h2"],
+                    "parent_headings": parents,
                 }
             }
         },
@@ -1552,49 +1297,59 @@ async def test_attach_content_headings_keeps_short_path_intact():
 
     await _attach_content_headings(chunks, db)
 
-    assert chunks[0]["content_headings"] == "h1 → h2"
+    out = chunks[0]["content_headings"]
+    if deep_path:
+        assert len(tok.encode(out)) <= DEFAULT_MAX_SECTION_CONTEXT_TOKENS
+        assert f"{HEADING_BREADCRUMB_SEP}…{HEADING_BREADCRUMB_SEP}" in out
+        assert "Level50" not in out
+    else:
+        assert out == "h1 → h2"
 
 
-@pytest.mark.offline
-def test_truncate_section_context_keeps_first_and_last_when_over_budget():
-    """Over budget -> keep first (top-level) + last (leaf) section, elide middle."""
+@pytest.mark.parametrize(
+    "case",
+    [
+        "collapse_middle",
+        "hard_cap_dense_short",
+        "hard_cap_collapsed",
+        "budget_zero_disabled",
+        "no_tokenizer_noop",
+    ],
+)
+def test_truncate_section_context_budget_modes(case: str):
     from lightrag.chunk_schema import HEADING_BREADCRUMB_SEP
     from lightrag.operate import _truncate_section_context
 
-    tok = Tokenizer("dummy", DummyTokenizer())  # 1 char == 1 token
-    levels = [f"Level{i:02d}" for i in range(100)]
-    path = HEADING_BREADCRUMB_SEP.join(levels)
-    # Budget large enough for the collapsed two-level form (~21 tokens) so the
-    # hard-cap backstop does not also fire here.
-    budget = 40
-
-    out = _truncate_section_context(path, tok, budget)
-    expected = (
-        f"{levels[0]}{HEADING_BREADCRUMB_SEP}…{HEADING_BREADCRUMB_SEP}{levels[-1]}"
-    )
-    assert out == expected
-    assert "Level50" not in out  # middle levels are gone
-    assert len(tok.encode(out)) <= budget
-
-
-@pytest.mark.offline
-def test_truncate_section_context_hard_caps_dense_short_path():
-    """A 1-/2-level path that is itself over budget must still be capped
-    (not bypassed) — guards token-dense / byte-level tokenizers."""
-    from lightrag.chunk_schema import HEADING_BREADCRUMB_SEP
-    from lightrag.operate import _truncate_section_context
-
-    tok = Tokenizer("dummy", DummyTokenizer())
-    path = HEADING_BREADCRUMB_SEP.join(["A" * 50, "B" * 50])  # 103 chars/tokens
-    budget = 10
-
-    out = _truncate_section_context(path, tok, budget)
-    assert out != path
-    assert out.endswith("…")
-    assert len(tok.encode(out)) <= budget
+    tok = make_dummy_tokenizer()
+    if case == "collapse_middle":
+        levels = [f"Level{i:02d}" for i in range(100)]
+        path = HEADING_BREADCRUMB_SEP.join(levels)
+        out = _truncate_section_context(path, tok, 40)
+        assert out == (
+            f"{levels[0]}{HEADING_BREADCRUMB_SEP}…{HEADING_BREADCRUMB_SEP}{levels[-1]}"
+        )
+        assert "Level50" not in out
+        assert len(tok.encode(out)) <= 40
+    elif case == "hard_cap_dense_short":
+        path = HEADING_BREADCRUMB_SEP.join(["A" * 50, "B" * 50])
+        out = _truncate_section_context(path, tok, 10)
+        assert out != path
+        assert out.endswith("…")
+        assert len(tok.encode(out)) <= 10
+    elif case == "hard_cap_collapsed":
+        levels = [f"Level{i:02d}" for i in range(100)]
+        path = HEADING_BREADCRUMB_SEP.join(levels)
+        out = _truncate_section_context(path, tok, 8)
+        assert out.endswith("…")
+        assert len(tok.encode(out)) <= 8
+    elif case == "budget_zero_disabled":
+        path = "X" * 1000
+        assert _truncate_section_context(path, tok, 0) == path
+    else:
+        path = "X" * 1000
+        assert _truncate_section_context(path, None, 256) == path
 
 
-@pytest.mark.offline
 def test_truncate_section_context_accounts_for_multitoken_ellipsis():
     """The hard cap must reserve the tokenizer's actual ellipsis cost."""
     from lightrag.operate import _truncate_section_context
@@ -1613,30 +1368,11 @@ def test_truncate_section_context_accounts_for_multitoken_ellipsis():
             return "".join(chr(token) for token in tokens if token <= 0x10FFFF)
 
     tok = Tokenizer("two-token-ellipsis", TwoTokenEllipsisTokenizer())
-    budget = 10
-
-    out = _truncate_section_context("A" * 20, tok, budget)
+    out = _truncate_section_context("A" * 20, tok, 10)
     assert out == "A" * 8 + "…"
-    assert len(tok.encode(out)) <= budget
+    assert len(tok.encode(out)) <= 10
 
 
-@pytest.mark.offline
-def test_truncate_section_context_hard_caps_collapsed_form_when_still_over():
-    """Even the collapsed first→…→leaf form is capped if it still exceeds."""
-    from lightrag.chunk_schema import HEADING_BREADCRUMB_SEP
-    from lightrag.operate import _truncate_section_context
-
-    tok = Tokenizer("dummy", DummyTokenizer())
-    levels = [f"Level{i:02d}" for i in range(100)]
-    path = HEADING_BREADCRUMB_SEP.join(levels)
-    budget = 8  # smaller than the ~21-token collapsed form
-
-    out = _truncate_section_context(path, tok, budget)
-    assert out.endswith("…")
-    assert len(tok.encode(out)) <= budget
-
-
-@pytest.mark.offline
 def test_heading_level_cap_below_one_third_of_token_budget():
     """Invariant guard: collapsed first+leaf must fit the token budget."""
     from lightrag.constants import (
@@ -1647,17 +1383,6 @@ def test_heading_level_cap_below_one_third_of_token_budget():
     assert DEFAULT_HEADING_LEVEL_MAX_CHARS * 3 < DEFAULT_MAX_SECTION_CONTEXT_TOKENS
 
 
-@pytest.mark.offline
-def test_truncate_section_context_disabled_or_no_tokenizer():
-    from lightrag.operate import _truncate_section_context
-
-    tok = Tokenizer("dummy", DummyTokenizer())
-    path = "X" * 1000
-    assert _truncate_section_context(path, tok, 0) == path
-    assert _truncate_section_context(path, None, 256) == path
-
-
-@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_extract_entities_bounds_pathological_heading_in_prompt():
     """A chunk with an absurdly long heading must not inject it verbatim."""
@@ -1669,18 +1394,11 @@ async def test_extract_entities_bounds_pathological_heading_in_prompt():
     llm_func.return_value = _TEXT_MODE_RESPONSE
 
     long_title = "Z" * 500
-    chunks = {
-        "chunk-001": {
-            "tokens": 10,
-            "content": "Alice founded Acme Corp.",
-            "full_doc_id": "doc-001",
-            "chunk_order_index": 0,
-            "heading": {
-                "level": 1,
-                "heading": long_title,
-                "parent_headings": [],
-            },
-        }
+    chunks = _make_chunks("Alice founded Acme Corp.")
+    chunks["chunk-001"]["heading"] = {
+        "level": 1,
+        "heading": long_title,
+        "parent_headings": [],
     }
 
     with patch("lightrag.operate.logger"):
@@ -1688,59 +1406,25 @@ async def test_extract_entities_bounds_pathological_heading_in_prompt():
 
     user_prompt = llm_func.call_args_list[0][0][0]
     assert _SECTION_MARKER in user_prompt
-    assert long_title not in user_prompt  # full title never reaches the prompt
+    assert long_title not in user_prompt
     assert "Z" * DEFAULT_HEADING_LEVEL_MAX_CHARS not in user_prompt
 
 
-# ---------------------------------------------------------------------------
-# Heading text symbol cleaning: → -> space, strip Cc/Cf, preserve everything else
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.offline
-def test_clean_heading_text_strips_control_and_format_chars():
-    """Cc (NUL, BEL, file/unit separators) and Cf (zero-width marks) are removed."""
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("a\x00b\u200bc\ufeff", "abc", id="nul_zwsp_bom"),
+        pytest.param("x\x07y", "xy", id="bel"),
+        pytest.param("p\x1c\x1fq", "pq", id="file_unit_separators"),
+        pytest.param(
+            "方法 → 数据采集 (2024)!", "方法 数据采集 (2024)!", id="cjk_and_arrow"
+        ),
+        pytest.param("数据采集", "数据采集", id="adjacent_cjk"),
+        pytest.param("a\nb\tc", "a b c", id="newline_tab_collapse"),
+        pytest.param("a \x00 b", "a b", id="control_between_spaces"),
+    ],
+)
+def test_clean_heading_text(raw: str, expected: str):
     from lightrag.chunk_schema import _clean_heading_text
 
-    # \x00 (Cc), ​ ZWSP (Cf), ﻿ BOM (Cf) all vanish.
-    assert _clean_heading_text("a\x00b​c﻿") == "abc"
-    assert _clean_heading_text("x\x07y") == "xy"
-    # \x1c-\x1f are Cc but NOT matched by \s — must be stripped, not kept.
-    assert _clean_heading_text("p\x1c\x1fq") == "pq"
-
-
-@pytest.mark.offline
-def test_clean_heading_text_preserves_normal_characters():
-    """CJK / Latin / digits / punctuation are left untouched; only → is folded."""
-    from lightrag.chunk_schema import _clean_heading_text
-
-    assert _clean_heading_text("方法 → 数据采集 (2024)!") == "方法 数据采集 (2024)!"
-    # Adjacent CJK never gets a space inserted between characters.
-    assert _clean_heading_text("数据采集") == "数据采集"
-
-
-@pytest.mark.offline
-def test_clean_heading_text_whitespace_collapse_is_last():
-    """Newline/tab still fold to a single space (kept through the strip pass)."""
-    from lightrag.chunk_schema import _clean_heading_text
-
-    assert _clean_heading_text("a\nb\tc") == "a b c"
-    # A control char removed between two words must not leave a double space.
-    assert _clean_heading_text("a \x00 b") == "a b"
-
-
-@pytest.mark.offline
-def test_format_heading_context_arrow_in_heading_does_not_forge_level():
-    """A heading containing → is cleaned, so the breadcrumb split stays accurate."""
-    from lightrag.chunk_schema import (
-        HEADING_BREADCRUMB_SEP,
-        format_heading_context,
-    )
-
-    chunk = {
-        "heading": {"level": 2, "heading": "C", "parent_headings": ["A→B"]},
-    }
-    out = format_heading_context(chunk)
-    assert out == "A B → C"
-    # The breadcrumb still splits into exactly the two real levels.
-    assert out.split(HEADING_BREADCRUMB_SEP) == ["A B", "C"]
+    assert _clean_heading_text(raw) == expected

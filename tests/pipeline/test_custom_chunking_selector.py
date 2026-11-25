@@ -12,14 +12,19 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
-from lightrag import LightRAG, ROLES, RoleLLMConfig
+from lightrag import LightRAG
 from lightrag.base import DocStatus
-from lightrag.chunker import chunking_by_token_size
-from lightrag.chunker import ChunkingContext, accepts_chunking_context
-from lightrag.utils import EmbeddingFunc, Tokenizer
+from lightrag.chunker import (
+    ChunkingContext,
+    accepts_chunking_context,
+    chunking_by_token_size,
+)
+
+from ._fakes import make_lightrag, mock_json_llm
+
+pytestmark = pytest.mark.offline
 
 
 def _registered_callback(monkeypatch, callback, name="acme", version="1", **kwargs):
@@ -376,53 +381,14 @@ def test_registered_async_failure_records_attempt_without_fallback(
     asyncio.run(run())
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(token) for token in tokens)
-
-
-async def _mock_embedding(texts: list[str]) -> np.ndarray:
-    return np.random.rand(len(texts), 32)
-
-
-async def _mock_llm(prompt, **kwargs):
-    return '{"name":"x","summary":"s","detail_description":"d"}'
-
-
-_ROLE_FIELD_SUFFIXES = (
-    ("_llm_model_func", "func"),
-    ("_llm_model_kwargs", "kwargs"),
-    ("_llm_model_max_async", "max_async"),
-    ("_llm_timeout", "timeout"),
-)
-
-
 def _new_rag(tmp_path: Path, **kwargs) -> LightRAG:
-    role_configs: dict[str, RoleLLMConfig] = {}
-    for spec in ROLES:
-        bucket = {}
-        for suffix, target in _ROLE_FIELD_SUFFIXES:
-            key = f"{spec.name}{suffix}"
-            if key in kwargs:
-                bucket[target] = kwargs.pop(key)
-        if bucket:
-            role_configs[spec.name] = RoleLLMConfig(**bucket)
-    if role_configs:
-        kwargs["role_llm_configs"] = role_configs
-
-    return LightRAG(
-        working_dir=str(tmp_path),
+    return make_lightrag(
+        tmp_path,
+        subdir=None,
         workspace=f"custom-selector-{tmp_path.name}",
-        llm_model_func=_mock_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=32,
-            max_token_size=4096,
-            func=_mock_embedding,
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+        llm_model_func=mock_json_llm,
+        embedding_dim=32,
+        max_token_size=4096,
         **kwargs,
     )
 

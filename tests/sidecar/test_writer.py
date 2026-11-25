@@ -30,6 +30,8 @@ from lightrag.sidecar.writer import (
     safe_asset_filename,
 )
 
+pytestmark = pytest.mark.offline
+
 
 def _load_jsonl(path: Path) -> tuple[dict, list[dict]]:
     rows: list[dict] = []
@@ -516,73 +518,84 @@ def test_writer_position_origin_mixed_per_block(tmp_path: Path) -> None:
 
 
 @pytest.mark.offline
-def test_writer_drawing_self_ref_emitted_only_when_nonempty(tmp_path: Path) -> None:
-    """Spec §四 ``self_ref``: empty string ⇒ field absent; non-empty ⇒
-    written verbatim. Keeps MinerU/native sidecars byte-compatible."""
-    parsed = tmp_path / "sref.parsed"
+@pytest.mark.parametrize(
+    "kind, expected_ref",
+    [
+        ("drawing", "#/pictures/3"),
+        ("table", "#/tables/0"),
+        ("equation", "#/texts/15"),
+    ],
+)
+def test_writer_self_ref_emitted_only_when_nonempty(
+    tmp_path: Path, kind: str, expected_ref: str
+) -> None:
+    """Spec §四/§五/§六 ``self_ref``: empty string ⇒ field absent; non-empty ⇒
+    written verbatim (for drawings, tables, and block equations). Keeps
+    MinerU/native sidecars byte-compatible."""
+    parsed = tmp_path / f"{kind}_sref.parsed"
+    if kind == "drawing":
+        block = IRBlock(
+            content_template="{{IMG:a}} {{IMG:b}}",
+            drawings=[
+                IRDrawing(placeholder_key="a", asset_ref="img_a", fmt="png"),
+                IRDrawing(
+                    placeholder_key="b",
+                    asset_ref="img_b",
+                    fmt="png",
+                    self_ref=expected_ref,
+                ),
+            ],
+        )
+        assets = [
+            AssetSpec(ref="img_a", suggested_name="a.png", source=b"\x89PNG"),
+            AssetSpec(ref="img_b", suggested_name="b.png", source=b"\x89PNG"),
+        ]
+        sidecar_name, top_key = "sref.drawings.json", "drawings"
+    elif kind == "table":
+        block = IRBlock(
+            content_template="{{TBL:a}} {{TBL:b}}",
+            tables=[
+                IRTable(placeholder_key="a", rows=[["x"]], num_rows=1, num_cols=1),
+                IRTable(
+                    placeholder_key="b",
+                    rows=[["y"]],
+                    num_rows=1,
+                    num_cols=1,
+                    self_ref=expected_ref,
+                ),
+            ],
+        )
+        assets = []
+        sidecar_name, top_key = "sref.tables.json", "tables"
+    else:
+        block = IRBlock(
+            content_template="{{EQ:a}} {{EQ:b}}",
+            equations=[
+                IREquation(placeholder_key="a", latex="a+b", is_block=True),
+                IREquation(
+                    placeholder_key="b",
+                    latex="c+d",
+                    is_block=True,
+                    self_ref=expected_ref,
+                ),
+            ],
+        )
+        assets = []
+        sidecar_name, top_key = "sref.equations.json", "equations"
+
     ir = IRDoc(
         document_name="sref.pdf",
         document_format="pdf",
         doc_title="sref",
         split_option={},
-        blocks=[
-            IRBlock(
-                content_template="{{IMG:a}} {{IMG:b}}",
-                drawings=[
-                    IRDrawing(placeholder_key="a", asset_ref="img_a", fmt="png"),
-                    IRDrawing(
-                        placeholder_key="b",
-                        asset_ref="img_b",
-                        fmt="png",
-                        self_ref="#/pictures/3",
-                    ),
-                ],
-            )
-        ],
-        assets=[
-            AssetSpec(ref="img_a", suggested_name="a.png", source=b"\x89PNG"),
-            AssetSpec(ref="img_b", suggested_name="b.png", source=b"\x89PNG"),
-        ],
+        blocks=[block],
+        assets=assets,
     )
     write_sidecar(ir, parsed_dir=parsed, doc_id="doc-ccc1", engine="docling")
-    drawings = json.loads((parsed / "sref.drawings.json").read_text("utf-8"))[
-        "drawings"
-    ]
-    items = list(drawings.values())
+    mapping = json.loads((parsed / sidecar_name).read_text("utf-8"))[top_key]
+    items = list(mapping.values())
     assert "self_ref" not in items[0]
-    assert items[1]["self_ref"] == "#/pictures/3"
-
-
-@pytest.mark.offline
-def test_writer_table_self_ref_emitted_only_when_nonempty(tmp_path: Path) -> None:
-    """Spec §五 ``self_ref``: same omit-when-empty semantics as drawings."""
-    parsed = tmp_path / "tsref.parsed"
-    ir = IRDoc(
-        document_name="tsref.pdf",
-        document_format="pdf",
-        doc_title="tsref",
-        split_option={},
-        blocks=[
-            IRBlock(
-                content_template="{{TBL:a}} {{TBL:b}}",
-                tables=[
-                    IRTable(placeholder_key="a", rows=[["x"]], num_rows=1, num_cols=1),
-                    IRTable(
-                        placeholder_key="b",
-                        rows=[["y"]],
-                        num_rows=1,
-                        num_cols=1,
-                        self_ref="#/tables/0",
-                    ),
-                ],
-            )
-        ],
-    )
-    write_sidecar(ir, parsed_dir=parsed, doc_id="doc-ddd1", engine="docling")
-    tables = json.loads((parsed / "tsref.tables.json").read_text("utf-8"))["tables"]
-    items = list(tables.values())
-    assert "self_ref" not in items[0]
-    assert items[1]["self_ref"] == "#/tables/0"
+    assert items[1]["self_ref"] == expected_ref
 
 
 @pytest.mark.offline
@@ -646,40 +659,6 @@ def test_writer_table_header_serialized_by_format(tmp_path: Path) -> None:
     assert (
         grid_html_item["table_header"] == "<thead><tr><th>P</th><th>Q</th></tr></thead>"
     )
-
-
-@pytest.mark.offline
-def test_writer_equation_self_ref_emitted_only_when_nonempty(tmp_path: Path) -> None:
-    """Spec §六 ``self_ref``: block equations carry it; inline equations
-    never reach equations.json so the field is moot there."""
-    parsed = tmp_path / "esref.parsed"
-    ir = IRDoc(
-        document_name="esref.pdf",
-        document_format="pdf",
-        doc_title="esref",
-        split_option={},
-        blocks=[
-            IRBlock(
-                content_template="{{EQ:a}} {{EQ:b}}",
-                equations=[
-                    IREquation(placeholder_key="a", latex="a+b", is_block=True),
-                    IREquation(
-                        placeholder_key="b",
-                        latex="c+d",
-                        is_block=True,
-                        self_ref="#/texts/15",
-                    ),
-                ],
-            )
-        ],
-    )
-    write_sidecar(ir, parsed_dir=parsed, doc_id="doc-eee1", engine="docling")
-    equations = json.loads((parsed / "esref.equations.json").read_text("utf-8"))[
-        "equations"
-    ]
-    items = list(equations.values())
-    assert "self_ref" not in items[0]
-    assert items[1]["self_ref"] == "#/texts/15"
 
 
 @pytest.mark.offline
@@ -790,6 +769,7 @@ def test_writer_asset_name_collision_suffixed(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "suggested, expected",
     [
+        # Basename collapse & path traversal stripping (POSIX + Windows)
         ("evil.png", "evil.png"),
         ("../evil.png", "evil.png"),
         ("../../etc/passwd", "passwd"),
@@ -799,53 +779,14 @@ def test_writer_asset_name_collision_suffixed(tmp_path: Path) -> None:
         ("/abs/evil.png", "evil.png"),
         ("C:\\Windows\\evil.png", "evil.png"),
         ("  spaced.png  ", "spaced.png"),
-    ],
-)
-def test_safe_asset_filename_collapses_to_basename(
-    suggested: str, expected: str
-) -> None:
-    """Parser-suggested names are reduced to a bare basename regardless of the
-    path separators they carry, so they can never steer the output path out of
-    the assets dir. ``\\`` is normalised first so Windows-style payloads on a
-    POSIX host still collapse rather than surviving as a single filename."""
-    assert safe_asset_filename(suggested) == expected
-
-
-@pytest.mark.offline
-@pytest.mark.parametrize("suggested", ["", "   ", "..", "...", "/", "\\", "\x00\x1f"])
-def test_safe_asset_filename_falls_back_when_empty(suggested: str) -> None:
-    """Names that strip down to nothing (pure dots/separators/control chars)
-    yield the ``asset`` fallback rather than an empty or dot-only filename."""
-    assert safe_asset_filename(suggested) == "asset"
-
-
-@pytest.mark.offline
-def test_safe_asset_filename_drops_control_chars() -> None:
-    """C0 control chars and DEL are stripped out of the basename so they can't
-    smuggle separators or break the on-disk name."""
-    assert safe_asset_filename("ev\x00i\x7fl\x1f.png") == "evil.png"
-
-
-@pytest.mark.offline
-def test_safe_asset_filename_preserves_leading_dots() -> None:
-    """A leading dot is part of a legitimate basename, not a traversal payload.
-
-    The native DOCX extractor really produces dot-prefixed assets such as
-    ``.foo.part``; stripping every dot turned that into ``foo.part`` and made
-    the in-place asset lookup miss. Only names made entirely of dots are
-    unsafe. Trailing dots/spaces are still removed because Windows drops them
-    when it resolves a filename.
-    """
-    assert safe_asset_filename(".foo.part") == ".foo.part"
-    assert safe_asset_filename(".hidden.png") == ".hidden.png"
-    assert safe_asset_filename(".foo.") == ".foo"
-    assert safe_asset_filename(".foo ") == ".foo"
-
-
-@pytest.mark.offline
-@pytest.mark.parametrize(
-    "suggested, expected",
-    [
+        # Control-char stripping (C0 + DEL)
+        ("ev\x00i\x7fl\x1f.png", "evil.png"),
+        # Leading dots preserved (legitimate dot-prefixed DOCX assets), trailing dots/spaces trimmed
+        (".foo.part", ".foo.part"),
+        (".hidden.png", ".hidden.png"),
+        (".foo.", ".foo"),
+        (".foo ", ".foo"),
+        # Edge canonicalization (mixed whitespace, dots, control chars)
         ("img.png.", "img.png"),
         ("img.png. . ", "img.png"),
         ("img.png.\u3000.", "img.png"),
@@ -854,13 +795,22 @@ def test_safe_asset_filename_preserves_leading_dots() -> None:
         ("a. .b", "a. .b"),
     ],
 )
-def test_safe_asset_filename_is_canonical(suggested: str, expected: str) -> None:
-    """Edges are cleaned in any mix of whitespace, dots and control chars, and
-    a second pass changes nothing. In-place producers name their files with
-    this function and the writer refuses a name it would change, so a
-    non-idempotent result would drop a correctly extracted image."""
+def test_safe_asset_filename_normalizes_and_is_canonical(
+    suggested: str, expected: str
+) -> None:
+    """Parser-suggested names collapse to a bare canonical basename (separators,
+    control chars, and trailing dots/spaces cleaned; leading dots preserved),
+    and a second pass is idempotent."""
     assert safe_asset_filename(suggested) == expected
     assert safe_asset_filename(expected) == expected
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("suggested", ["", "   ", "..", "...", "/", "\\", "\x00\x1f"])
+def test_safe_asset_filename_falls_back_when_empty(suggested: str) -> None:
+    """Names that strip down to nothing (pure dots/separators/control chars)
+    yield the ``asset`` fallback rather than an empty or dot-only filename."""
+    assert safe_asset_filename(suggested) == "asset"
 
 
 @pytest.mark.offline

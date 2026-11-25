@@ -17,9 +17,7 @@ monkeypatched to a deterministic fake (one entity per staged chunk), covering:
 from __future__ import annotations
 
 from threading import get_ident
-from uuid import uuid4
 
-import numpy as np
 import pytest
 
 import lightrag.lightrag as lightrag_module
@@ -30,7 +28,6 @@ from lightrag.exceptions import ChunkTokenLimitExceededError
 from lightrag.utils import (
     LLM_TRUNCATION_METADATA_KEY,
     EmbeddingFunc,
-    Tokenizer,
     TruncatedResponse,
 )
 from lightrag.utils_pipeline import (
@@ -38,46 +35,24 @@ from lightrag.utils_pipeline import (
     make_custom_chunk_id,
 )
 
+from ._fakes import build_initialized_rag, make_embedding_func
+
 pytestmark = pytest.mark.offline
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*args, **kwargs) -> str:
-    return "ok"
-
 
 # 81 char-tokens: one over the 80-token embedding limit used below.
 _OVER_LIMIT_CHUNK = "1" * 81
 
 
+def _embedding_func(max_token_size: int | None) -> EmbeddingFunc:
+    return make_embedding_func(dim=8, max_token_size=max_token_size)
+
+
 async def _build_rag(tmp_path, **overrides) -> LightRAG:
-    rag = LightRAG(
-        working_dir=str(tmp_path / "wd"),
-        workspace=f"ccpatch-{uuid4().hex[:8]}",
-        llm_model_func=_dummy_llm,
-        embedding_func=overrides.pop("embedding_func", _embedding_func(8192)),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+    return await build_initialized_rag(
+        tmp_path,
+        workspace_prefix="ccpatch",
         max_parallel_insert=1,
         **overrides,
-    )
-    await rag.initialize_storages()
-    return rag
-
-
-def _embedding_func(max_token_size: int | None) -> EmbeddingFunc:
-    return EmbeddingFunc(
-        embedding_dim=8, max_token_size=max_token_size, func=_dummy_embedding
     )
 
 

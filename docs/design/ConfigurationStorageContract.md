@@ -8,7 +8,7 @@ the *Acceptance scenarios* at the end.
 | --- | --- |
 | code | `lightrag/config_store.py`, `lightrag/config_anchor.py`, `lightrag/config_shards.py`, `lightrag/kg/anchor_lock.py`, `lightrag/kg/working_dir_lock.py`, `LightRAG.initialize_storages()` / `finalize_storages()`, the `config` namespace branch in each admitted KV backend |
 | tools | `lightrag-rebuild-vdb`, `lightrag-clear-storage`, `lightrag-migrate-config`, and the setup wizard (`make env-storage`, `make env-validate`) |
-| tests | `tests/config_store/`, beside each backend under `tests/kg/<backend>_impl/`, `tests/tools/`, `tests/workspace/test_anchor_lock.py`, `tests/setup/test_config_anchor.py` |
+| tests | `tests/config_store/`, beside each backend under `tests/kg/<backend>_impl/`, `tests/tools/`, `tests/workspace/test_workspace_locks.py`, `tests/setup/test_config_anchor.py` |
 | read with | `VectorSpaceProvenance.md` (the verdict rules and the blind spots the baselines close), `ServerInstanceContract.md` (several servers on one host) and `ConfigurationStorageDesign.md` (the design overview: why the parts are shaped this way, where the implementation departs from the original plan, known gaps) |
 
 Read this before touching any of:

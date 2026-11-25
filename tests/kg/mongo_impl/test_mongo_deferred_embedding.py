@@ -1,8 +1,6 @@
-"""Unit tests for MongoVectorDBStorage's deferred-embedding flush pipeline.
+"""Unit tests for MongoVectorDBStorage's deferred-embedding flush pipeline and vector queries.
 
 All tests use mocks — no running MongoDB instance required.
-Mirrors the structure of tests/kg/opensearch_impl/test_opensearch_storage.py's
-TestVectorStorageBatching to keep behaviour aligned across backends.
 """
 
 import asyncio
@@ -555,11 +553,10 @@ async def test_drop_clears_pending_buffers():
         assert s._pending_vector_deletes == set()
 
 
-@pytest.mark.offline
 @pytest.mark.asyncio
 async def test_drop_pending_index_ops_clears_buffers():
     """On an internal-error abort the pipeline calls drop_pending_index_ops to
-    discard buffered upserts/deletes without flushing them (PR #3187)."""
+    discard buffered upserts/deletes without flushing them."""
     embed = CountingEmbeddingFunc()
     s = _make_storage(embed)
     await s.upsert({"v1": {"content": "x"}, "v2": {"content": "y"}})
@@ -594,3 +591,69 @@ async def test_strict_read_raises_where_get_by_ids_reports_nothing():
     assert await storage.get_by_ids(["ent-1"]) == []
     with pytest.raises(ConnectionError):
         await storage.get_by_ids_strict(["ent-1"])
+
+
+# ---------------------------------------------------------------------------
+# Atlas Vector Search query: cosine threshold rescaling & numCandidates bounds
+# ---------------------------------------------------------------------------
+
+
+def _make_query_storage(threshold: float = 0.2) -> MongoVectorDBStorage:
+    storage = MongoVectorDBStorage(
+        namespace="entities",
+        workspace="test",
+        global_config={
+            "embedding_batch_num": 10,
+            "vector_db_storage_cls_kwargs": {"cosine_better_than_threshold": threshold},
+        },
+        embedding_func=MockEmbeddingFunc(),
+        meta_fields={"content"},
+    )
+    storage._data = MagicMock()
+    storage._index_name = "test_index"
+    return storage
+
+
+@pytest.mark.asyncio
+async def test_query_rescales_cosine_threshold_and_converts_distance_back():
+    """Server-side $match compares against (1 + threshold) / 2, and returned
+    distance converts Atlas's normalized vectorSearchScore back to raw cosine."""
+    storage = _make_query_storage(threshold=0.2)
+    storage._data.aggregate = AsyncMock(
+        return_value=_AsyncCursor([{"_id": "v1", "score": 0.85, "content": "match"}])
+    )
+
+    results = await storage.query("test", top_k=5, query_embedding=[0.1] * 8)
+
+    pipeline = storage._data.aggregate.await_args[0][0]
+    match_stage = next(stage for stage in pipeline if "$match" in stage)
+    assert match_stage["$match"]["score"]["$gte"] == pytest.approx(0.6)
+    assert len(results) == 1
+    assert results[0]["distance"] == pytest.approx(0.7)
+
+
+@pytest.mark.parametrize(
+    ("top_k", "expected_num_candidates", "expected_limit"),
+    [
+        pytest.param(5, 100, 5, id="small"),
+        pytest.param(100, 100, 100, id="at-floor"),
+        pytest.param(101, 101, 101, id="just-above-floor"),
+        pytest.param(10_000, 10_000, 10_000, id="atlas-ceiling"),
+        pytest.param(20_000, 10_000, 10_000, id="above-atlas-ceiling"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_vector_search_num_candidates_bounds(
+    top_k, expected_num_candidates, expected_limit
+):
+    storage = _make_query_storage()
+    storage._data.aggregate = AsyncMock(return_value=_AsyncCursor([]))
+
+    await storage.query("q", top_k=top_k, query_embedding=[0.1] * 8)
+
+    stage = storage._data.aggregate.call_args[0][0][0]["$vectorSearch"]
+    assert (stage["numCandidates"], stage["limit"]) == (
+        expected_num_candidates,
+        expected_limit,
+    )
+    assert stage["limit"] <= stage["numCandidates"] <= 10_000

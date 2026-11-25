@@ -1,4 +1,4 @@
-"""Tests for heading merge, CB2 demotion, skeleton correction, and clamping."""
+"""Tests for heading merge, CB2 demotion, anchoring, nesting, skeleton correction, and clamping."""
 
 from __future__ import annotations
 
@@ -9,43 +9,20 @@ from lightrag.parser.docx.smart_heading.heading_flow import (
     HeadingDecision,
     _register_merge_members,
     align_numbering_series,
+    anchor_outline_levels,
+    backfill_top_level,
     clamp_deep_levels,
     correct_numbering_skeleton,
     demote_strong_body_headings,
     merge_split_headings,
+    nest_numbered_under_parent,
 )
-from lightrag.parser.docx.smart_heading.style_key import classify_numbering
+from tests.parser.docx._smart_heading_helpers import (
+    make_decision as _d,
+    stub_strong_body as _stub_strong_body,
+)
 
 pytestmark = pytest.mark.offline
-
-
-def _d(
-    text: str,
-    level: int,
-    *,
-    idx: int,
-    size: float = 14.0,
-    numbered: bool = False,
-    outline: int | None = None,
-    anchored: bool = False,
-) -> HeadingDecision:
-    return HeadingDecision(
-        record_index=idx,
-        text=text,
-        is_heading=True,
-        level=level,
-        font_size_pt=size,
-        outline_level=outline,
-        anchored=anchored,
-        numbering=classify_numbering(text) if numbered else None,
-    )
-
-
-def _stub_strong_body(text: str) -> str | None:
-    stripped = text.strip()
-    if stripped.endswith(("。", "？", "！")) or len(stripped) > 60:
-        return "strong_body_stub"
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -802,3 +779,389 @@ def test_title_block_members_emitted_exactly_once() -> None:
     # The doc-number lives only inside the level-0 title block.
     title_block = next(b for b in blocks if b.get("is_title_block"))
     assert "质监发〔2026〕12号" in title_block["content"]
+
+
+# ---------------------------------------------------------------------------
+# Two-round physical-outline anchoring & CB3 guard
+# ---------------------------------------------------------------------------
+
+
+def _build_anchor(specs) -> list[HeadingDecision]:
+    return [
+        _d(text, level, outline=outline, numbered=numbered, idx=i)
+        for i, (text, level, outline, numbered) in enumerate(specs)
+    ]
+
+
+def test_anchor_no_outline_skips_everything() -> None:
+    ds = _build_anchor([("标题甲", 2, None, False), ("标题乙", 3, None, False)])
+    assert anchor_outline_levels(ds, warnings={}) is False
+    assert [d.level for d in ds] == [2, 3]
+    assert not any(d.anchored for d in ds)
+
+
+def test_anchor_round1_non_numbered_snaps_to_outline() -> None:
+    """G7-1: outlineLvl=2 -> final level 3 regardless of the size level."""
+    ds = _build_anchor([("样式标题", 5, 2, False)])
+    assert anchor_outline_levels(ds, warnings={}) is True
+    assert ds[0].level == 3 and ds[0].anchored
+    assert ds[0].pre_anchor_level == 5
+
+
+def test_anchor_round1_series_mode_unifies_outliers() -> None:
+    """G7-2: 5 CnNum members, four outlined at 1 and one at 3 -> all level 2."""
+    specs = [
+        (f"{'一二三四五'[i]}、条目", 4, 1 if i != 2 else 3, True) for i in range(5)
+    ]
+    ds = _build_anchor(specs)
+    warnings: dict = {}
+    anchor_outline_levels(ds, warnings=warnings)
+    assert [d.level for d in ds] == [2] * 5
+    assert all(d.anchored for d in ds)
+    assert "smart_cb3_low_outline_ratio" not in warnings
+
+
+def test_anchor_cb3_low_outline_ratio_still_propagates() -> None:
+    """G7-3: 2/10 outlined (<50%) -> propagate + warning."""
+    cn = "一二三四五六七八九十"
+    specs = [(f"{cn[i]}、条目", 4, 1 if i < 2 else None, True) for i in range(10)]
+    ds = _build_anchor(specs)
+    warnings: dict = {}
+    anchor_outline_levels(ds, warnings=warnings)
+    assert [d.level for d in ds] == [2] * 10
+    assert warnings["smart_cb3_low_outline_ratio"] == 1
+
+
+@pytest.mark.parametrize(
+    ("specs", "expected_levels", "expect_all_anchored", "expected_warnings"),
+    [
+        pytest.param(
+            # G7-4: sub-window holds level >= R1(4) -> shift by R2 - R1 = -2.
+            [
+                ("锚点甲", 2, 1, False),
+                ("未锁定深标题", 4, None, False),
+                ("未锁定更深", 5, None, False),
+                ("锚点乙", 4, 1, False),
+            ],
+            [2, 2, 3, 2],
+            True,
+            {"smart_anchor_window_shifts": 1},
+            id="deep-subwindow-shifts-with-back-anchor",
+        ),
+        pytest.param(
+            # G7-5 shape 1: L0=5, back anchor 7->3 -> delta = -(5-3+1) = -3.
+            [
+                ("未锁定甲", 4, None, False),
+                ("未锁定乙", 5, None, False),
+                ("后锚点", 7, 2, False),
+            ],
+            [1, 2, 3],
+            False,
+            {},
+            id="gap-close-shallower-than-r1",
+        ),
+        pytest.param(
+            # G7-5 shape 2: L0=3, back 5->3 -> delta = -1 (continuous boundary).
+            [
+                ("未锁定甲", 3, None, False),
+                ("后锚点", 5, 2, False),
+            ],
+            [2, 3],
+            False,
+            {},
+            id="gap-close-one-level",
+        ),
+        pytest.param(
+            # G7-5 shape 3: already shallower than R2 -> no shift.
+            [
+                ("未锁定甲", 2, None, False),
+                ("后锚点", 6, 3, False),
+            ],
+            [2, 4],
+            False,
+            {},
+            id="gap-close-already-above-r2",
+        ),
+        pytest.param(
+            # G7-5 floor: shift below level 1 floors and warns.
+            [
+                ("未锁定甲", 2, None, False),
+                ("未锁定乙", 4, None, False),
+                ("后锚点", 4, 0, False),
+            ],
+            [1, 1, 1],
+            False,
+            {"smart_anchor_floor_compressions": 1},
+            id="floor-compression-warns",
+        ),
+        pytest.param(
+            # G7-6a: trailing anchor moving deeper leaves window alone.
+            [
+                ("未锁定甲", 3, None, False),
+                ("后锚点", 2, 4, False),
+            ],
+            [3, 5],
+            False,
+            {},
+            id="back-anchor-deeper-noop",
+        ),
+        pytest.param(
+            # Front-anchor shift drags immediate subtree, stops at <= new level.
+            [
+                ("前锚点", 4, 1, False),
+                ("子标题甲", 5, None, False),
+                ("子标题乙", 6, None, False),
+                ("同层标题", 2, None, False),
+                ("后续深标题", 3, None, False),
+            ],
+            [2, 3, 4, 2, 3],
+            False,
+            {},
+            id="front-anchor-follow-and-stop",
+        ),
+        pytest.param(
+            # G7-6b: document-leading window without front anchor.
+            [
+                ("开头未锁定", 3, None, False),
+                ("锚点", 3, 1, False),
+            ],
+            [2, 2],
+            False,
+            {},
+            id="first-window-without-front-anchor",
+        ),
+        pytest.param(
+            # Raised front (4->2): stop at PRE-adjust level (4), not post (2).
+            [
+                ("前锚点", 4, 1, False),
+                ("真子标题", 5, None, False),
+                ("旧平级标题", 4, None, False),
+                ("更浅标题", 3, None, False),
+            ],
+            [2, 3, 4, 3],
+            False,
+            {},
+            id="front-follow-stops-at-pre-adjust-raised",
+        ),
+        pytest.param(
+            # Lowered front (2->4): child at 3 follows to 5; sibling at 2 stops.
+            [
+                ("前锚点", 2, 3, False),
+                ("真子标题", 3, None, False),
+                ("旧平级标题", 2, None, False),
+            ],
+            [4, 5, 2],
+            False,
+            {},
+            id="front-follow-stops-at-pre-adjust-lowered",
+        ),
+    ],
+)
+def test_anchor_round2_window_shifts(
+    specs,
+    expected_levels: list[int],
+    expect_all_anchored: bool,
+    expected_warnings: dict[str, int],
+) -> None:
+    ds = _build_anchor(specs)
+    warnings: dict = {}
+    anchor_outline_levels(ds, warnings=warnings)
+    assert [d.level for d in ds] == expected_levels
+    if expect_all_anchored:
+        assert all(d.anchored for d in ds)
+    for key, val in expected_warnings.items():
+        assert warnings[key] == val
+
+
+# ---------------------------------------------------------------------------
+# Numbered-list re-nesting & chapter-top backfill
+# ---------------------------------------------------------------------------
+
+
+def _nest_d(
+    idx: int,
+    text: str,
+    level: int,
+    *,
+    size: float = 12.0,
+    outline: int | None = None,
+    plain: bool = False,
+    anchored: bool = False,
+) -> HeadingDecision:
+    return _d(
+        text,
+        level,
+        idx=idx,
+        size=size,
+        numbered=not plain,
+        outline=outline,
+        anchored=anchored or outline is not None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("ds_factory", "expected_levels", "nested_indices", "untouched_indices"),
+    [
+        pytest.param(
+            # (i) EnNum mis-leveled shallower than deep MLN -> parent + 1.
+            lambda: [
+                _nest_d(0, "2.1.1.1.1.2 密钥管理规则", 6, outline=5),
+                _nest_d(1, "1. 密钥产生", 5),
+            ],
+            [6, 7],
+            (1,),
+            (),
+            id="ennum-nests-under-deep-mln",
+        ),
+        pytest.param(
+            # (ii) Two lists each align to their own MLN parent.
+            lambda: [
+                _nest_d(0, "2.1.1 A", 5, outline=4),
+                _nest_d(1, "1. x", 4),
+                _nest_d(2, "2. y", 4),
+                _nest_d(3, "2.1.1.1 B", 6, outline=5),
+                _nest_d(4, "1. p", 4),
+                _nest_d(5, "2. q", 4),
+            ],
+            [5, 6, 6, 6, 7, 7],
+            (),
+            (),
+            id="two-lists-align-to-own-parent",
+        ),
+        pytest.param(
+            # (iii) EnNum already deeper than parent -> untouched.
+            lambda: [_nest_d(0, "2.1.1 A", 5, outline=4), _nest_d(1, "1. x", 6)],
+            [5, 6],
+            (),
+            (1,),
+            id="already-deeper-not-raised",
+        ),
+        pytest.param(
+            # (iv) Outlined EnNum is not touched by nesting pass.
+            lambda: [
+                _nest_d(0, "2.1.1 A", 5, outline=4),
+                _nest_d(1, "1. x", 7, outline=6),
+            ],
+            [5, 7],
+            (),
+            (1,),
+            id="outlined-ennum-untouched",
+        ),
+        pytest.param(
+            # (v) Outline-locked descendant under EnNum is NOT dragged.
+            lambda: [
+                _nest_d(0, "2.1.1 A", 6, outline=5),
+                _nest_d(1, "1. x", 5),
+                _nest_d(2, "child", 7, outline=6, anchored=True),
+            ],
+            [6, 7, 7],
+            (),
+            (),
+            id="locked-descendant-not-dragged",
+        ),
+        pytest.param(
+            # (v2) Round-2 non-outline anchored child moves with its parent.
+            lambda: [
+                _nest_d(0, "2.1.1 A", 6, outline=5),
+                _nest_d(1, "1. x", 5),
+                _nest_d(2, "小节", 6, plain=True, anchored=True),
+            ],
+            [6, 7, 8],
+            (),
+            (),
+            id="nonoutline-anchored-child-moves",
+        ),
+        pytest.param(
+            # (vi) Unnumbered nearest parent: nest under IT, not earlier MLN.
+            lambda: [
+                _nest_d(0, "2.1 MLN", 2, outline=1),
+                _nest_d(1, "小结", 5, plain=True),
+                _nest_d(2, "1. x", 4),
+            ],
+            [2, 5, 6],
+            (),
+            (),
+            id="unnumbered-parent-no-reattach",
+        ),
+        pytest.param(
+            # (vii) Peer aligns across deeper child: 1. A -> a. child -> 2. B.
+            lambda: [
+                _nest_d(0, "2.1.1 P", 6, outline=5),
+                _nest_d(1, "1. A", 5),
+                _nest_d(2, "a. child", 6),
+                _nest_d(3, "2. B", 5),
+            ],
+            [6, 7, 8, 7],
+            (),
+            (),
+            id="peer-aligns-across-deeper-child",
+        ),
+        pytest.param(
+            # (vii-b) Reset ordinal (1 after 1) nests under child, not peer of A.
+            lambda: [
+                _nest_d(0, "2.1.1 P", 5, outline=4),
+                _nest_d(1, "1. A", 5),
+                _nest_d(2, "a. child", 6),
+                _nest_d(3, "1. subitem", 5),
+            ],
+            [5, 6, 7, 8],
+            (),
+            (),
+            id="nested-restart-nests-under-child",
+        ),
+        pytest.param(
+            # (viii) Same-level heading breaks the list; 1. redo starts new sublist.
+            lambda: [
+                _nest_d(0, "2.1 P", 5, outline=4),
+                _nest_d(1, "1. first", 6),
+                _nest_d(2, "小结", 6, plain=True),
+                _nest_d(3, "1. redo", 6),
+                _nest_d(4, "2. redo2", 6),
+            ],
+            [5, 6, 6, 7, 7],
+            (3,),
+            (),
+            id="same-level-heading-breaks-list",
+        ),
+    ],
+)
+def test_nest_numbered_under_parent_cases(
+    ds_factory,
+    expected_levels: list[int],
+    nested_indices: tuple[int, ...],
+    untouched_indices: tuple[int, ...],
+) -> None:
+    ds = ds_factory()
+    nest_numbered_under_parent(ds)
+    assert [d.level for d in ds] == expected_levels
+    for idx in nested_indices:
+        assert "nest_under_parent" in ds[idx].rule_trail
+    for idx in untouched_indices:
+        assert ds[idx].rule_trail == []
+
+
+def test_backfill_linked_chapter_beats_linked_ennum() -> None:
+    """When both a CnChapter top and an EnNum series carry >=2 ordinal
+    linkages, CnChapter wins on priority tie-break as MLN level-1."""
+    from lightrag.parser.docx.smart_heading.style_key import EN_NUM, MULTI_LEVEL_NUM
+
+    ds = [
+        _nest_d(0, "第一章 X", 2, size=14.0),
+        _nest_d(1, "1. foo", 2, size=14.0),
+        _nest_d(2, "1.1 a", 3),
+        _nest_d(3, "1.2 b", 3),
+        _nest_d(4, "第二章 Y", 2, size=14.0),
+        _nest_d(5, "2. bar", 2, size=14.0),
+        _nest_d(6, "2.1 c", 3),
+        _nest_d(7, "2.2 d", 3),
+    ]
+    backfill_top_level(ds)
+
+    foo, bar = ds[1], ds[5]
+    chap1, chap2 = ds[0], ds[4]
+    assert foo.numbering.style_key == EN_NUM
+    assert bar.numbering.style_key == EN_NUM
+    assert "backfill_top_level" not in foo.rule_trail
+    assert chap1.numbering.style_key == MULTI_LEVEL_NUM
+    assert "backfill_top_level" in chap1.rule_trail
+    assert chap2.numbering.style_key == MULTI_LEVEL_NUM

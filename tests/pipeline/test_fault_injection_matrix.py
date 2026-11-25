@@ -17,44 +17,17 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-import numpy as np
 import pytest
 
 from lightrag import LightRAG
 from lightrag.base import DocStatus
 from lightrag.tools.kg_integrity_repair import audit_kg_integrity
-from lightrag.utils import EmbeddingFunc, Tokenizer, compute_mdhash_id
+from lightrag.utils import compute_mdhash_id
 
+from ._fakes import build_initialized_rag, single_chunk_chunking
 from .conftest import request_failed_retry
 
 pytestmark = pytest.mark.offline
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*args, **kwargs) -> str:
-    return "ok"
-
-
-def _deterministic_chunking(
-    tokenizer,
-    content: str,
-    split_by_character,
-    split_by_character_only: bool,
-    chunk_overlap_token_size: int,
-    chunk_token_size: int,
-) -> list[dict]:
-    return [{"tokens": 1, "content": f"{content}::chunk1", "chunk_order_index": 0}]
 
 
 def _wire_fake_extraction(rag: LightRAG) -> None:
@@ -86,18 +59,12 @@ def _wire_fake_extraction(rag: LightRAG) -> None:
 
 
 async def _build_rag(tmp_path, workspace: str) -> LightRAG:
-    rag = LightRAG(
-        working_dir=str(tmp_path / "wd"),
+    rag = await build_initialized_rag(
+        tmp_path,
         workspace=workspace,
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
-        chunking_func=_deterministic_chunking,
+        chunking_func=single_chunk_chunking,
         max_parallel_insert=1,
     )
-    await rag.initialize_storages()
     _wire_fake_extraction(rag)
     return rag
 

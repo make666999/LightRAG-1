@@ -2,8 +2,8 @@
 
 Locks in the supported-subset contract: ATX heading splitting, fenced-code
 suppression, pipe / HTML table recognition with headers, block-level ``$$``
-math (and inline ``$`` left alone), and inline image resolution via a stubbed
-resolver.
+math (and inline ``$`` left alone), literal-image code-span/escape preservation,
+and inline image resolution via a stubbed resolver.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import random
 import re
 import time
 import tracemalloc
+from collections.abc import Callable
 
 import pytest
 
@@ -144,7 +145,7 @@ def _reference_replace_inline_images(line: str) -> str:
 
 
 class _StubResolver:
-    """Resolves ``http(s)`` → external link, everything else → local bytes."""
+    """Resolves ``http(s)`` -> external link, everything else -> local bytes."""
 
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -191,6 +192,17 @@ def _extract(md: str):
     return extract_markdown(md, image_resolver=_StubResolver())
 
 
+def _resolved(line: str) -> tuple[list[str], str]:
+    calls: list[str] = []
+    out = _replace_inline_images(line, lambda src: calls.append(src) or "<img>")
+    return calls, out
+
+
+# ---------------------------------------------------------------------------
+# Headings & fenced code blocks
+# ---------------------------------------------------------------------------
+
+
 def test_headings_split_blocks_and_track_parents():
     md = "# A\nintro\n## B\nbody\n### C\ndeep\n# D\nlast"
     ex = _extract(md)
@@ -222,21 +234,27 @@ def test_content_before_first_heading_is_preface():
     assert "loose intro line" in ex.blocks[0]["content"]
 
 
-def test_fenced_code_suppresses_all_detection():
-    md = "# H\n```python\n# not a heading\n$$ not eq $$\n| not | table |\n![x](no.png)\n```\n"
+@pytest.mark.parametrize(
+    ("md", "snippets"),
+    [
+        pytest.param(
+            "# H\n```python\n# not a heading\n$$ not eq $$\n| not | table |\n![x](no.png)\n```\n",
+            ("# not a heading", "$$ not eq $$"),
+            id="backtick-fence",
+        ),
+        pytest.param(
+            "# H\n~~~\n## still code\n~~~\nafter",
+            ("## still code",),
+            id="tilde-fence",
+        ),
+    ],
+)
+def test_fenced_code_suppresses_detection(md: str, snippets: tuple[str, ...]):
     ex = _extract(md)
-    # Only the single real heading produced a block; fence content stays verbatim.
     assert len(ex.blocks) == 1
     assert not ex.tables and not ex.equations and not ex.drawings
-    assert "# not a heading" in ex.blocks[0]["content"]
-    assert "$$ not eq $$" in ex.blocks[0]["content"]
-
-
-def test_tilde_fence_supported():
-    md = "# H\n~~~\n## still code\n~~~\nafter"
-    ex = _extract(md)
-    assert len(ex.blocks) == 1
-    assert "## still code" in ex.blocks[0]["content"]
+    for snippet in snippets:
+        assert snippet in ex.blocks[0]["content"]
 
 
 def test_one_line_backtick_code_span_does_not_open_a_fence():
@@ -249,14 +267,70 @@ def test_one_line_backtick_code_span_does_not_open_a_fence():
     assert len(ex.tables) == 1
 
 
-def test_pipe_table_with_header():
-    md = "| Name | Age |\n|------|-----|\n| Bob | 30 |\n| Sue | 25 |\n"
+# ---------------------------------------------------------------------------
+# Pipe tables
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("md", "expected_header", "expected_rows", "not_in_content"),
+    [
+        pytest.param(
+            "| Name | Age |\n|------|-----|\n| Bob | 30 |\n| Sue | 25 |\n",
+            [["Name", "Age"]],
+            [["Bob", "30"], ["Sue", "25"]],
+            None,
+            id="basic-header-and-rows",
+        ),
+        pytest.param(
+            # ``\|`` is cell content, not a column separator.
+            "| h1 | h2 |\n| --- | --- |\n| a \\| b | c |\n",
+            [["h1", "h2"]],
+            [["a | b", "c"]],
+            None,
+            id="escaped-pipe-in-cell",
+        ),
+        pytest.param(
+            # Escaped pipe in the header must not inflate its column count.
+            "| a \\| b | h2 |\n| --- | --- |\n| 1 | 2 |\n",
+            [["a | b", "h2"]],
+            [["1", "2"]],
+            None,
+            id="escaped-pipe-in-header",
+        ),
+        pytest.param(
+            # Once the delimiter establishes the table, an escaped-pipe-only
+            # line stays in the table body (GFM pads it to the header width).
+            "| h1 | h2 |\n| --- | --- |\n| a | b |\ntail \\| text\n",
+            [["h1", "h2"]],
+            [["a", "b"], ["tail | text"]],
+            "tail \\| text",
+            id="escaped-pipe-only-body-row",
+        ),
+        pytest.param(
+            # ``\\|`` is an escaped backslash followed by a real separator.
+            "| h1 | h2 |\n| --- | --- |\n| a | b |\nc \\\\| d\n",
+            [["h1", "h2"]],
+            [["a", "b"], ["c \\", "d"]],
+            None,
+            id="escaped-backslash-before-separator",
+        ),
+    ],
+)
+def test_pipe_table_extraction(
+    md: str,
+    expected_header: list[list[str]],
+    expected_rows: list[list[str]],
+    not_in_content: str | None,
+):
     ex = _extract(md)
     assert len(ex.tables) == 1
     (table,) = ex.tables.values()
     assert table["kind"] == "pipe"
-    assert table["rows"] == [["Bob", "30"], ["Sue", "25"]]
-    assert table["header"] == [["Name", "Age"]]
+    assert table["header"] == expected_header
+    assert table["rows"] == expected_rows
+    if not_in_content is not None:
+        assert not_in_content not in ex.blocks[0]["content"]
 
 
 def test_pipe_table_stops_at_atx_heading_with_pipe():
@@ -280,79 +354,39 @@ def test_pipe_table_stops_at_atx_heading_with_pipe():
     assert "Confirm the shipment date." in ex.blocks[1]["content"]
 
 
-def test_pipe_table_requires_delimiter_row():
-    # A pipe-containing line with no delimiter row underneath is plain text.
-    md = "| just | text |\nnot a delimiter\n"
+@pytest.mark.parametrize(
+    ("md", "preserved_text"),
+    [
+        pytest.param(
+            "| just | text |\nnot a delimiter\n",
+            None,
+            id="missing-delimiter-row",
+        ),
+        pytest.param(
+            # Mismatched column counts (2 vs 1) over bare thematic break.
+            "foo | bar\n---\nnext paragraph\n",
+            "foo | bar",
+            id="pipe-line-over-thematic-break",
+        ),
+        pytest.param(
+            # Delimiter column count differs from header.
+            "| a | b | c |\n| --- | --- |\n| 1 | 2 | 3 |\n",
+            None,
+            id="column-count-mismatch",
+        ),
+        pytest.param(
+            # No unescaped pipe -> paragraph, not a 1-column table over ``---``.
+            "foo \\| bar\n---\nnext paragraph\n",
+            "foo \\| bar",
+            id="escaped-pipe-only-over-thematic-break",
+        ),
+    ],
+)
+def test_pipe_table_rejected_when_invalid(md: str, preserved_text: str | None):
     ex = _extract(md)
     assert not ex.tables
-
-
-def test_pipe_line_over_thematic_break_is_not_a_table():
-    # A pipe-containing paragraph followed by a bare ``---`` (thematic break /
-    # setext underline) has mismatched column counts (2 vs 1) and so is NOT a
-    # GFM table — it must stay plain text rather than be misrecognised.
-    md = "foo | bar\n---\nnext paragraph\n"
-    ex = _extract(md)
-    assert not ex.tables
-    assert "foo | bar" in ex.blocks[0]["content"]
-
-
-def test_pipe_table_column_count_must_match_header():
-    # Delimiter row column count differs from the header → not a table.
-    md = "| a | b | c |\n| --- | --- |\n| 1 | 2 | 3 |\n"
-    ex = _extract(md)
-    assert not ex.tables
-
-
-def test_pipe_table_escaped_pipe_is_cell_text():
-    # ``\|`` is content, not a column separator, so the row keeps the header's
-    # column count instead of silently shifting values under the wrong header.
-    md = "| h1 | h2 |\n| --- | --- |\n| a \\| b | c |\n"
-    ex = _extract(md)
-    (table,) = ex.tables.values()
-    assert table["header"] == [["h1", "h2"]]
-    assert table["rows"] == [["a | b", "c"]]
-
-
-def test_pipe_table_escaped_pipe_in_header_keeps_table():
-    # An escaped pipe in the header must not inflate its column count, or the
-    # delimiter row stops matching and the table is not recognised at all.
-    md = "| a \\| b | h2 |\n| --- | --- |\n| 1 | 2 |\n"
-    ex = _extract(md)
-    (table,) = ex.tables.values()
-    assert table["header"] == [["a | b", "h2"]]
-    assert table["rows"] == [["1", "2"]]
-
-
-def test_escaped_pipe_only_line_over_thematic_break_is_not_a_table():
-    # With no unescaped ``|`` the line has no column separator at all, so it is
-    # a paragraph, even though its single cell matches the one-cell ``---``.
-    md = "foo \\| bar\n---\nnext paragraph\n"
-    ex = _extract(md)
-    assert not ex.tables
-    assert "foo \\| bar" in ex.blocks[0]["content"]
-
-
-def test_escaped_pipe_only_line_stays_in_the_table_body():
-    # Escaping is content-level. Once the delimiter row has established the
-    # table, a line whose only pipe is escaped is still a body row -- GFM keeps
-    # it, as one cell padded to the header width. Requiring an unescaped ``|``
-    # here would move table data out into a paragraph; only the header gate,
-    # where no table is established yet, may demand structural evidence.
-    md = "| h1 | h2 |\n| --- | --- |\n| a | b |\ntail \\| text\n"
-    ex = _extract(md)
-    (table,) = ex.tables.values()
-    assert table["rows"] == [["a", "b"], ["tail | text"]]
-    assert "tail \\| text" not in ex.blocks[0]["content"]
-
-
-def test_escaped_backslash_body_row_splits_into_two_cells():
-    # ``\\|`` is an escaped backslash followed by a real separator, so the row
-    # carries two cells and the backslash stays in the first one.
-    md = "| h1 | h2 |\n| --- | --- |\n| a | b |\nc \\\\| d\n"
-    ex = _extract(md)
-    (table,) = ex.tables.values()
-    assert table["rows"] == [["a", "b"], ["c \\", "d"]]
+    if preserved_text is not None:
+        assert preserved_text in ex.blocks[0]["content"]
 
 
 @pytest.mark.parametrize(
@@ -375,58 +409,143 @@ def test_has_unescaped_pipe_agrees_with_the_row_splitter(line, expected):
     assert (len(_split_pipe_row("|" + line)) > 1) is expected
 
 
-def test_html_table_captured_verbatim_spanning_lines():
-    md = (
-        "<table>\n"
-        "<thead><tr><th>K</th></tr></thead>\n"
-        "<tbody><tr><td>a</td></tr></tbody>\n"
-        "</table>\n"
-    )
+# ---------------------------------------------------------------------------
+# HTML tables
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("md", "expected_html", "expected_trailing"),
+    [
+        pytest.param(
+            "<table>\n<thead><tr><th>K</th></tr></thead>\n"
+            "<tbody><tr><td>a</td></tr></tbody>\n</table>\n",
+            "<table>\n<thead><tr><th>K</th></tr></thead>\n"
+            "<tbody><tr><td>a</td></tr></tbody>\n</table>",
+            "",
+            id="multiline-verbatim-thead-tbody",
+        ),
+        pytest.param(
+            "<table><tr><td>a</td></tr></table> trailing prose",
+            "<table><tr><td>a</td></tr></table>",
+            " trailing prose",
+            id="same-line-trailing-text",
+        ),
+        pytest.param(
+            "<table>\n<tr><td>a</td></tr>\n</table> trailing prose",
+            "<table>\n<tr><td>a</td></tr>\n</table>",
+            " trailing prose",
+            id="multiline-close-trailing-text",
+        ),
+        pytest.param(
+            "<table><tr><td>İ</td></tr></table>tail",
+            "<table><tr><td>İ</td></tr></table>",
+            "tail",
+            id="unicode-content-trailing-text",
+        ),
+        pytest.param(
+            '<table data-note="</table>"><tr><td>a</td></tr></table> tail',
+            '<table data-note="</table>"><tr><td>a</td></tr></table>',
+            " tail",
+            id="closing-tag-inside-attribute",
+        ),
+        pytest.param(
+            "<table><!-- don't remove --><tr><td>a</td></tr></table> tail",
+            "<table><!-- don't remove --><tr><td>a</td></tr></table>",
+            " tail",
+            id="quotes-inside-comments",
+        ),
+        pytest.param(
+            # Unmatched quote inside RCDATA (<textarea>) must not stall close scan.
+            "<table>\n<tr><td><textarea>x<y's value</textarea></td></tr>\n</table> tail",
+            "<table>\n<tr><td><textarea>x<y's value</textarea></td></tr>\n</table>",
+            " tail",
+            id="unmatched-quote-inside-textarea",
+        ),
+        pytest.param(
+            # Raw mode waits until the opening <textarea ...> tag itself closes.
+            '<table><textarea data-note="</textarea>">x<y\'s value</textarea></table> tail',
+            '<table><textarea data-note="</textarea>">x<y\'s value</textarea></table>',
+            " tail",
+            id="raw-mode-waits-for-opening-tag-close",
+        ),
+        pytest.param(
+            # Valid HTML closing tag broken by whitespace/newline before ``>``.
+            "<table><textarea>x</textarea\n>\n</table> tail",
+            "<table><textarea>x</textarea\n>\n</table>",
+            " tail",
+            id="raw-mode-closing-tag-split-across-lines",
+        ),
+        pytest.param(
+            # Bare ``>`` inside foreign-content CDATA must not expose inner ``</table>``.
+            "<table><tr><td><svg><![CDATA[x > </table> y]]></svg></td></tr></table> tail",
+            "<table><tr><td><svg><![CDATA[x > </table> y]]></svg></td></tr></table>",
+            " tail",
+            id="closing-tag-inside-cdata",
+        ),
+        pytest.param(
+            # Same-line nested table depth is tracked; inner stays verbatim.
+            "<table><tr><td><table>x</table></td></tr></table> tail",
+            "<table><tr><td><table>x</table></td></tr></table>",
+            " tail",
+            id="nested-same-line-table-depth",
+        ),
+        pytest.param(
+            # Custom/namespaced tag ``<textarea:widget>`` needs real name boundary.
+            "<table><textarea:widget>x</textarea:widget></table> tail",
+            "<table><textarea:widget>x</textarea:widget></table>",
+            " tail",
+            id="boundary-after-raw-element-name",
+        ),
+        pytest.param(
+            # Literal ``</table>`` inside <script> raw-text content is ignored.
+            '<table><tr><td><script>if (a < b) { x.close("</table>"); }</script>'
+            "</td></tr></table> tail",
+            '<table><tr><td><script>if (a < b) { x.close("</table>"); }</script>'
+            "</td></tr></table>",
+            " tail",
+            id="tag-like-text-inside-script",
+        ),
+        pytest.param(
+            # Unmatched quote inside <style> raw-text content is ignored.
+            '<table><tr><td><style>content: "it\'s";</style></td></tr></table> tail',
+            '<table><tr><td><style>content: "it\'s";</style></td></tr></table>',
+            " tail",
+            id="quote-inside-style",
+        ),
+        pytest.param(
+            # Non-ASCII letter after ``<`` is not an HTML tag opener.
+            "<table><td>x <é's text</td></table> tail",
+            "<table><td>x <é's text</td></table>",
+            " tail",
+            id="non-ascii-tag-open",
+        ),
+        pytest.param(
+            # RCDATA (<textarea>) must not treat literal ``<!--`` as a comment.
+            "<table><tr><td><textarea>a <!-- not a comment</textarea></td></tr></table> tail",
+            "<table><tr><td><textarea>a <!-- not a comment</textarea></td></tr></table>",
+            " tail",
+            id="comment-marker-inside-rcdata-textarea",
+        ),
+        pytest.param(
+            # RCDATA (<title>) must not treat literal ``<!--`` as a comment.
+            "<table><tr><td><title>a <!-- not a comment</title></td></tr></table> tail",
+            "<table><tr><td><title>a <!-- not a comment</title></td></tr></table>",
+            " tail",
+            id="comment-marker-inside-rcdata-title",
+        ),
+    ],
+)
+def test_html_table_single_block_extraction(
+    md: str, expected_html: str, expected_trailing: str
+):
     ex = _extract(md)
     assert len(ex.tables) == 1
     (table,) = ex.tables.values()
     assert table["kind"] == "html"
-    assert "<thead>" in table["html"] and "</table>" in table["html"]
-
-
-def test_html_table_preserves_same_line_trailing_text():
-    ex = _extract("<table><tr><td>a</td></tr></table> trailing prose")
-
-    (table,) = ex.tables.values()
-    assert table["html"] == "<table><tr><td>a</td></tr></table>"
-    assert ex.blocks[0]["content"].endswith(" trailing prose")
-
-
-def test_html_table_preserves_trailing_text_after_multiline_close():
-    ex = _extract("<table>\n<tr><td>a</td></tr>\n</table> trailing prose")
-
-    (table,) = ex.tables.values()
-    assert table["html"].endswith("</table>")
-    assert ex.blocks[0]["content"].endswith(" trailing prose")
-
-
-def test_html_table_preserves_trailing_text_after_unicode_content():
-    ex = _extract("<table><tr><td>İ</td></tr></table>tail")
-
-    (table,) = ex.tables.values()
-    assert table["html"] == "<table><tr><td>İ</td></tr></table>"
-    assert ex.blocks[0]["content"].endswith("tail")
-
-
-def test_html_table_ignores_closing_tag_text_inside_attribute():
-    ex = _extract('<table data-note="</table>"><tr><td>a</td></tr></table> tail')
-
-    (table,) = ex.tables.values()
-    assert table["html"] == ('<table data-note="</table>"><tr><td>a</td></tr></table>')
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
-def test_html_table_ignores_quotes_inside_comments():
-    ex = _extract("<table><!-- don't remove --><tr><td>a</td></tr></table> tail")
-
-    (table,) = ex.tables.values()
-    assert table["html"] == ("<table><!-- don't remove --><tr><td>a</td></tr></table>")
-    assert ex.blocks[0]["content"].endswith(" tail")
+    assert table["html"] == expected_html
+    if expected_trailing:
+        assert ex.blocks[0]["content"].endswith(expected_trailing)
 
 
 def test_html_table_processes_inline_image_in_trailing_text():
@@ -441,128 +560,18 @@ def test_html_table_processes_inline_image_in_trailing_text():
     assert "![plot](plot.png)" not in ex.blocks[0]["content"]
 
 
-def test_html_table_ignores_unmatched_quote_inside_textarea():
-    """Codex finding: an apostrophe inside RCDATA content (textarea/title)
-    must not be tracked as an attribute quote -- it previously left the
-    parser's quote-tracking state open indefinitely, swallowing the real
-    </table> that followed."""
-    ex = _extract(
-        "<table>\n<tr><td><textarea>x<y's value</textarea></td></tr>\n</table> tail"
-    )
-
-    (table,) = ex.tables.values()
-    assert table["html"].endswith("</table>")
-    assert "<y's value</textarea>" in table["html"]
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
-def test_html_table_raw_mode_waits_for_opening_tag_to_close():
-    """A decoy closing sequence inside the textarea's own opening-tag
-    attributes (still ordinary markup, quote-tracked as normal) must not be
-    mistaken for the real content boundary -- raw mode must not begin until
-    that opening tag's own unquoted ">" is reached."""
-    ex = _extract(
-        '<table><textarea data-note="</textarea>">x<y\'s value</textarea></table> tail'
-    )
-
-    (table,) = ex.tables.values()
-    assert table["html"].endswith("</table>")
-    assert 'data-note="</textarea>">x<y\'s value</textarea>' in table["html"]
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
-def test_html_table_raw_mode_closing_tag_split_across_lines():
-    """A raw-text closing tag broken by a line break, e.g. </textarea then a
-    bare > on the next line, is still valid HTML and must still be found --
-    a per-line search would miss it and lose the rest of the document."""
-    ex = _extract("<table><textarea>x</textarea\n>\n</table> tail")
-
-    (table,) = ex.tables.values()
-    assert table["html"].endswith("</table>")
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
 def test_html_table_tag_name_split_across_lines_is_not_recognized():
-    """A line break inside a tag NAME itself (as opposed to the whitespace
-    before ">") is not valid HTML -- a real tokenizer has no "</textarea"
-    substring to match here, so the element never closes and the table is
-    left as plain text, same as any other genuinely unclosed table."""
+    """A line break inside a tag NAME itself is not valid HTML, so the element
+    never closes and the unclosed table stays plain text."""
     ex = _extract("<table><textarea>x</texta\nrea></table> tail")
 
     assert not ex.tables
     assert ex.blocks[0]["content"] == "<table><textarea>x</texta\nrea></table> tail"
 
 
-def test_html_table_ignores_closing_tag_text_inside_cdata():
-    """Codex finding: a bare ">" inside foreign-content CDATA (e.g. an <svg>
-    cell) must not end a fake in_tag state and expose a literal
-    "</table>"-shaped string inside the payload as the real close."""
-    ex = _extract(
-        "<table><tr><td><svg><![CDATA[x > </table> y]]></svg></td></tr></table> tail"
-    )
-
-    (table,) = ex.tables.values()
-    assert table["html"].endswith("</table>")
-    assert "<![CDATA[x > </table> y]]>" in table["html"]
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
-def test_html_table_tracks_nested_same_line_table_depth():
-    """Codex finding: a same-line nested table's inner </table> must not be
-    accepted as the outer block's close. The nested table's own structure is
-    never separately parsed -- it stays verbatim inside the captured html,
-    same as everything else this parser doesn't specially understand."""
-    ex = _extract("<table><tr><td><table>x</table></td></tr></table> tail")
-
-    (table,) = ex.tables.values()
-    assert table["html"] == "<table><tr><td><table>x</table></td></tr></table>"
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
-def test_html_table_requires_boundary_after_raw_element_name():
-    """Codex finding: a custom/namespaced tag like <textarea:widget> must not
-    trigger raw mode just because its name starts with a known raw-mode
-    element name -- only a real boundary (whitespace, "/" or ">") after the
-    matched name counts."""
-    ex = _extract("<table><textarea:widget>x</textarea:widget></table> tail")
-
-    (table,) = ex.tables.values()
-    assert table["html"].endswith("</table>")
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
-def test_html_table_ignores_tag_like_text_inside_script():
-    """RCDATA/raw-text elements (script here) must not have their content
-    scanned for tags either -- a literal </table>-shaped string inside
-    <script> content must not be mistaken for the real closing tag."""
-    ex = _extract(
-        '<table><tr><td><script>if (a < b) { x.close("</table>"); }</script>'
-        "</td></tr></table> tail"
-    )
-
-    (table,) = ex.tables.values()
-    assert table["html"].endswith("</table>")
-    assert 'x.close("</table>")' in table["html"]
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
-def test_html_table_ignores_quote_inside_style():
-    """Same unmatched-quote hazard as textarea, for the other raw-text
-    element (style)."""
-    ex = _extract(
-        '<table><tr><td><style>content: "it\'s";</style></td></tr></table> tail'
-    )
-
-    (table,) = ex.tables.values()
-    assert table["html"].endswith("</table>")
-    assert 'content: "it\'s";' in table["html"]
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
 def test_html_table_recognizes_second_same_line_table():
-    """Codex finding: a second supported table on the same line as the
-    first's close must not be swallowed as inline prose -- the targeted
-    table-only suffix retry gives it its own entry too."""
+    """A second supported table on the same line as the first's close gets its
+    own entry via the targeted table-only suffix retry."""
     ex = _extract("<table>A</table><table>B</table>")
 
     assert [t["html"] for t in ex.tables.values()] == [
@@ -575,81 +584,82 @@ def test_html_table_recognizes_second_same_line_table():
     )
 
 
-def test_html_table_ignores_non_ascii_tag_open():
-    """Codex finding: a non-ASCII letter after "<" (e.g. "<é") must not
-    be treated as a tag opener -- Python's str.isalpha() is true for it, but
-    real HTML tag names start with an ASCII letter only. Before the fix this
-    entered a fake in_tag state, mistook the following apostrophe for a
-    quote, and swallowed the real closing tag."""
-    ex = _extract("<table><td>x <é's text</td></table> tail")
-
-    (table,) = ex.tables.values()
-    assert table["html"] == "<table><td>x <é's text</td></table>"
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
 def test_html_table_trailing_suffix_does_not_gain_line_anchored_semantics():
-    """Codex finding: re-queuing the suffix as a "line" must not let it open
-    a fence or start a heading it never was in the source -- only another
-    same-line table gets the special-cased retry; everything else goes
-    through plain inline-image resolution like before."""
+    """Re-queuing the suffix after ``</table>`` must not let it open a fence or
+    start a heading it never was in the source."""
     ex = _extract("<table>A</table># literal")
     assert ex.blocks[0]["heading"] == PREFACE_HEADING
     assert ex.blocks[0]["content"].endswith("# literal")
-    assert len(ex.blocks) == 1  # no second, heading-split block
+    assert len(ex.blocks) == 1
 
     ex2 = _extract("<table>A</table>```\n# actual heading")
     assert ex2.blocks[0]["heading"] == PREFACE_HEADING
     assert ex2.blocks[0]["content"].endswith("```")
-    assert ex2.blocks[1]["heading"] == "actual heading"  # not swallowed by a fence
+    assert ex2.blocks[1]["heading"] == "actual heading"
 
 
-@pytest.mark.parametrize("tag", ["textarea", "title"])
-def test_html_table_ignores_comment_marker_inside_rcdata(tag: str):
-    """RCDATA content must not be scanned for HTML comments either -- a
-    literal <!-- must stay text rather than open a never-closing comment."""
-    ex = _extract(
-        f"<table><tr><td><{tag}>a <!-- not a comment</{tag}></td></tr></table> tail"
-    )
-
-    (table,) = ex.tables.values()
-    assert table["html"].endswith("</table>")
-    assert f"<!-- not a comment</{tag}>" in table["html"]
-    assert ex.blocks[0]["content"].endswith(" tail")
+# ---------------------------------------------------------------------------
+# Block equations
+# ---------------------------------------------------------------------------
 
 
-def test_block_equation_single_and_multiline():
-    md = "$$ E = mc^2 $$\n\ntext\n\n$$\n\\sum x\n$$\n"
+@pytest.mark.parametrize(
+    ("md", "expected_equations", "expected_headings", "expected_snippet"),
+    [
+        pytest.param(
+            "$$ E = mc^2 $$\n\ntext\n\n$$\n\\sum x\n$$\n",
+            ["E = mc^2", "\\sum x"],
+            None,
+            None,
+            id="single-and-multiline",
+        ),
+        pytest.param(
+            "cost is $5 and $10 today",
+            [],
+            None,
+            "$5",
+            id="inline-dollar-ignored",
+        ),
+        pytest.param(
+            "# A\n$$E = mc^2$$ relates mass and energy.\n## B\n$$\np = mv\n$$\n",
+            ["p = mv"],
+            ["A", "B"],
+            None,
+            id="display-math-with-trailing-prose-does-not-open-block",
+        ),
+        pytest.param(
+            "$$\nE = mc^2\nno closing",
+            [],
+            None,
+            "$$",
+            id="unclosed-block-is-plain-text",
+        ),
+    ],
+)
+def test_block_equation_extraction(
+    md: str,
+    expected_equations: list[str],
+    expected_headings: list[str] | None,
+    expected_snippet: str | None,
+):
     ex = _extract(md)
-    latexes = list(ex.equations.values())
-    assert "E = mc^2" in latexes
-    assert "\\sum x" in latexes
+    assert list(ex.equations.values()) == expected_equations
+    if expected_headings is not None:
+        assert [b["heading"] for b in ex.blocks] == expected_headings
+    if expected_snippet is not None:
+        assert expected_snippet in ex.blocks[0]["content"]
 
 
-def test_inline_dollar_not_recognized_as_equation():
-    ex = _extract("cost is $5 and $10 today")
-    assert not ex.equations
-    assert "$5" in ex.blocks[0]["content"]
-
-
-def test_display_math_followed_by_prose_does_not_open_a_block():
-    md = "# A\n$$E = mc^2$$ relates mass and energy.\n## B\n$$\np = mv\n$$\n"
-    ex = _extract(md)
-    assert [b["heading"] for b in ex.blocks] == ["A", "B"]
-    assert list(ex.equations.values()) == ["p = mv"]
-
-
-def test_unclosed_block_equation_is_plain_text():
-    ex = _extract("$$\nE = mc^2\nno closing")
-    assert not ex.equations
-    assert "$$" in ex.blocks[0]["content"]
+# ---------------------------------------------------------------------------
+# Inline images, literal images, grammar & resource bounds
+# ---------------------------------------------------------------------------
 
 
 def test_inline_image_local_and_external_and_dedup():
     md = "![a](one.png) and ![b](one.png) and ![c](http://x/y.png)"
     resolver = _StubResolver()
     ex = extract_markdown(md, image_resolver=resolver)
-    # Three occurrences → three drawings; same local src deduped to one asset.
+    # Three occurrences -> three drawings; same local src deduped to one asset.
     assert len(ex.drawings) == 3
     assert len(ex.assets) == 1
     kinds = sorted(d["kind"] for d in ex.drawings.values())
@@ -663,6 +673,8 @@ def test_base64_src_not_echoed_into_drawing_src():
     md = "![x](data:image/png;base64,QUJD)"
 
     class _B64:
+        """Minimal resolver returning a local image for data URLs."""
+
         def resolve(self, src):
             return ResolvedImage(
                 kind="local",
@@ -684,12 +696,110 @@ def test_reference_style_image_not_recognized():
 
 
 @pytest.mark.parametrize(
+    "literal",
+    [
+        r"\![example](example.png)",
+        "`![example](example.png)`",
+        "``a ` tick ![example](example.png)``",
+        "``![example](example.png)` still code``",
+        # A backslash escapes one backtick; the rest of the run still opens.
+        r"\``![example](example.png)`",
+        # The code span opened in the alt text swallows its ``]``.
+        "![a `b](example.png)`",
+        # An escaped ``]`` never ends the alt text.
+        r"![a\](example.png)",
+    ],
+)
+def test_literal_images_are_preserved_without_resolving(literal):
+    calls: list[str] = []
+
+    class _Resolver:
+        """Records resolved image sources and returns an external stub."""
+
+        def resolve(self, src):
+            calls.append(src)
+            return ResolvedImage(kind="external", url=src)
+
+    result = extract_markdown(
+        literal + " and ![real](real.png)", image_resolver=_Resolver()
+    )
+    assert calls == ["real.png"]
+    assert len(result.drawings) == 1
+    assert literal in result.blocks[0]["content"]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        r"\\",  # an escaped backslash escapes nothing after it
+        "`unclosed ",  # an unclosed run protects nothing
+        r"\`",  # an escaped single backtick opens nothing
+        r"`a\`",  # a backslash does not escape a closing run
+        "``a`` ",  # a closed span ends before the image
+    ],
+)
+def test_escaped_backslash_or_unclosed_code_does_not_hide_image(prefix):
+    calls: list[str] = []
+
+    class _Resolver:
+        """Records resolved image sources and returns an external stub."""
+
+        def resolve(self, src):
+            calls.append(src)
+            return ResolvedImage(kind="external", url=src)
+
+    result = extract_markdown(prefix + "![real](real.png)", image_resolver=_Resolver())
+    assert calls == ["real.png"]
+    assert len(result.drawings) == 1
+
+
+@pytest.mark.parametrize(
+    ("line", "expected_calls", "expected_out"),
+    [
+        ("![a `b` c](real.png)", ["real.png"], "<img>"),
+        (r"![a\\](real.png)", ["real.png"], "<img>"),
+        ('![a ``b`` c](real.png "title")', ["real.png"], "<img>"),
+        # After an unclosed ``x run scans the line, a closed `a` span must not
+        # make a later `b ...` span look unclosed or hide a later closer.
+        ("``x `a` `b ![i](i.png)` `", [], None),
+        ("``x `a` `in ``` t` ![real](real.png) ```", ["real.png"], None),
+        (
+            "`a` ``b ` c`` ![x](x.png) `![y](y.png)` tail",
+            ["x.png"],
+            "`a` ``b ` c`` <img> `![y](y.png)` tail",
+        ),
+    ],
+)
+def test_literal_image_scanner_code_span_and_escape_handling(
+    line: str, expected_calls: list[str], expected_out: str | None
+):
+    calls, out = _resolved(line)
+    assert calls == expected_calls
+    if expected_out is not None:
+        assert out == expected_out
+
+
+@pytest.mark.parametrize(
     ("line", "expected"),
     [
         ("before ![alt](image.png) after", "before <image.png> after"),
         ('![alt](<a b.png> "caption")', "<<a b.png>>"),
         ("![](<a>suffix)", "<<a>suffix>"),
         ("![broken ![nested](ok.png)", "<ok.png>"),
+        # CommonMark: a bare destination may hold balanced parentheses.
+        ("![x](shot(1).png)", "<shot(1).png>"),
+        ("see ![x](a(b(c))d) end", "see <a(b(c))d> end"),
+        ('![x](shot(1).png "caption")', "<shot(1).png>"),
+        (
+            "![x](https://en.wikipedia.org/wiki/File:Foo_(bar).svg) tail)",
+            "<https://en.wikipedia.org/wiki/File:Foo_(bar).svg> tail)",
+        ),
+        ("(![x](a(1).png))", "(<a(1).png>)"),
+        ("![x](a.png)(b)", "<a.png>(b)"),
+        # Unbalanced: not an image (CommonMark asks for escapes or <...>).
+        ("![x](foo(and(bar))", "![x](foo(and(bar))"),
+        ('![x](foo(bar "title")', '![x](foo(bar "title")'),
+        ("![x]()", "![x]()"),
     ],
 )
 def test_inline_image_scanner_preserves_supported_image_grammar(line, expected):
@@ -740,57 +850,40 @@ def test_inline_image_scanner_lenient_retry_leaves_non_images_alone(line):
     assert _replace_inline_images(line, lambda src: f"<{src}>") == line
 
 
-def test_lenient_retry_sees_an_image_inside_an_earlier_tail():
-    # Codex finding: ``old.png "...")`` is itself a valid source end plus
-    # quoted title, and that title spans the real image. Looking for source
-    # ends with one non-overlapping scan of the line hid the image's own end.
-    line = '(old.png "![x](my pic.png)")'
-    assert _replace_inline_images(line, lambda src: f"<{src}>") == (
-        '(old.png "<my pic.png>")'
-    )
-    ex = _extract(line)
-    (drawing,) = ex.drawings.values()
-    assert drawing["src"] == "my pic.png"
-
-
-def test_lenient_retry_does_not_reach_into_the_next_candidate():
-    # The first candidate is rejected; its retry must stop at the next ``![``
-    # so the second image is matched on its own, by the strict grammar.
-    line = "![a](two words ![b](ok.png)"
-    assert _replace_inline_images(line, lambda src: f"<{src}>") == (
-        "![a](two words <ok.png>"
-    )
-
-
-def test_strict_grammar_wins_over_the_lenient_retry():
-    # ``a.png`` already is a complete image; the retry must not extend it.
-    line = "![x](a.png) trailing (b c.png)"
-    assert _replace_inline_images(line, lambda src: f"<{src}>") == (
-        "<a.png> trailing (b c.png)"
-    )
-
-
 @pytest.mark.parametrize(
-    ("line", "expected"),
+    ("line", "expected", "drawing_src"),
     [
-        # CommonMark: a bare destination may hold balanced parentheses.
-        ("![x](shot(1).png)", "<shot(1).png>"),
-        ("see ![x](a(b(c))d) end", "see <a(b(c))d> end"),
-        ('![x](shot(1).png "caption")', "<shot(1).png>"),
-        (
-            "![x](https://en.wikipedia.org/wiki/File:Foo_(bar).svg) tail)",
-            "<https://en.wikipedia.org/wiki/File:Foo_(bar).svg> tail)",
+        pytest.param(
+            # ``old.png "...")`` must not hide the real image inside its title.
+            '(old.png "![x](my pic.png)")',
+            '(old.png "<my pic.png>")',
+            "my pic.png",
+            id="image-inside-earlier-tail",
         ),
-        ("(![x](a(1).png))", "(<a(1).png>)"),
-        ("![x](a.png)(b)", "<a.png>(b)"),
-        # Unbalanced: not an image (CommonMark asks for escapes or <...>).
-        ("![x](foo(and(bar))", "![x](foo(and(bar))"),
-        ('![x](foo(bar "title")', '![x](foo(bar "title")'),
-        ("![x]()", "![x]()"),
+        pytest.param(
+            # Rejected candidate's retry must stop at the next ``![``.
+            "![a](two words ![b](ok.png)",
+            "![a](two words <ok.png>",
+            None,
+            id="stops-before-next-candidate",
+        ),
+        pytest.param(
+            # Strict grammar already matched ``a.png``; retry must not extend it.
+            "![x](a.png) trailing (b c.png)",
+            "<a.png> trailing (b c.png)",
+            None,
+            id="strict-wins-over-lenient",
+        ),
     ],
 )
-def test_inline_image_scanner_keeps_balanced_parentheses_in_source(line, expected):
+def test_lenient_retry_interaction_boundaries(
+    line: str, expected: str, drawing_src: str | None
+):
     assert _replace_inline_images(line, lambda src: f"<{src}>") == expected
+    if drawing_src is not None:
+        ex = _extract(line)
+        (drawing,) = ex.drawings.values()
+        assert drawing["src"] == drawing_src
 
 
 def test_image_path_with_spaces_becomes_a_drawing():
@@ -825,19 +918,15 @@ def test_parenthesised_source_is_limited_in_length():
 @pytest.mark.parametrize(
     "line",
     [
-        # Codex finding: a whole-line parenthesis index grew one entry per
-        # depth for a suffix no image could ever reach (230 MiB for 1 MB).
+        # Whole-line parenthesis index once grew 230 MiB for 1 MB suffix.
         "![x](a.png) " + ")" * 1_000_000,
         "![x](a(1).png) " + ")" * 1_000_000,
-        # These two are slow under tracemalloc, so they are shorter: an index
-        # over the whole line still takes about 4x the bound at this length.
+        # Shorter under tracemalloc: whole-line index still takes ~4x bound.
         "![x](" + "(" * 250_000,
         "![x](a(" + "()" * 125_000 + ")",
         "![x](a b" + ".png)" * 200_000,
         "![x](a (b" + ".png) " * 200_000,
-        # Code spans are skipped, never indexed: a whole-line list of backtick
-        # runs took 48 MiB for the first line at twice this length. Halved for
-        # speed, the list still takes 1.5x the bound or more.
+        # Code spans are skipped, never indexed.
         "![x](a.png) " + "`a" * 100_000,
         "![x](a.png) " + "``a`" * 50_000,
         "![x](a.png) " + "".join("`" * k + " " for k in range(1, 1_400)),
@@ -855,72 +944,165 @@ def test_inline_image_scanner_memory_stays_bounded(line):
     assert peak < 2 * len(line) + 4_000_000
 
 
+def _repeat(prefix: str, unit: str, suffix: str) -> Callable[[int], str]:
+    return lambda n: prefix + unit * n + suffix
+
+
 @pytest.mark.parametrize(
-    "unit",
+    ("build_line", "small_n", "large_n", "paren_max_chars", "verify_unchanged"),
     [
-        "![](a(",
-        "![](a)",
-        "![](a(b)",
-        "![]((",
-        "![](a (",
+        # Parenthesis matching for malformed candidates (small window = 64).
+        pytest.param(
+            _repeat("", "![](a(", ""), 1_024, 8_192, 64, False, id="paren-open"
+        ),
+        pytest.param(
+            _repeat("", "![](a)", ""), 1_024, 8_192, 64, False, id="paren-close"
+        ),
+        pytest.param(
+            _repeat("", "![](a(b)", ""), 1_024, 8_192, 64, False, id="paren-nested"
+        ),
+        pytest.param(
+            _repeat("", "![]((", ""), 1_024, 8_192, 64, False, id="paren-bare-open"
+        ),
+        pytest.param(
+            _repeat("", "![](a (", ""), 1_024, 8_192, 64, False, id="paren-space-open"
+        ),
+        # Parenthesis window rebuilds (every candidate beyond previous window).
+        pytest.param(
+            _repeat("", "![](a(" + "x" * 5_000, ""),
+            32,
+            256,
+            None,
+            False,
+            id="paren-window-rebuilds",
+        ),
+        # Lenient retry for malformed candidates sharing a suffix.
+        pytest.param(
+            _repeat("", "![](a b", "](a ( b.png)"),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="lenient-no-ext",
+        ),
+        pytest.param(
+            _repeat("", "![](a b.png", "](a ( b.png)"),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="lenient-unclosed",
+        ),
+        pytest.param(
+            _repeat("", "![](a (b.png) ", "](a ( b.png)"),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="lenient-wrong-depth",
+        ),
+        pytest.param(
+            _repeat("", '![](a b.png "', "](a ( b.png)"),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="lenient-dangling-title",
+        ),
+        pytest.param(
+            _repeat("", "![", "](a ( b.png)"),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="lenient-nested-alt",
+        ),
+        # Code span and escape checks.
+        pytest.param(
+            _repeat("![x](a.png) ", "`a", ""),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="code-closed",
+        ),
+        pytest.param(
+            _repeat("![x](a.png) ", "``a`", ""),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="code-unclosed-opener",
+        ),
+        pytest.param(
+            _repeat("![x](a.png) ", "\\``a", ""),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="code-escaped-opener",
+        ),
+        pytest.param(
+            _repeat("![x](a.png) ", "![", "`](x.png)`"),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="code-alt-ends-in-span",
+        ),
+        pytest.param(
+            _repeat("![x](a.png) ", "![ `a` ", "`](x.png)`"),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="code-alt-after-closed-span",
+        ),
+        pytest.param(
+            _repeat("![x](a.png) ", "![", "\\](x.png)"),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="code-escaped-alt-end",
+        ),
+        # Shared alt end behind a long odd backslash run.
+        pytest.param(
+            lambda n: "![" * n + "\\" * (2 * n + 1) + "](x.png)",
+            1_024,
+            8_192,
+            None,
+            False,
+            id="shared-alt-end-backslashes",
+        ),
+        # Bare malformed candidate flood.
+        pytest.param(
+            _repeat("", "![](", ""),
+            1_024,
+            8_192,
+            None,
+            True,
+            id="malformed-candidate-flood",
+        ),
     ],
 )
-def test_parenthesis_matching_scales_linearly_for_malformed_candidates(
-    unit, monkeypatch
+def test_inline_image_scanner_scales_linearly(
+    build_line: Callable[[int], str],
+    small_n: int,
+    large_n: int,
+    paren_max_chars: int | None,
+    verify_unchanged: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    # A small window, so that both sizes span many windows and their cost
-    # per candidate is comparable.
-    monkeypatch.setattr(extract_module, "_PAREN_SOURCE_MAX_CHARS", 64)
-    assert _scan_time_ratio(unit * 1_024, unit * 8_192) < 16
-
-
-def test_parenthesis_window_rebuilds_scale_linearly():
-    # Every candidate lies beyond the previous window, so each one rebuilds it.
-    unit = "![](a(" + "x" * 5_000
-    assert _scan_time_ratio(unit * 32, unit * 256) < 16
-
-
-@pytest.mark.parametrize(
-    "unit",
-    [
-        "![](a b",  # no extension anywhere near
-        "![](a b.png",  # extension, never closed
-        "![](a (b.png) ",  # closed at the wrong depth
-        '![](a b.png "',  # dangling titles
-        "![",  # candidates nested in one alt text ...
-    ],
-)
-def test_lenient_retry_scales_linearly_for_malformed_candidates(unit):
-    # ... which all share the source start after this suffix.
-    suffix = "](a ( b.png)"
-    assert _scan_time_ratio(unit * 1_024 + suffix, unit * 8_192 + suffix) < 16
-
-
-@pytest.mark.parametrize(
-    ("unit", "suffix"),
-    [
-        ("`a", ""),  # closed spans
-        ("``a`", ""),  # openers that never close
-        ("\\``a", ""),  # escaped openers
-        ("![", "`](x.png)`"),  # nested candidates, alt ends inside a span
-        ("![ `a` ", "`](x.png)`"),  # ... after spans closed in the alt text
-        ("![", "\\](x.png)"),  # nested candidates, escaped alt end
-    ],
-)
-def test_code_span_and_escape_checks_scale_linearly(unit, suffix):
-    def line_with(count: int) -> str:
-        return "![x](a.png) " + unit * count + suffix
-
-    assert _scan_time_ratio(line_with(1_024), line_with(8_192)) < 16
-
-
-def test_escape_check_on_a_shared_alt_end_scales_linearly():
-    # Every nested candidate ends its alt text at one ``]`` behind a long odd
-    # backslash run; counting that run once per candidate was quadratic.
-    def line_with(count: int) -> str:
-        return "![" * count + "\\" * (2 * count + 1) + "](x.png)"
-
-    assert _scan_time_ratio(line_with(1_024), line_with(8_192)) < 16
+    if paren_max_chars is not None:
+        monkeypatch.setattr(extract_module, "_PAREN_SOURCE_MAX_CHARS", paren_max_chars)
+    small = build_line(small_n)
+    large = build_line(large_n)
+    if verify_unchanged:
+        assert _replace_inline_images(small, lambda src: src) == small
+        assert _replace_inline_images(large, lambda src: src) == large
+    # Eight times more input must not become a quadratic (~64x) workload.
+    assert _scan_time_ratio(small, large) < 16
 
 
 class _CopyCountingLine(str):
@@ -993,17 +1175,3 @@ def test_code_spans_and_escapes_match_reference_for_random_lines():
         assert _replace_inline_images(
             line, lambda src: f"<{src}>"
         ) == _reference_replace_inline_images(line), line
-
-
-def test_inline_image_scanner_scales_linearly_for_malformed_candidates():
-    def elapsed(repetitions: int) -> float:
-        line = "![](" * repetitions
-        started = time.perf_counter()
-        for _ in range(5):
-            assert _replace_inline_images(line, lambda src: src) == line
-        return time.perf_counter() - started
-
-    small = elapsed(1_024)
-    large = elapsed(8_192)
-    # Eight times more input must not become the old quadratic 64x workload.
-    assert large / max(small, 1e-9) < 16

@@ -40,7 +40,6 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-import numpy as np
 import pytest
 
 import lightrag.kg.shared_storage as shared_storage
@@ -58,14 +57,17 @@ from lightrag.kg.shared_storage import (
     acquire_processing_reservation,
     finalize_share_data,
     get_namespace_data,
-    get_namespace_lock,
     get_pipeline_ingress,
     get_storage_keyed_lock,
     initialize_share_data,
     make_owner_record,
     reconcile_dead_pipeline_reservations,
 )
-from lightrag.utils import EmbeddingFunc, Tokenizer
+
+from ._fakes import (
+    make_lightrag,
+    pipeline_status_handles as _status_handles,
+)
 
 # ``check_pipeline_busy_or_raise`` is the preflight every /graph/* route runs
 # before the core method, so the REST-path tests at the bottom need it. Import
@@ -83,22 +85,6 @@ check_pipeline_busy_or_raise = _document_routes.check_pipeline_busy_or_raise
 pytestmark = pytest.mark.offline
 
 
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*args, **kwargs) -> str:
-    return "ok"
-
-
 @pytest.fixture(autouse=True)
 def _shared():
     initialize_share_data()
@@ -108,14 +94,9 @@ def _shared():
 
 @pytest.fixture
 async def rag(tmp_path):
-    instance = LightRAG(
-        working_dir=str(tmp_path / "wd"),
-        workspace=f"admin-{uuid4().hex[:8]}",
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+    instance = make_lightrag(
+        tmp_path,
+        workspace_prefix="admin",
         max_parallel_insert=1,
     )
     await instance.initialize_storages()
@@ -127,13 +108,6 @@ async def rag(tmp_path):
         *lightrag_module._ADMIN_RELEASE_DRIVE_TASKS, return_exceptions=True
     )
     await instance.finalize_storages()
-
-
-async def _status_handles(rag):
-    return (
-        await get_namespace_data("pipeline_status", workspace=rag.workspace),
-        get_namespace_lock("pipeline_status", workspace=rag.workspace),
-    )
 
 
 def _status_value(status: object) -> str:
@@ -1061,14 +1035,9 @@ def _sync_rag(tmp_path):
     will reuse -- the shape a plain script has."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    instance = LightRAG(
-        working_dir=str(tmp_path / "wd"),
-        workspace=f"sync-{uuid4().hex[:8]}",
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+    instance = make_lightrag(
+        tmp_path,
+        workspace_prefix="sync",
         max_parallel_insert=1,
     )
     loop.run_until_complete(instance.initialize_storages())
@@ -1249,123 +1218,64 @@ def _build_rag(tmp_path, **overrides):
     ``__post_init__`` is where the ceiling is resolved and checked, so
     construction alone is what these cases need -- no storages, no event loop.
     """
-    return LightRAG(
-        working_dir=str(tmp_path / f"wd-{uuid4().hex[:8]}"),
-        workspace=f"admin-{uuid4().hex[:8]}",
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
+    return make_lightrag(
+        tmp_path,
+        subdir=f"wd-{uuid4().hex[:8]}",
+        workspace_prefix="admin",
         max_parallel_insert=1,
         **overrides,
     )
 
 
 @pytest.mark.parametrize(
-    "embedding_timeout, expected",
+    "embedding_timeout, explicit_ceiling, expected",
     [
-        (30, 180.0),  # the default: 6x30 == the floor, so nothing changes
-        (60, 360.0),  # a raised timeout carries the ceiling with it
-        (5, 180.0),  # the floor wins for a small timeout
+        pytest.param(5, None, 180.0, id="floor-wins-small-timeout"),
+        pytest.param(30, None, 180.0, id="default-6x30-equals-floor"),
+        pytest.param(60, None, 360.0, id="raised-timeout-carries-ceiling"),
+        # Regression: ``LightRAG(default_embedding_timeout=300)`` must resolve
+        # from the instance's value rather than refusing against env default.
+        pytest.param(300, None, 1800.0, id="constructor-timeout-300"),
+        pytest.param(30, 45.0, 45.0, id="explicit-override-wins"),
     ],
 )
-def test_the_hold_ceiling_default_follows_the_embedding_timeout(
-    tmp_path, embedding_timeout, expected
+def test_hold_ceiling_resolution_from_instance_config(
+    tmp_path, embedding_timeout, explicit_ceiling, expected
 ):
-    """``max(180, 6 x embedding timeout)``, resolved from the INSTANCE's value.
+    """``max(180, 6 x embedding timeout)`` resolved per instance, or explicit override.
 
-    Asserted through a real construction rather than on the helper alone: the
-    defect this pins was not the arithmetic but where the input came from.
+    Also pins that the derived floor covers one embedding retry storm
+    (``3 x timeout + 8s``) plus the GraphML commit that follows inside the hold.
     """
-    assert (
-        lightrag_module._default_admin_write_hold_seconds(embedding_timeout) == expected
-    )
+    overrides: dict = {"default_embedding_timeout": embedding_timeout}
+    if explicit_ceiling is not None:
+        overrides["admin_write_max_hold_seconds"] = explicit_ceiling
+    else:
+        derived = lightrag_module._default_admin_write_hold_seconds(embedding_timeout)
+        assert derived == expected
+        assert derived > 3 * embedding_timeout + 8
 
-    instance = _build_rag(tmp_path, default_embedding_timeout=embedding_timeout)
+    instance = _build_rag(tmp_path, **overrides)
     assert instance.admin_write_max_hold_seconds == expected
-
-
-def test_a_constructor_embedding_timeout_alone_resolves_the_ceiling(tmp_path):
-    """Regression: ``LightRAG(default_embedding_timeout=300)`` must just work.
-
-    The embedding timeout is per-instance and needs no environment variable, so
-    a ceiling read from the environment at import could not follow it. A first
-    attempt at this check derived the ceiling from ``EMBEDDING_TIMEOUT`` while
-    comparing it against the instance field, which refused this construction
-    outright -- a startup regression against a configuration that is legal, and
-    one its own comment claimed only an explicit override could reach.
-    """
-    instance = _build_rag(tmp_path, default_embedding_timeout=300)
-
-    assert instance.admin_write_max_hold_seconds == 1800.0
     assert instance.admin_write_max_hold_seconds >= instance.default_embedding_timeout
 
 
-def test_the_default_ceiling_covers_one_embedding_retry_storm():
-    """The floor is not arbitrary: it covers what one hold cannot split.
+@pytest.mark.parametrize(
+    "mode",
+    [
+        pytest.param("explicit-env", id="explicit-env-overrides"),
+        pytest.param("dotenv-embedding-timeout", id="dotenv-embedding-timeout"),
+    ],
+)
+def test_admin_write_bounds_import_time_env_resolution(tmp_path, mode):
+    """Import-time env overrides and ``.env`` ``EMBEDDING_TIMEOUT`` derivation.
 
-    ``openai_embed`` retries three times with a flat 4s wait, so one embedding
-    can legitimately occupy ``3 x timeout + 8s`` -- and a whole-graph GraphML
-    commit follows it inside the same hold. A ceiling under that turns a slow
-    but healthy write into a failure whose commit may already have landed.
+    Read in a subprocess because module constants are resolved at import:
+    reloading ``lightrag.lightrag`` in-process would rebind ``LightRAG`` for
+    every test that follows.
     """
-    for embedding_timeout in (10, 30, 60, 120):
-        ceiling = lightrag_module._default_admin_write_hold_seconds(embedding_timeout)
-        assert ceiling > 3 * embedding_timeout + 8
-
-
-def test_an_explicit_ceiling_wins_over_the_derivation(tmp_path):
-    """An operator who names a value gets it, high or low, as long as it is legal."""
-    instance = _build_rag(
-        tmp_path, default_embedding_timeout=30, admin_write_max_hold_seconds=45.0
-    )
-    assert instance.admin_write_max_hold_seconds == 45.0
-
-
-def test_both_admin_write_bounds_accept_environment_overrides():
-    """Both explicit env vars are honoured.
-
-    Read in a subprocess because these are resolved at import: reloading
-    ``lightrag.lightrag`` in-process would rebind ``LightRAG`` itself for every
-    test that follows.
-    """
-    script = (
-        "import lightrag.lightrag as m;"
-        "print(m.ADMIN_WRITE_LOCK_ACQUIRE_TIMEOUT,"
-        " m.ADMIN_WRITE_MAX_HOLD_SECONDS_OVERRIDE)"
-    )
-    env = os.environ.copy()
-    env.pop("EMBEDDING_TIMEOUT", None)
-
-    explicit = subprocess.run(
-        [sys.executable, "-c", script],
-        env={
-            **env,
-            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
-            "LIGHTRAG_ADMIN_WRITE_LOCK_ACQUIRE_TIMEOUT": "7.5",
-            "LIGHTRAG_ADMIN_WRITE_MAX_HOLD_SECONDS": "600",
-        },
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert explicit.stdout.split() == ["7.5", "600.0"]
-
-
-def test_an_environment_embedding_timeout_still_reaches_the_ceiling(tmp_path):
-    """``.env`` feeds the field default, which feeds the derivation.
-
-    ``load_dotenv`` runs when ``lightrag.base`` is imported, so a ``.env``
-    reaches ``default_embedding_timeout``'s field default -- and the ceiling,
-    resolved from that field, follows it without reading the environment again.
-    Run from a scratch cwd, since ``load_dotenv(dotenv_path=".env")`` resolves
-    relative to it. The subprocess drops ``PYTHON_DOTENV_DISABLED``, which the
-    test suite sets for itself (``tests/__init__.py``), because this test is
-    about ``.env`` loading.
-    """
-    (tmp_path / ".env").write_text("EMBEDDING_TIMEOUT=300\n", encoding="utf-8")
-    bare = {
+    repo_root = str(Path(__file__).resolve().parents[2])
+    base_env = {
         key: value
         for key, value in os.environ.items()
         if key
@@ -1377,65 +1287,89 @@ def test_an_environment_embedding_timeout_still_reaches_the_ceiling(tmp_path):
         )
     }
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
+    if mode == "explicit-env":
+        script = (
+            "import lightrag.lightrag as m;"
+            "print(m.ADMIN_WRITE_LOCK_ACQUIRE_TIMEOUT,"
+            " m.ADMIN_WRITE_MAX_HOLD_SECONDS_OVERRIDE)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env={
+                **base_env,
+                "PYTHONPATH": repo_root,
+                "LIGHTRAG_ADMIN_WRITE_LOCK_ACQUIRE_TIMEOUT": "7.5",
+                "LIGHTRAG_ADMIN_WRITE_MAX_HOLD_SECONDS": "600",
+            },
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.split() == ["7.5", "600.0"]
+    else:
+        (tmp_path / ".env").write_text("EMBEDDING_TIMEOUT=300\n", encoding="utf-8")
+        script = (
             "import lightrag.lightrag as m;"
             "f = m.LightRAG.__dataclass_fields__;"
             "print(f['default_embedding_timeout'].default,"
             " m.ADMIN_WRITE_MAX_HOLD_SECONDS_OVERRIDE,"
             " m._default_admin_write_hold_seconds("
             "f['default_embedding_timeout'].default),"
-            " m.ADMIN_WRITE_LOCK_ACQUIRE_TIMEOUT)",
-        ],
-        cwd=str(tmp_path),
-        env={**bare, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    embedding_timeout, hold_override, hold_ceiling, acquire_timeout = (
-        result.stdout.split()
-    )
-    assert (embedding_timeout, hold_override, hold_ceiling) == ("300", "None", "1800.0")
-    # The acquire timeout has its own default even when the hold ceiling grows.
-    assert acquire_timeout == "30.0"
-
-
-def test_an_explicit_ceiling_below_the_embedding_timeout_is_refused(tmp_path):
-    """Fatal, and it names both numbers so the operator can see which to move.
-
-    Only an explicit ceiling can reach this now -- the derived default is 6x
-    the same instance's timeout -- so it refuses a hand-written mistake.
-    """
-    with pytest.raises(ValueError) as excinfo:
-        _build_rag(
-            tmp_path, default_embedding_timeout=90, admin_write_max_hold_seconds=20.0
+            " m.ADMIN_WRITE_LOCK_ACQUIRE_TIMEOUT)"
         )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(tmp_path),
+            env={**base_env, "PYTHONPATH": repo_root},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        embedding_timeout, hold_override, hold_ceiling, acquire_timeout = (
+            result.stdout.split()
+        )
+        assert (embedding_timeout, hold_override, hold_ceiling) == (
+            "300",
+            "None",
+            "1800.0",
+        )
+        # The acquire timeout keeps its own default even when the hold ceiling grows.
+        assert acquire_timeout == "30.0"
 
-    message = str(excinfo.value)
-    assert "LIGHTRAG_ADMIN_WRITE_MAX_HOLD_SECONDS" in message
-    assert "20s" in message and "90s" in message
 
-
-def test_the_startup_check_is_scoped_to_storages_that_take_the_gate(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "requires_single_writer",
+    [
+        pytest.param(True, id="gated-storage-refuses"),
+        pytest.param(False, id="ungated-storage-allows"),
+    ],
+)
+def test_explicit_ceiling_below_embedding_timeout_startup_check(
+    tmp_path, monkeypatch, requires_single_writer
 ):
-    """A server-backed graph store never takes the gate, so it is never refused.
-
-    Same misconfiguration as the case above; only the storage's
-    ``requires_single_writer`` declaration differs.
-    """
-    monkeypatch.setattr(NetworkXStorage, "requires_single_writer", False)
-
-    instance = _build_rag(
-        tmp_path, default_embedding_timeout=90, admin_write_max_hold_seconds=20.0
+    """Startup refusal is fatal (naming both bounds) only when the gate applies."""
+    monkeypatch.setattr(
+        NetworkXStorage, "requires_single_writer", requires_single_writer
     )
 
-    assert instance._admin_write_gate_required() is False
-    assert instance.admin_write_max_hold_seconds == 20.0
+    if requires_single_writer:
+        with pytest.raises(ValueError) as excinfo:
+            _build_rag(
+                tmp_path,
+                default_embedding_timeout=90,
+                admin_write_max_hold_seconds=20.0,
+            )
+        message = str(excinfo.value)
+        assert "LIGHTRAG_ADMIN_WRITE_MAX_HOLD_SECONDS" in message
+        assert "20s" in message and "90s" in message
+    else:
+        instance = _build_rag(
+            tmp_path,
+            default_embedding_timeout=90,
+            admin_write_max_hold_seconds=20.0,
+        )
+        assert instance._admin_write_gate_required() is False
+        assert instance.admin_write_max_hold_seconds == 20.0
 
 
 def test_an_acquire_timeout_above_the_ceiling_does_not_warn(tmp_path, monkeypatch):
@@ -1553,97 +1487,79 @@ async def test_custom_kg_is_refused_during_ingestion_on_a_buffered_tracking_kv(
             status.update({"busy": False, "busy_owner": None})
 
 
-@pytest.fixture
-def _buffered_tracking(monkeypatch):
-    """Make the tracking KV class look per-process buffered and record every
-    synchronous discard the gate issues, by namespace."""
+def _tracking_namespaces(rag) -> list[str]:
+    return [rag.entity_chunks.namespace, rag.relation_chunks.namespace]
+
+
+@pytest.mark.parametrize(
+    "buffered, outcome, expects_discard",
+    [
+        pytest.param(True, "error", True, id="buffered-error-discards"),
+        pytest.param(True, "cancel", True, id="buffered-cancel-discards"),
+        pytest.param(True, "ok", False, id="buffered-success-keeps"),
+        pytest.param(True, "refused", False, id="buffered-refused-keeps"),
+        pytest.param(False, "error", False, id="immediate-error-never-discards"),
+    ],
+)
+async def test_buffered_tracking_discard_matrix(
+    rag, monkeypatch, buffered, outcome, expects_discard
+):
+    """Buffered tracking discards only when a gated body fails or is cancelled.
+
+    A failed or cancelled write must drop its per-process buffered rows so a
+    later flush cannot publish stale tracking over a newer commit; successful,
+    refused, and immediate-KV exits must never discard.
+    """
     from lightrag.kg.json_kv_impl import JsonKVStorage
 
     discarded: list[str] = []
 
     def _discard(self):
         discarded.append(self.namespace)
-        return 1
+        return 1 if buffered else 0
 
-    monkeypatch.setattr(JsonKVStorage, "buffers_writes_per_process", True)
+    monkeypatch.setattr(JsonKVStorage, "buffers_writes_per_process", buffered)
     monkeypatch.setattr(JsonKVStorage, "discard_buffered_writes", _discard)
-    return discarded
 
-
-def _tracking_namespaces(rag) -> list[str]:
-    return [rag.entity_chunks.namespace, rag.relation_chunks.namespace]
-
-
-async def test_a_failed_admin_write_discards_buffered_tracking(rag, _buffered_tracking):
-    """A failed write's tracking rows must not stay in a per-process buffer:
-    released from the gate, a later flush would publish them over a newer
-    commit. Dropped on the gate's failure exit, for every admin writer."""
-    with pytest.raises(RuntimeError, match="boom"):
-        async with rag._admin_write_gate("test"):
-            raise RuntimeError("boom")
-
-    assert _buffered_tracking == _tracking_namespaces(rag)
-
-
-async def test_a_cancelled_admin_write_discards_buffered_tracking(
-    rag, _buffered_tracking
-):
-    """The exit no flow-level handler sees: a cancellation delivered while the
-    body awaits its tracking flush (the hold ceiling's, a disconnected
-    client's)."""
-    entered = asyncio.Event()
-
-    async def _body():
-        async with rag._admin_write_gate("test"):
-            entered.set()
-            await asyncio.Event().wait()
-
-    task = asyncio.create_task(_body())
-    await entered.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert _buffered_tracking == _tracking_namespaces(rag)
-
-
-async def test_a_successful_admin_write_discards_no_tracking(rag, _buffered_tracking):
-    async with rag._admin_write_gate("test"):
-        pass
-
-    assert _buffered_tracking == []
-
-
-async def test_a_refused_admin_write_discards_no_tracking(rag, _buffered_tracking):
-    """Refused before the body ran: the buffer is not this write's to drop."""
-    status, lock = await _status_handles(rag)
-    async with lock:
-        status.update({"busy": True, "busy_owner": {"token": "p", "kind": "process"}})
-    try:
-        with pytest.raises(AdminWriteGateRefusedError):
+    if outcome == "error":
+        with pytest.raises(RuntimeError, match="boom"):
             async with rag._admin_write_gate("test"):
-                raise AssertionError("the body must not run")  # pragma: no cover
-    finally:
-        async with lock:
-            status.update({"busy": False, "busy_owner": None})
+                raise RuntimeError("boom")
+    elif outcome == "cancel":
+        entered = asyncio.Event()
 
-    assert _buffered_tracking == []
+        async def _body():
+            async with rag._admin_write_gate("test"):
+                entered.set()
+                await asyncio.Event().wait()
 
-
-async def test_an_immediate_tracking_kv_is_never_asked_to_discard(rag, monkeypatch):
-    from lightrag.kg.json_kv_impl import JsonKVStorage
-
-    calls: list[str] = []
-    monkeypatch.setattr(
-        JsonKVStorage,
-        "discard_buffered_writes",
-        lambda self: calls.append(self.namespace) or 0,
-    )
-    with pytest.raises(RuntimeError, match="boom"):
+        task = asyncio.create_task(_body())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif outcome == "ok":
+        status, _lock = await _status_handles(rag)
         async with rag._admin_write_gate("test"):
-            raise RuntimeError("boom")
+            assert status["busy"] is True
+    elif outcome == "refused":
+        status, lock = await _status_handles(rag)
+        body_ran: list[bool] = []
+        async with lock:
+            status.update(
+                {"busy": True, "busy_owner": {"token": "p", "kind": "process"}}
+            )
+        try:
+            with pytest.raises(AdminWriteGateRefusedError):
+                async with rag._admin_write_gate("test"):
+                    body_ran.append(True)  # pragma: no cover
+        finally:
+            async with lock:
+                status.update({"busy": False, "busy_owner": None})
+        assert body_ran == []
 
-    assert calls == []
+    expected = _tracking_namespaces(rag) if expects_discard else []
+    assert discarded == expected
 
 
 # ---------------------------------------------------------------------------

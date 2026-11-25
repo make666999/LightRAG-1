@@ -1,12 +1,8 @@
-"""Unit tests for PGVectorStorage deferred-embedding contract.
+"""Unit tests for PGVectorStorage deferred-embedding contract and read payload shaping.
 
-PGVectorStorage now buffers upserts/deletes in process-local pending buffers
+PGVectorStorage buffers upserts/deletes in process-local pending buffers
 and embeds + persists only during ``index_done_callback()`` / ``finalize()``.
-This mirrors OpenSearchVectorDBStorage and NanoVectorDBStorage.
-
-These tests use the same ``MagicMock``-based DB stub as
-``test_postgres_upsert.py``, plus a counting embedding function adapted from
-``tests/kg/opensearch_impl/test_opensearch_storage.py``.
+All tests use mocks — no live PostgreSQL instance required.
 """
 
 import asyncio
@@ -1035,3 +1031,40 @@ async def test_drop_pending_index_ops_clears_buffers():
     await storage.drop_pending_index_ops()
     assert not storage._pending_vector_docs
     assert not storage._pending_vector_deletes
+
+
+# ---------------------------------------------------------------------------
+# Read payload strips embedding column (content_vector)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_and_get_by_ids_strip_content_vector():
+    """SQL fallback reads must strip ``content_vector`` so payloads stay JSON-serializable."""
+    row = {
+        "id": "ent-1",
+        "content": "Alice\ndescription",
+        "entity_name": "Alice",
+        "source_id": "chunk-1",
+        "file_path": "doc.txt",
+        "content_vector": np.array([0.1, 0.2, 0.3], dtype=np.float32),
+        "created_at": 1,
+    }
+    storage = _make_storage(namespace=NameSpace.VECTOR_STORE_ENTITIES)
+
+    async def _query(sql, params, multirows=False):
+        return [dict(row)] if multirows else dict(row)
+
+    storage.db.query = AsyncMock(side_effect=_query)
+
+    single = await storage.get_by_id("ent-1")
+    assert single is not None
+    assert "content_vector" not in single
+    assert single["content"] == "Alice\ndescription"
+    assert single["id"] == "ent-1"
+
+    batch = await storage.get_by_ids(["ent-1"])
+    assert len(batch) == 1
+    assert batch[0] is not None
+    assert "content_vector" not in batch[0]
+    assert batch[0]["content"] == "Alice\ndescription"

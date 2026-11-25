@@ -214,4 +214,4 @@ When API upload explicitly passes `parse_engine="myengine"`, that engine is fixe
 
 - **Unit-test the engine itself**: bypass the CLI and directly call `get_parser("myengine").parse(ParseContext(fake_rag, doc_id, file_path, content_data))`. `fake_rag` only needs to provide `_persist_parsed_full_docs` / `_resolve_source_file_for_parser` / `full_docs` / `doc_status` (see `build_debug_rag()` in `lightrag/parser/debug.py`, or the minimal `_FakeRag` in `tests/parser/test_legacy_parser.py`);
 - **The registry is a module-level singleton**: after calling `register_parser` in a test, clean up with `finally: registry._REGISTRY.pop("myengine", None)` (see `tests/parser/test_registry.py`);
-- **Entry-point loading logic**: see `tests/parser/test_plugins.py` (monkeypatch `lightrag.parser.plugins.entry_points` to inject a fake entry point; the `plugins._loaded` flag must be reset).
+- **Entry-point loading logic**: see `tests/parser/test_registry.py` (monkeypatch `lightrag.parser.plugins.entry_points` to inject a fake entry point; the `plugins._loaded` flag must be reset).

@@ -1,11 +1,14 @@
-import pytest
-from unittest.mock import patch, AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, patch
+
 import numpy as np
-from lightrag.utils import EmbeddingFunc
-from lightrag.kg.postgres_impl import (
-    PGVectorStorage,
-)
+import pytest
+
+import lightrag.kg.postgres_impl as pg_impl
+from lightrag.exceptions import DataMigrationError
+from lightrag.kg.postgres_impl import PGVectorStorage
 from lightrag.namespace import NameSpace
+from lightrag.utils import EmbeddingFunc
 from tests._pg_legacy_migration import answer_legacy_migration
 
 
@@ -766,3 +769,331 @@ async def test_case1_sequential_workspace_migration(
     print("\n🎉 Case 1c: Sequential workspace migration verification complete!")
     print("   - Workspace A: Migrated successfully (only legacy existed)")
     print("   - Workspace B: Migrated successfully (new table empty for workspace_b)")
+
+
+# ---------------------------------------------------------------------------
+# Legacy vector migration: segmented copy, in-progress marker, resume
+# ---------------------------------------------------------------------------
+
+
+_RESTART_STATE_TABLE = pg_impl.LEGACY_VECTOR_MIGRATION_STATE_TABLE
+_RESTART_COLUMNS = ["id", "workspace", "content_vector"]
+_RESTART_SETUP_ARGS = dict(
+    table_name="target",
+    workspace="tenant",
+    embedding_dim=3,
+    legacy_table_name="legacy",
+    base_table="LIGHTRAG_VDB_CHUNKS",
+)
+
+
+class _RestartFakeServer:
+    """Committed database state, shared by every _RestartFakeDB facade."""
+
+    def __init__(self, rows: int = 750):
+        self.source = {f"row-{i:04}": [1.0, 0.0, float(i)] for i in range(rows)}
+        self.target: dict[str, list[float]] = {}
+        self.state_table_exists = False
+        self.markers: set[tuple[str, str]] = set()
+        self.fail_on_id: str | None = None
+        self.after_segment = None
+        self.events: list[str] = []
+        self.segment_sql: list[str] = []
+
+
+class _RestartFakeDB:
+    vector_index_type = None
+
+    def __init__(self, server: _RestartFakeServer):
+        self.server = server
+        self._create_vector_index = AsyncMock()
+
+    async def check_table_exists(self, name: str) -> bool:
+        if name == _RESTART_STATE_TABLE:
+            return self.server.state_table_exists
+        return True
+
+    async def query(self, sql, params=None, multirows=False, **kwargs):
+        server = self.server
+        if "pg_attribute" in sql:
+            assert params == ["legacy"]
+            return [{"attname": name} for name in _RESTART_COLUMNS]
+        if "in_progress" in sql:
+            return {"in_progress": True} if tuple(params) in server.markers else None
+        if sql.startswith("WITH guard"):
+            return self._copy_segment(sql, params)
+        if "AS cleared" in sql:
+            return self._verify_and_clear(params)
+        assert "COUNT(*)" in sql, sql
+        if "FROM legacy" in sql:
+            return {"count": len(server.source)}
+        return {"count": len(server.target)}
+
+    def _copy_segment(self, sql, params):
+        server = self.server
+        server.segment_sql.append(sql)
+        if "id > $3" in sql:
+            workspace, target, last_id, limit = params
+        else:
+            (workspace, target, limit), last_id = params, None
+        assert workspace == "tenant"
+        if (target, workspace) not in server.markers:
+            server.events.append("segment:fenced")
+            return {"batch_rows": 0, "last_id": None, "active": False}
+        ids = sorted(i for i in server.source if last_id is None or i > last_id)
+        batch = ids[:limit]
+        if server.fail_on_id in batch:
+            raise RuntimeError("injected segment failure")
+        for row_id in batch:
+            server.target.setdefault(row_id, server.source[row_id])
+        server.events.append(f"segment:{len(batch)}")
+        if server.after_segment:
+            server.after_segment()
+        return {
+            "batch_rows": len(batch),
+            "last_id": batch[-1] if batch else None,
+            "active": True,
+        }
+
+    def _verify_and_clear(self, params):
+        server = self.server
+        workspace, target = params
+        server.events.append("verify")
+        missing = len(set(server.source) - set(server.target))
+        cleared = int(missing == 0 and (target, workspace) in server.markers)
+        if cleared:
+            server.markers.discard((target, workspace))
+            server.events.append("marker:clear")
+        return {"missing": missing, "cleared": cleared}
+
+    async def execute(self, sql, data=None, **kwargs):
+        server = self.server
+        if sql.startswith("CREATE TABLE"):
+            assert _RESTART_STATE_TABLE in sql
+            server.state_table_exists = True
+        elif sql.startswith(f"INSERT INTO {_RESTART_STATE_TABLE}"):
+            assert "WHERE NOT EXISTS (SELECT 1 FROM target WHERE workspace = $2)" in sql
+            if not server.target:
+                server.markers.add((data["target_table"], data["workspace"]))
+                server.events.append("marker:set")
+        else:
+            raise AssertionError(f"unexpected statement: {sql}")
+
+
+@pytest.mark.asyncio
+class TestPostgresLegacyVectorMigrationRestart:
+    @pytest.fixture
+    def small_batches(self, monkeypatch):
+        monkeypatch.setattr(pg_impl, "LEGACY_VECTOR_MIGRATION_BATCH_SIZE", 200)
+
+    async def test_interrupted_migration_is_resumed_not_accepted(self, small_batches):
+        server = _RestartFakeServer()
+        server.fail_on_id = "row-0600"
+        with pytest.raises(DataMigrationError):
+            await PGVectorStorage.setup_table(
+                db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+            )
+        assert len(server.target) == 600
+        assert server.markers == {("target", "tenant")}
+
+        with pytest.raises(DataMigrationError):
+            await PGVectorStorage.setup_table(
+                db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+            )
+        assert len(server.target) == 600
+
+        server.fail_on_id = None
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        assert server.target == server.source
+        assert server.markers == set()
+
+        server.events.clear()
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        assert server.events == []
+
+    async def test_marker_brackets_the_copy_and_verification(self, small_batches):
+        server = _RestartFakeServer()
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        assert server.events == [
+            "marker:set",
+            "segment:200",
+            "segment:200",
+            "segment:200",
+            "segment:150",
+            "verify",
+            "marker:clear",
+        ]
+
+    async def test_segments_are_server_side_keyset_statements(self, small_batches):
+        server = _RestartFakeServer()
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        names = '"id", "workspace", "content_vector"'
+        first, later = server.segment_sql[0], server.segment_sql[1]
+        assert "id >" not in first
+        assert "AND id > $3 ORDER BY id LIMIT $4" in later
+        for sql in (first, later):
+            assert (
+                f"FROM {_RESTART_STATE_TABLE} WHERE target_table = $2 AND workspace = $1"
+                in sql
+            )
+            assert "FOR SHARE" in sql
+            assert "AND EXISTS (SELECT 1 FROM guard)" in sql
+            assert f"INSERT INTO target ({names}) SELECT {names} FROM batch" in sql
+            assert f"SELECT {names} FROM legacy WHERE workspace = $1" in sql
+            assert "ON CONFLICT (workspace, id) DO NOTHING" in sql
+
+    async def test_exact_multiple_of_batch_size_terminates(self, small_batches):
+        server = _RestartFakeServer(rows=400)
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        assert server.target == server.source
+        assert server.events.count("segment:200") == 2
+        assert server.events[-3:] == ["segment:0", "verify", "marker:clear"]
+
+    async def test_failed_verification_keeps_the_marker(self, small_batches):
+        server = _RestartFakeServer()
+        server.after_segment = lambda: server.target.pop("row-0001", None)
+        with pytest.raises(DataMigrationError, match="verification failed"):
+            await PGVectorStorage.setup_table(
+                db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+            )
+        assert server.markers == {("target", "tenant")}
+
+        server.after_segment = None
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        assert server.target == server.source
+        assert server.markers == set()
+
+    async def test_cancellation_leaves_a_resumable_marker(self, small_batches):
+        server = _RestartFakeServer()
+
+        def cancel():
+            raise asyncio.CancelledError()
+
+        server.after_segment = cancel
+        with pytest.raises(asyncio.CancelledError):
+            await PGVectorStorage.setup_table(
+                db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+            )
+        assert len(server.target) == 200
+        assert server.markers == {("target", "tenant")}
+
+    async def test_resume_does_not_overwrite_rows_already_in_the_target(
+        self, small_batches
+    ):
+        server = _RestartFakeServer()
+        server.state_table_exists = True
+        server.markers.add(("target", "tenant"))
+        server.target["row-0003"] = [9.0, 9.0, 9.0]
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        assert len(server.target) == 750
+        assert server.target["row-0003"] == [9.0, 9.0, 9.0]
+
+    async def test_follower_stops_when_another_instance_finishes(self, small_batches):
+        server = _RestartFakeServer()
+        server.state_table_exists = True
+        server.markers.add(("target", "tenant"))
+        segments = 0
+
+        def leader_finishes_and_serves_a_deletion():
+            nonlocal segments
+            segments += 1
+            if segments == 1:
+                server.target = dict(server.source)
+                server.markers.clear()
+                del server.target["row-0700"]
+
+        server.after_segment = leader_finishes_and_serves_a_deletion
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        assert "row-0700" not in server.target
+        assert len(server.target) == 749
+        assert server.events == ["segment:200", "segment:fenced"]
+
+    async def test_deletion_between_last_segment_and_verification_is_not_a_failure(
+        self, small_batches
+    ):
+        server = _RestartFakeServer(rows=150)
+        server.state_table_exists = True
+        server.markers.add(("target", "tenant"))
+
+        def leader_finishes_and_serves_a_deletion():
+            server.markers.clear()
+            del server.target["row-0001"]
+
+        server.after_segment = leader_finishes_and_serves_a_deletion
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        assert "row-0001" not in server.target
+        assert server.markers == set()
+
+    async def test_resume_never_recreates_the_marker(self, small_batches):
+        server = _RestartFakeServer()
+        server.state_table_exists = True
+        await PGVectorStorage._pg_migrate_workspace_data(
+            _RestartFakeDB(server), "legacy", "target", "tenant", 750, resume=True
+        )
+        assert server.markers == set()
+        assert server.target == {}
+        assert server.events == ["segment:fenced"]
+
+    async def test_fresh_start_does_not_mark_a_target_populated_meanwhile(
+        self, small_batches
+    ):
+        server = _RestartFakeServer()
+        server.target = {"row-0000": server.source["row-0000"]}
+        await PGVectorStorage._pg_migrate_workspace_data(
+            _RestartFakeDB(server), "legacy", "target", "tenant", 750
+        )
+        assert server.markers == set()
+        assert len(server.target) == 1
+        assert server.events == ["segment:fenced"]
+
+    async def test_populated_target_without_marker_is_left_alone(self, lightrag_caplog):
+        server = _RestartFakeServer()
+        server.target = {"row-0000": [9.0, 9.0, 9.0]}
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        assert server.target == {"row-0000": [9.0, 9.0, 9.0]}
+        assert server.events == []
+        assert "fewer than the 750" in lightrag_caplog.text
+
+    async def test_progress_is_logged_per_segment(self, small_batches, lightrag_caplog):
+        server = _RestartFakeServer()
+        await PGVectorStorage.setup_table(
+            db=_RestartFakeDB(server), **_RESTART_SETUP_ARGS
+        )
+        for done in (200, 400, 600, 750):
+            assert f"{done}/750 records migrated" in lightrag_caplog.text
+
+    async def test_malformed_segment_result_is_not_read_as_end_of_data(self):
+        server = _RestartFakeServer()
+        db = _RestartFakeDB(server)
+        db._copy_segment = lambda sql, params: {}
+        with pytest.raises(DataMigrationError, match="segment result"):
+            await PGVectorStorage.setup_table(db=db, **_RESTART_SETUP_ARGS)
+        assert server.markers == {("target", "tenant")}
+
+    async def test_helper_rejects_empty_workspace_before_touching_the_database(self):
+        server = _RestartFakeServer()
+        with pytest.raises(ValueError, match="workspace must be provided"):
+            await PGVectorStorage._pg_migrate_workspace_data(
+                _RestartFakeDB(server), "legacy", "target", "", 750
+            )
+        assert server.events == [] and not server.state_table_exists

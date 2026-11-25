@@ -36,9 +36,13 @@ from lightrag import utils as lr_utils
 from lightrag.exceptions import CommitBookkeepingError
 from lightrag.utils import (
     _bounded_submit_impl,
+    _wait_deferring_cancellation,
     bounded_submit,
+    cancellation_was_deferred,
     commit_in_storage_io,
     get_storage_io_executor,
+    mark_cancellation_deferred,
+    retract_cancellation_deferred,
     run_in_storage_io,
 )
 from tests._log_capture import capture_lightrag_logs
@@ -519,3 +523,286 @@ async def test_on_committed_requires_wait_for_completion():
             )
     finally:
         executor.shutdown(wait=True)
+
+
+# ---------------------------------------------------------------------------
+# Deferred cancellation durability stamp
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_withheld_cancellation_is_stamped():
+    """The caller is cancelled mid-region; the region still finishes, and the
+    cancellation handed back says so."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    landed = []
+
+    async def _uninterruptible():
+        started.set()
+        await release.wait()
+        landed.append("committed")
+
+    async def _region():
+        future = asyncio.ensure_future(_uninterruptible())
+        return await _wait_deferring_cancellation(future, None)
+
+    task = asyncio.ensure_future(_region())
+    await started.wait()
+    task.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    pending = await task
+
+    assert landed == ["committed"]
+    assert isinstance(pending, asyncio.CancelledError)
+    assert cancellation_was_deferred(pending) is True
+
+
+@pytest.mark.asyncio
+async def test_work_that_FAILED_is_not_stamped():
+    """The stamp claims success, not merely that the region ran."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fails():
+        started.set()
+        await release.wait()
+        raise OSError(28, "No space left on device")
+
+    async def _region():
+        future = asyncio.ensure_future(_fails())
+        return await _wait_deferring_cancellation(future, None)
+
+    task = asyncio.ensure_future(_region())
+    await started.wait()
+    task.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    pending = await task
+
+    assert isinstance(pending, asyncio.CancelledError)
+    assert cancellation_was_deferred(pending) is False
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_from_an_earlier_step_survives_a_later_failure():
+    """A write that succeeded IS durable, so a failing hook afterwards must
+    not retract the stamp."""
+    write_started = asyncio.Event()
+    write_release = asyncio.Event()
+    hook_started = asyncio.Event()
+    hook_release = asyncio.Event()
+
+    async def _ok():
+        write_started.set()
+        await write_release.wait()
+
+    async def _fails():
+        hook_started.set()
+        await hook_release.wait()
+        raise RuntimeError("publication failed")
+
+    async def _region():
+        write = asyncio.ensure_future(_ok())
+        pending = await _wait_deferring_cancellation(write, None)
+        hook = asyncio.ensure_future(_fails())
+        return await _wait_deferring_cancellation(hook, pending)
+
+    task = asyncio.ensure_future(_region())
+    await write_started.wait()
+    task.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    write_release.set()
+    await hook_started.wait()
+    hook_release.set()
+    pending = await task
+
+    assert cancellation_was_deferred(pending) is True
+
+
+@pytest.mark.asyncio
+async def test_no_cancellation_means_no_stamp():
+    """Nothing was withheld, so there is nothing to warn a caller about."""
+
+    async def _work():
+        return "done"
+
+    future = asyncio.ensure_future(_work())
+    assert await _wait_deferring_cancellation(future, None) is None
+
+
+@pytest.mark.asyncio
+async def test_the_stamp_survives_the_re_raise_the_caller_does():
+    """The stamp rides the exception object itself across the re-raise."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _uninterruptible():
+        started.set()
+        await release.wait()
+
+    async def _region():
+        future = asyncio.ensure_future(_uninterruptible())
+        pending = await _wait_deferring_cancellation(future, None)
+        if pending is not None:
+            raise pending
+
+    task = asyncio.ensure_future(_region())
+    await started.wait()
+    task.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await task
+    assert cancellation_was_deferred(excinfo.value) is True
+
+
+@pytest.mark.asyncio
+async def test_a_plain_cancellation_at_a_suspension_point_is_not_stamped():
+    """A cancellation delivered at an ordinary await is not stamped."""
+
+    async def _plain():
+        await asyncio.sleep(3600)
+
+    task = asyncio.ensure_future(_plain())
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await task
+    assert cancellation_was_deferred(excinfo.value) is False
+
+
+def test_cancellation_was_deferred_is_false_for_anything_else():
+    assert cancellation_was_deferred(RuntimeError("boom")) is False
+    assert cancellation_was_deferred(asyncio.CancelledError()) is False
+
+
+async def _run_bounded(fn, on_committed):
+    """Submit ``fn`` through ``_bounded_submit_impl`` and cancel the caller
+    once the commit hook has started -- the window the stamp has to cover."""
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        semaphore = asyncio.Semaphore(1)
+        hook_started = asyncio.Event()
+        hook_release = asyncio.Event()
+
+        async def _hook():
+            hook_started.set()
+            await hook_release.wait()
+            return await on_committed()
+
+        task = asyncio.ensure_future(
+            _bounded_submit_impl(
+                executor,
+                semaphore,
+                fn,
+                (),
+                {},
+                wait_for_completion=True,
+                on_committed=_hook,
+            )
+        )
+        await hook_started.wait()
+        task.cancel()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        hook_release.set()
+        return task
+    finally:
+        executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_landed_is_stamped_even_when_its_commit_hook_fails():
+    """The write is on disk; only its publication failed."""
+    written = []
+
+    def _write():
+        written.append("landed")
+        return "result"
+
+    async def _publish():
+        raise RuntimeError("could not flip the reload flags")
+
+    task = await _run_bounded(_write, _publish)
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await task
+    assert written == ["landed"]
+    assert cancellation_was_deferred(excinfo.value) is True
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_RAISED_is_still_not_stamped():
+    """``fn`` raising means nothing was persisted, the hook never runs, and
+    the cancellation must carry no claim of durability."""
+    published: list[int] = []
+
+    def _write():
+        raise OSError(28, "No space left on device")
+
+    async def _publish():  # pragma: no cover - must never run
+        published.append(1)
+        raise AssertionError("the commit hook must not run after a failed write")
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        semaphore = asyncio.Semaphore(1)
+
+        async def _region():
+            future = asyncio.ensure_future(
+                _bounded_submit_impl(
+                    executor,
+                    semaphore,
+                    _write,
+                    (),
+                    {},
+                    wait_for_completion=True,
+                    on_committed=_publish,
+                )
+            )
+            await asyncio.sleep(0)
+            return future
+
+        task = await _region()
+        task.cancel()
+        with pytest.raises(BaseException) as excinfo:
+            await task
+    finally:
+        executor.shutdown(wait=True)
+
+    assert published == []
+    assert cancellation_was_deferred(excinfo.value) is False
+    assert not isinstance(excinfo.value, CommitBookkeepingError)
+
+
+def test_a_rolled_back_write_retracts_the_stamp():
+    """A caller that undid the deferred write withdraws the durability claim."""
+    cancel = asyncio.CancelledError()
+    mark_cancellation_deferred(cancel)
+    assert cancellation_was_deferred(cancel)
+
+    retract_cancellation_deferred(cancel)
+
+    assert not cancellation_was_deferred(cancel)
+
+
+@pytest.mark.parametrize(
+    "exc", [asyncio.CancelledError(), ValueError("boom")], ids=["unstamped", "other"]
+)
+def test_retracting_leaves_an_unstamped_exception_untouched(exc):
+    before = dict(vars(exc))
+
+    retract_cancellation_deferred(exc)
+
+    assert vars(exc) == before
+    assert not cancellation_was_deferred(exc)

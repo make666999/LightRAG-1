@@ -19,131 +19,51 @@ The suite asserts the operator-visible loop is now closed:
 from __future__ import annotations
 
 import asyncio
+import importlib
+import sys
 from uuid import uuid4
 
-import numpy as np
 import pytest
 
 import lightrag.pipeline as pipeline_module
 from lightrag import LightRAG
 from lightrag.base import DocStatus
 from lightrag.constants import (
+    CUSTOM_CHUNK_PATCH_METADATA_KEY,
     GRAPH_FIELD_SEP,
     KG_PURGE_METADATA_KEY,
     KG_PURGE_PHASE_COMPLETED,
+    KG_PURGE_PHASE_DERIVED_COMMITTED,
+    KG_PURGE_PHASE_PREPARED,
     KG_WRITE_STATE_GRAPH_MUTATION_STARTED,
     KG_WRITE_STATE_METADATA_KEY,
     KG_WRITE_STATE_PRE_GRAPH,
 )
+from lightrag.pipeline import _AUTO_RESUME_DOC_STATUSES
 from lightrag.tools.kg_integrity_repair import _union_ids, audit_kg_integrity
 from lightrag.utils import (
-    EmbeddingFunc,
-    Tokenizer,
     compute_mdhash_id,
     make_relation_chunk_key,
 )
+from lightrag.utils_pipeline import (
+    make_custom_chunk_id,
+    make_custom_chunk_operation_id,
+    make_kg_purge_operation_id,
+)
 
+from ._fakes import (
+    PurgeDocStatusDouble as _PurgeDocStatus,
+    PurgeGraphDouble as _PurgeGraph,
+    PurgeKVDouble as _PurgeKV,
+    build_delete_test_rag as _build_rag,
+    ingest_test_doc as _ingest,
+    make_purge_journal as _purge_journal,
+    make_purge_pipeline_status as _purge_status,
+    make_purge_rag as _make_purge_rag,
+)
 from .conftest import request_failed_retry
 
 pytestmark = pytest.mark.offline
-
-
-class _SimpleTokenizerImpl:
-    def encode(self, content: str) -> list[int]:
-        return [ord(ch) for ch in content]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(chr(t) for t in tokens)
-
-
-async def _dummy_embedding(texts: list[str]) -> np.ndarray:
-    return np.ones((len(texts), 8), dtype=float)
-
-
-async def _dummy_llm(*args, **kwargs) -> str:
-    return "ok"
-
-
-def _deterministic_chunking(
-    tokenizer,
-    content: str,
-    split_by_character,
-    split_by_character_only: bool,
-    chunk_overlap_token_size: int,
-    chunk_token_size: int,
-) -> list[dict]:
-    return [{"tokens": 1, "content": f"{content}::chunk1", "chunk_order_index": 0}]
-
-
-def _wire_fake_extraction(rag: LightRAG) -> None:
-    """One ALICE--ACME relation per chunk, so the graph has a node AND an edge."""
-
-    async def fake_extract(chunks, *args, **kwargs):
-        results = []
-        for chunk_id in chunks:
-            nodes = {
-                name: [
-                    {
-                        "entity_name": name,
-                        "entity_type": "person",
-                        "description": f"{name} description",
-                        "source_id": chunk_id,
-                        "file_path": "d.txt",
-                        "timestamp": 1,
-                    }
-                ]
-                for name in ("ALICE", "ACME")
-            }
-            edges = {
-                ("ACME", "ALICE"): [
-                    {
-                        "src_id": "ACME",
-                        "tgt_id": "ALICE",
-                        "description": "works at",
-                        "keywords": "employment",
-                        "weight": 1.0,
-                        "source_id": chunk_id,
-                        "file_path": "d.txt",
-                        "timestamp": 1,
-                    }
-                ]
-            }
-            results.append((nodes, edges))
-        return results
-
-    rag._process_extract_entities = fake_extract
-
-
-async def _build_rag(tmp_path, workspace: str) -> LightRAG:
-    rag = LightRAG(
-        working_dir=str(tmp_path / "wd"),
-        workspace=workspace,
-        llm_model_func=_dummy_llm,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=8, max_token_size=8192, func=_dummy_embedding
-        ),
-        tokenizer=Tokenizer("mock-tokenizer", _SimpleTokenizerImpl()),
-        chunking_func=_deterministic_chunking,
-        max_parallel_insert=1,
-    )
-    await rag.initialize_storages()
-    _wire_fake_extraction(rag)
-    return rag
-
-
-async def _ingest(
-    rag: LightRAG,
-    file_path: str = "d.txt",
-    content: str = "alice works at acme",
-) -> str:
-    doc_id = compute_mdhash_id(file_path, prefix="doc-")
-    await rag.apipeline_enqueue_documents(content, ids=[doc_id], file_paths=[file_path])
-    await rag.apipeline_process_enqueue_documents()
-    row = await rag.doc_status.get_by_id(doc_id)
-    status = row.get("status")
-    status_text = status.value if isinstance(status, DocStatus) else str(status)
-    assert status_text == DocStatus.PROCESSED.value, row
-    return doc_id
 
 
 async def _ingest_skip_kg(rag: LightRAG, file_path: str = "nokg.txt") -> str:
@@ -1379,5 +1299,266 @@ async def test_cancelled_delete_propagates_when_the_final_flush_fails(tmp_path):
         with pytest.raises(asyncio.CancelledError):
             await rag.adelete_by_doc_id(doc_id)
         assert flush_failures == 1
+    finally:
+        await rag.finalize_storages()
+
+
+# ---------------------------------------------------------------------------
+# DELETING status visibility, durability, and exclusion from ingestion recovery
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stamp", [False, True])
+async def test_prepared_status_and_journal_share_a_write_before_mutation(stamp):
+    writes = []
+
+    class Status(_PurgeDocStatus):
+        async def update_doc_status_fields(self, doc_id, fields, **kwargs):
+            writes.append(fields)
+            await super().update_doc_status_fields(doc_id, fields, **kwargs)
+
+    rag = _make_purge_rag(
+        graph=_PurgeGraph(),
+        doc_status=Status({"d1": {"status": DocStatus.PROCESSED, "metadata": {}}}),
+        full_entities=_PurgeKV({"d1": {"entity_names": []}}),
+        full_relations=_PurgeKV({"d1": {"relation_pairs": []}}),
+    )
+
+    async def fail_derived(*args, **kwargs):
+        assert writes[0]["metadata"][KG_PURGE_METADATA_KEY]["phase"] == "prepared"
+        assert (writes[0].get("status") == DocStatus.DELETING) is stamp
+        raise RuntimeError("interrupted after prepared")
+
+    rag._purge_derived_kg_contributions = fail_derived
+    status, lock = _purge_status()
+    with pytest.raises(RuntimeError, match="interrupted"):
+        await rag._purge_kg_contributions(
+            "d1",
+            [],
+            stamp_deleting=stamp,
+            pipeline_status=status,
+            pipeline_status_lock=lock,
+        )
+    row = await rag.doc_status.get_by_id("d1")
+    assert row["status"] == (DocStatus.DELETING if stamp else DocStatus.PROCESSED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_via_route", [False, True])
+async def test_failed_delete_remains_visible_and_retry_completes(
+    tmp_path, monkeypatch, retry_via_route
+):
+    rag = await _build_rag(tmp_path, f"deleting-{uuid4().hex[:8]}")
+    try:
+        doc_id = await _ingest(rag)
+        original = rag._purge_derived_kg_contributions
+
+        async def fail(*args, **kwargs):
+            raise RuntimeError("injected purge interruption")
+
+        monkeypatch.setattr(rag, "_purge_derived_kg_contributions", fail)
+        result = await rag.adelete_by_doc_id(doc_id)
+        assert result.status == "fail"
+        row = await rag.doc_status.get_by_id(doc_id)
+        assert row["status"] == DocStatus.DELETING
+        assert row["metadata"]["deletion_failed"] is True
+        assert "injected purge interruption" in row["error_msg"]
+        assert DocStatus.DELETING not in _AUTO_RESUME_DOC_STATUSES
+
+        # A process/retry request cannot silently turn deletion into ingestion.
+        await request_failed_retry(rag)
+        await rag.apipeline_process_enqueue_documents()
+        assert (await rag.doc_status.get_by_id(doc_id))["status"] == DocStatus.DELETING
+
+        counts = await rag.doc_status.get_all_status_counts()
+        assert counts["deleting"] == 1
+        docs, total = await rag.doc_status.get_docs_paginated(
+            status_filter=DocStatus.DELETING
+        )
+        assert total == 1
+        assert docs[0][0] == doc_id
+
+        # Existing content/source must remain blocked, with actionable diagnostics.
+        for candidate_id, source in [
+            (doc_id, "d.txt"),
+            ("new-doc", "d.txt"),
+            ("same-content", "another.txt"),
+        ]:
+            await rag.apipeline_enqueue_documents(
+                "alice works at acme", ids=[candidate_id], file_paths=[source]
+            )
+            if candidate_id != doc_id:
+                assert await rag.doc_status.get_by_id(candidate_id) is None
+        failures = await rag.doc_status.get_docs_by_statuses([DocStatus.FAILED])
+        assert any(
+            "re-run deletion first" in doc.error_msg for doc in failures.values()
+        )
+        assert (await rag.doc_status.get_by_id(doc_id))["status"] == DocStatus.DELETING
+
+        with pytest.raises(RuntimeError, match="re-run deletion first"):
+            await rag.ainsert_custom_chunks("new body", ["new chunk"], doc_id=doc_id)
+
+        monkeypatch.setattr(rag, "_purge_derived_kg_contributions", original)
+        if retry_via_route:
+            with monkeypatch.context() as import_patch:
+                import_patch.setattr(sys, "argv", [sys.argv[0]])
+                routes = importlib.import_module("lightrag.api.routers.document_routes")
+            router = routes.create_document_routes(
+                rag, routes.DocumentManager(str(tmp_path / "inputs"))
+            )
+            endpoint = next(
+                route.endpoint
+                for route in router.routes
+                if route.path == "/documents/delete_document"
+            )
+            tasks = set()
+            result = await endpoint(
+                routes.DeleteDocRequest(doc_ids=[doc_id]), managed_tasks=tasks
+            )
+            assert result.status == "deletion_started"
+            await asyncio.gather(*tasks)
+        else:
+            assert (await rag.adelete_by_doc_id(doc_id)).status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    [
+        KG_PURGE_PHASE_PREPARED,
+        KG_PURGE_PHASE_DERIVED_COMMITTED,
+        KG_PURGE_PHASE_COMPLETED,
+    ],
+)
+@pytest.mark.parametrize("stamp", [False, True])
+async def test_retry_with_existing_journal_stamps_deleting(phase, stamp):
+    """An unstamped journal is projected into DELETING before resumed work for deletion."""
+    writes = []
+
+    class Status(_PurgeDocStatus):
+        async def update_doc_status_fields(self, doc_id, fields, **kwargs):
+            writes.append(dict(fields))
+            await super().update_doc_status_fields(doc_id, fields, **kwargs)
+
+    rag = _make_purge_rag(
+        graph=_PurgeGraph(),
+        doc_status=Status(
+            {
+                "d1": {
+                    "status": DocStatus.PROCESSED,
+                    "metadata": {
+                        KG_PURGE_METADATA_KEY: _purge_journal(phase, [], doc_id="d1")
+                    },
+                }
+            }
+        ),
+        full_entities=_PurgeKV({"d1": {"entity_names": []}}),
+        full_relations=_PurgeKV({"d1": {"relation_pairs": []}}),
+    )
+
+    async def fail_derived(*args, **kwargs):
+        raise RuntimeError("interrupted while resuming")
+
+    rag._purge_derived_kg_contributions = fail_derived
+    status, lock = _purge_status()
+    call = rag._purge_kg_contributions(
+        "d1",
+        [],
+        stamp_deleting=stamp,
+        pipeline_status=status,
+        pipeline_status_lock=lock,
+    )
+    if phase == KG_PURGE_PHASE_PREPARED:
+        with pytest.raises(RuntimeError, match="interrupted while resuming"):
+            await call
+    else:
+        await call
+
+    row = await rag.doc_status.get_by_id("d1")
+    assert row["status"] == (DocStatus.DELETING if stamp else DocStatus.PROCESSED)
+    if stamp:
+        first = writes[0]
+        assert first["status"] == DocStatus.DELETING
+        assert first["metadata"][KG_PURGE_METADATA_KEY]["phase"] == phase
+        assert isinstance(first.get("updated_at"), str)
+    else:
+        assert all("status" not in fields for fields in writes)
+
+
+@pytest.mark.asyncio
+async def test_deletion_takes_over_unstamped_journal_and_stays_visible(
+    tmp_path, monkeypatch
+):
+    """End to end: a PROCESSED row with an unstamped ``prepared`` journal becomes DELETING."""
+    rag = await _build_rag(tmp_path, f"takeover-{uuid4().hex[:8]}")
+    try:
+        doc_id = await _ingest(rag)
+        row = await rag.doc_status.get_by_id(doc_id)
+        chunk_ids = list(row["chunks_list"])
+        await rag._write_kg_purge_phase(
+            doc_id,
+            KG_PURGE_PHASE_PREPARED,
+            operation_id=make_kg_purge_operation_id(doc_id, chunk_ids),
+            chunk_count=len(chunk_ids),
+        )
+        assert (await rag.doc_status.get_by_id(doc_id))["status"] == DocStatus.PROCESSED
+
+        original = rag._purge_derived_kg_contributions
+
+        async def fail(*args, **kwargs):
+            raise RuntimeError("injected purge interruption")
+
+        monkeypatch.setattr(rag, "_purge_derived_kg_contributions", fail)
+        assert (await rag.adelete_by_doc_id(doc_id)).status == "fail"
+        row = await rag.doc_status.get_by_id(doc_id)
+        assert row["status"] == DocStatus.DELETING
+        assert row["metadata"][KG_PURGE_METADATA_KEY]["phase"] == (
+            KG_PURGE_PHASE_PREPARED
+        )
+
+        monkeypatch.setattr(rag, "_purge_derived_kg_contributions", original)
+        assert (await rag.adelete_by_doc_id(doc_id)).status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_custom_chunks_refuse_deleting_row_with_patch_journal(
+    tmp_path, monkeypatch
+):
+    """A DELETING row with a matching patch journal must not resume custom-chunk patching."""
+    rag = await _build_rag(tmp_path, f"patch-{uuid4().hex[:8]}")
+    try:
+        doc_id = await _ingest(rag)
+
+        async def fail(*args, **kwargs):
+            raise RuntimeError("injected purge interruption")
+
+        monkeypatch.setattr(rag, "_purge_derived_kg_contributions", fail)
+        assert (await rag.adelete_by_doc_id(doc_id)).status == "fail"
+
+        new_chunk = "patched chunk"
+        operation_id = make_custom_chunk_operation_id(
+            doc_id, [make_custom_chunk_id(doc_id, new_chunk)]
+        )
+        row = await rag.doc_status.get_by_id(doc_id)
+        patch_journal = {"operation_id": operation_id, "mode": "patch"}
+        metadata = {**row["metadata"], CUSTOM_CHUNK_PATCH_METADATA_KEY: patch_journal}
+        await rag.doc_status.update_doc_status_fields(doc_id, {"metadata": metadata})
+
+        with pytest.raises(RuntimeError, match="re-run deletion first"):
+            await rag.ainsert_custom_chunks("patched body", [new_chunk], doc_id=doc_id)
+
+        row = await rag.doc_status.get_by_id(doc_id)
+        assert row["status"] == DocStatus.DELETING
+        assert row["metadata"][CUSTOM_CHUNK_PATCH_METADATA_KEY] == patch_journal
+        assert row["metadata"][KG_PURGE_METADATA_KEY]["phase"] == (
+            KG_PURGE_PHASE_PREPARED
+        )
     finally:
         await rag.finalize_storages()

@@ -5,7 +5,6 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
-import numpy as np
 import pytest
 
 from lightrag import LightRAG, utils_graph
@@ -17,19 +16,10 @@ from lightrag.utils import (
     make_relation_chunk_key,
 )
 
+from ._fakes import SimpleTokenizerImpl as _Characters
+from ._fakes import dummy_embedding as _embed
+
 pytestmark = pytest.mark.offline
-
-
-class _Characters:
-    def encode(self, content):
-        return [ord(c) for c in content]
-
-    def decode(self, tokens):
-        return "".join(chr(c) for c in tokens)
-
-
-async def _embed(texts):
-    return np.ones((len(texts), 8))
 
 
 async def _no_llm(*args, **kwargs):

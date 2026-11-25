@@ -21,33 +21,17 @@ from lightrag.parser.docx.smart_heading.heading_flow import (
     nest_numbered_under_parent,
 )
 from lightrag.parser.docx.smart_heading.style_key import classify_numbering
+from tests.parser.docx._smart_heading_helpers import (
+    log_messages as _log_messages,
+    make_body_paras as _body,
+    make_decision as _make_decision,
+    make_para as _para,
+    stub_no_caption as _stub_no_caption,
+    stub_no_veto as _stub_no_veto,
+    stub_strong_body as _stub_strong_body,
+)
 
 pytestmark = pytest.mark.offline
-
-
-@pytest.fixture(autouse=True)
-def _lightrag_records_reach_caplog(lightrag_caplog):
-    """Tests here assert on ``lightrag`` records through caplog."""
-    yield
-
-
-def _para(text: str, *, size: float = 12.0, **kw) -> ParagraphRecord:
-    return ParagraphRecord(kind="para", text=text, font_size_pt=size, **kw)
-
-
-def _stub_strong_body(text: str) -> str | None:
-    stripped = text.strip()
-    if stripped.endswith(("。", "？", "！")) or len(stripped) > 60:
-        return "strong_body_stub"
-    return None
-
-
-def _stub_no_veto(_c, _t) -> str | None:
-    return None
-
-
-def _stub_no_caption(_t) -> str | None:
-    return None
 
 
 def _no_title_llm(prompt: str, *, system_prompt: str | None = None) -> str:
@@ -68,13 +52,6 @@ def _gate(records, *, fs_base=None, **kw):
     kw.setdefault("numbering_veto", _stub_no_veto)
     kw.setdefault("caption_veto", _stub_no_caption)
     return gate_candidates(records, indices, fs_base=fs, **kw)
-
-
-def _body(n: int = 20, size: float = 12.0) -> list[ParagraphRecord]:
-    return [
-        _para(f"这是第{i}段正常长度的正文内容，用来撑起基准字号的统计权重。", size=size)
-        for i in range(n)
-    ]
 
 
 def _texts(result) -> list[str]:
@@ -266,144 +243,158 @@ def _hd(
     *,
     outline_level: int | None = None,
     is_title_block: bool = False,
+    anchored: bool = False,
 ) -> HeadingDecision:
-    return HeadingDecision(
-        record_index=idx,
-        text=text,
-        is_heading=True,
-        level=level,
-        outline_level=outline_level,
+    return _make_decision(
+        text,
+        level,
+        idx=idx,
+        size=None,
+        numbered=True,
+        outline=outline_level,
+        anchored=anchored,
         is_title_block=is_title_block,
-        numbering=classify_numbering(text),
     )
 
 
-def test_postmerge_demotion_cascades_to_subtree() -> None:
-    """test14 regression: a parent heading demoted for strong body (句号) takes
-    its non-strong subtree (（一）/（二）) down with it, so no orphan level-2
-    heading survives to swallow the following section's content."""
-    decs = [
-        _hd(0, "一、对节能汽车，减半征收车船税。", 1),
-        _hd(1, "（一）减半征收车船税的节能乘用车应同时符合以下标准：", 2),
-        _hd(2, "（二）减半征收车船税的节能商用车应同时符合以下标准：", 2),
-        _hd(3, "二、对新能源车船，免征车船税。", 1),
-    ]
+@pytest.mark.parametrize(
+    "case_id,builder,expected_is_heading,subtree_idxs,non_subtree_strong_idxs,expected_subtree_warn",
+    [
+        pytest.param(
+            "cascades_to_subtree",
+            lambda: [
+                _hd(0, "一、对节能汽车，减半征收车船税。", 1),
+                _hd(1, "（一）减半征收车船税的节能乘用车应同时符合以下标准：", 2),
+                _hd(2, "（二）减半征收车船税的节能商用车应同时符合以下标准：", 2),
+                _hd(3, "二、对新能源车船，免征车船税。", 1),
+            ],
+            [False, False, False, False],
+            (1, 2),
+            (0, 3),
+            2,
+            id="cascades_to_subtree",
+        ),
+        pytest.param(
+            "stops_at_outline_member",
+            lambda: [
+                _hd(0, "一、总体要求。", 1),
+                _hd(1, "（一）明确目标", 2, outline_level=1),
+                _hd(2, "1）具体分工", 3),
+            ],
+            [False, True, True],
+            (),
+            (0,),
+            None,
+            id="stops_at_outline_member",
+        ),
+        pytest.param(
+            "outline_member_demoted_by_own_evidence",
+            lambda: [
+                _hd(0, "一、总体要求。", 1),
+                _hd(1, "（一）本项要求已经明确。", 2, outline_level=1),
+            ],
+            [False, False],
+            (),
+            (0, 1),
+            None,
+            id="outline_member_demoted_by_own_evidence",
+        ),
+        pytest.param(
+            "stops_at_title_block_boundary",
+            lambda: [
+                _hd(0, "一、总体要求。", 1),
+                _hd(1, "第二篇 附件材料", 0, is_title_block=True),
+                _hd(2, "（一）附件要点", 2),
+            ],
+            [False, True, True],
+            (),
+            (0,),
+            None,
+            id="stops_at_title_block_boundary",
+        ),
+        pytest.param(
+            "follows_cb2_propagation",
+            lambda: [
+                _hd(0, "一、对节能汽车减半征收车船税。", 1),
+                _hd(1, "（一）节能乘用车标准", 2),
+                _hd(2, "二、对新能源车船免征车船税", 1),
+                _hd(3, "（二）新能源汽车标准", 2),
+            ],
+            [False, False, False, False],
+            (1, 3),
+            (0, 2),
+            2,
+            id="follows_cb2_propagation",
+        ),
+        pytest.param(
+            "leaves_unnumbered_child_to_gap_close",
+            lambda: [
+                _hd(0, "一、总体要求。", 1),
+                _hd(1, "实施要点", 2),
+            ],
+            [False, True],
+            (),
+            (0,),
+            None,
+            id="leaves_unnumbered_child_to_gap_close",
+        ),
+        pytest.param(
+            "multilevel_and_sibling_boundary",
+            lambda: [
+                _hd(0, "一、总体安排。", 1),
+                _hd(1, "（一）职责分工", 2),
+                _hd(2, "（1）牵头单位", 3),
+                _hd(3, "第一章 概述", 1),
+            ],
+            [False, False, False, True],
+            (1, 2),
+            (0,),
+            2,
+            id="multilevel_and_sibling_boundary",
+        ),
+        pytest.param(
+            "ignores_plain_anchored_child",
+            lambda: [
+                _hd(0, "一、对节能汽车，减半征收车船税。", 1),
+                _hd(1, "（一）标准甲", 2, anchored=True),
+            ],
+            [False, False],
+            (1,),
+            (0,),
+            1,
+            id="ignores_plain_anchored_child",
+        ),
+    ],
+)
+def test_subtree_demotion_cases(
+    case_id: str,
+    builder,
+    expected_is_heading: list[bool],
+    subtree_idxs: tuple[int, ...],
+    non_subtree_strong_idxs: tuple[int, ...],
+    expected_subtree_warn: int | None,
+) -> None:
+    """Post-merge subtree demotion cascades to numbered descendants (including
+    after CB2 propagation and ignoring plain size-anchored bookkeeping), stops
+    at outline/title-block/sibling boundaries, and leaves unnumbered children."""
+    decs = builder()
     warnings: dict = {}
     demote_strong_body_headings(decs, strong_body=_stub_strong_body, warnings=warnings)
-    assert [d.is_heading for d in decs] == [False, False, False, False]
-    for child in (decs[1], decs[2]):
-        assert "subtree_demoted" in child.rule_trail
-        assert "strong_body_demoted" in child.rule_trail
-        assert child.use_raw_text
-    # the 句号 parents were demoted by their own strong-body evidence, not subtree
-    assert "subtree_demoted" not in decs[0].rule_trail
-    assert "subtree_demoted" not in decs[3].rule_trail
-    assert warnings["smart_subtree_demotions"] == 2
-
-
-def test_subtree_demotion_stops_at_outline_member() -> None:
-    """An outline-bearing subtree member is a hard boundary: ancestor
-    propagation does not demote it, and it shields the deeper headings
-    after it."""
-    decs = [
-        _hd(0, "一、总体要求。", 1),
-        _hd(1, "（一）明确目标", 2, outline_level=1),  # outline hard boundary
-        _hd(2, "1）具体分工", 3),  # shielded by the boundary above
-    ]
-    warnings: dict = {}
-    demote_strong_body_headings(decs, strong_body=_stub_strong_body, warnings=warnings)
-    assert not decs[0].is_heading  # 句号 parent demoted
-    assert decs[1].is_heading  # outline member kept
-    assert "subtree_demoted" not in decs[1].rule_trail
-    assert decs[2].is_heading  # not reached (scan stopped at the boundary)
-    assert "smart_subtree_demotions" not in warnings
-
-
-def test_outline_subtree_member_still_demoted_by_own_evidence() -> None:
-    """The outline boundary only blocks *ancestor* propagation — an outline
-    member that hits strong body on its own is still demoted (existing I2
-    semantics), tagged strong_body_demoted rather than subtree_demoted."""
-    decs = [
-        _hd(0, "一、总体要求。", 1),
-        _hd(1, "（一）本项要求已经明确。", 2, outline_level=1),  # 句号 → own hit
-    ]
-    warnings: dict = {}
-    demote_strong_body_headings(decs, strong_body=_stub_strong_body, warnings=warnings)
-    assert not decs[1].is_heading
-    assert "strong_body_demoted" in decs[1].rule_trail
-    assert "subtree_demoted" not in decs[1].rule_trail
-
-
-def test_subtree_demotion_stops_at_title_block_boundary() -> None:
-    """A title block (level 0) is a sub-document hard boundary: an ancestor
-    demotion in one sub-document never cascades past it."""
-    decs = [
-        _hd(0, "一、总体要求。", 1),
-        _hd(1, "第二篇 附件材料", 0, is_title_block=True),
-        _hd(2, "（一）附件要点", 2),
-    ]
-    warnings: dict = {}
-    demote_strong_body_headings(decs, strong_body=_stub_strong_body, warnings=warnings)
-    assert not decs[0].is_heading
-    assert decs[1].is_heading  # title block untouched
-    assert decs[2].is_heading  # beyond the boundary, kept
-    assert "smart_subtree_demotions" not in warnings
-
-
-def test_subtree_demotion_follows_cb2_propagation() -> None:
-    """A parent demoted only via CB2 same-series propagation (not its own
-    strong body) still cascades to its own subtree."""
-    decs = [
-        _hd(0, "一、对节能汽车减半征收车船税。", 1),  # 句号 → own hit
-        _hd(1, "（一）节能乘用车标准", 2),  # subtree of 一、
-        _hd(2, "二、对新能源车船免征车船税", 1),  # no 句号 → demoted only via CB2
-        _hd(3, "（二）新能源汽车标准", 2),  # subtree of 二、
-    ]
-    warnings: dict = {}
-    demote_strong_body_headings(decs, strong_body=_stub_strong_body, warnings=warnings)
-    assert [d.is_heading for d in decs] == [False, False, False, False]
-    assert "strong_body_demoted" in decs[2].rule_trail  # via CB2, not own hit
-    assert "subtree_demoted" not in decs[2].rule_trail
-    assert "subtree_demoted" in decs[1].rule_trail
-    assert "subtree_demoted" in decs[3].rule_trail
-    assert warnings["smart_subtree_demotions"] == 2
-
-
-def test_subtree_demotion_leaves_unnumbered_child_to_gap_close() -> None:
-    """Only numbered children cascade; an unnumbered deeper heading is left to
-    ``close_unnumbered_level_gaps`` rather than demoted with the parent —
-    its deeper level is a size/style heuristic, not a reliable subtree link
-    (test7: EnNum claims demoted, the independent sections survive, rise to
-    L2)."""
-    decs = [
-        _hd(0, "一、总体要求。", 1),  # 句号 → hit
-        _hd(1, "实施要点", 2),  # unnumbered deeper heading (numbering is None)
-    ]
-    warnings: dict = {}
-    demote_strong_body_headings(decs, strong_body=_stub_strong_body, warnings=warnings)
-    assert not decs[0].is_heading
-    assert decs[1].is_heading  # unnumbered child kept, left to gap-close
-    assert "subtree_demoted" not in decs[1].rule_trail
-    assert "smart_subtree_demotions" not in warnings
-
-
-def test_subtree_demotion_multilevel_and_sibling_boundary() -> None:
-    """Cascade reaches grandchildren in one pass; a same-level sibling of a
-    different series is not part of the subtree and survives."""
-    decs = [
-        _hd(0, "一、总体安排。", 1),  # 句号 → hit
-        _hd(1, "（一）职责分工", 2),  # child
-        _hd(2, "（1）牵头单位", 3),  # grandchild
-        _hd(3, "第一章 概述", 1),  # sibling, different series, no 句号
-    ]
-    warnings: dict = {}
-    demote_strong_body_headings(decs, strong_body=_stub_strong_body, warnings=warnings)
-    assert not decs[0].is_heading
-    assert "subtree_demoted" in decs[1].rule_trail  # child
-    assert "subtree_demoted" in decs[2].rule_trail  # grandchild, same pass
-    assert decs[3].is_heading  # sibling kept (not in the subtree)
-    assert "subtree_demoted" not in decs[3].rule_trail
-    assert warnings["smart_subtree_demotions"] == 2
+    assert [d.is_heading for d in decs] == expected_is_heading
+    for idx in subtree_idxs:
+        assert "subtree_demoted" in decs[idx].rule_trail
+        assert "strong_body_demoted" in decs[idx].rule_trail
+        assert decs[idx].use_raw_text
+    for idx in non_subtree_strong_idxs:
+        assert "strong_body_demoted" in decs[idx].rule_trail
+        assert "subtree_demoted" not in decs[idx].rule_trail
+    for idx, d in enumerate(decs):
+        if d.is_heading:
+            assert "subtree_demoted" not in d.rule_trail
+    if expected_subtree_warn is None:
+        assert "smart_subtree_demotions" not in warnings
+    else:
+        assert warnings["smart_subtree_demotions"] == expected_subtree_warn
 
 
 def test_subtree_demotion_keeps_outline_anchored_series_together() -> None:
@@ -429,21 +420,6 @@ def test_subtree_demotion_keeps_outline_anchored_series_together() -> None:
     assert [d.is_heading for d in decs[1:]] == [True, True, True]  # series intact
     assert "subtree_demoted" not in decs[1].rule_trail
     assert "smart_subtree_demotions" not in warnings
-
-
-def test_subtree_demotion_ignores_plain_anchored_child() -> None:
-    """Only physical-outline evidence (outline_anchored) exempts a numbered
-    child — bare ``anchored`` bookkeeping (set by round-2 size-only propagation,
-    no outline evidence) does NOT: such a child is still cascaded."""
-    child = _hd(1, "（一）标准甲", 2)
-    child.anchored = True  # round-2 size-propagation bookkeeping
-    child.outline_anchored = False  # but no physical-outline evidence
-    decs = [_hd(0, "一、对节能汽车，减半征收车船税。", 1), child]
-    warnings: dict = {}
-    demote_strong_body_headings(decs, strong_body=_stub_strong_body, warnings=warnings)
-    assert not decs[0].is_heading
-    assert not child.is_heading  # cascaded despite anchored=True
-    assert "subtree_demoted" in child.rule_trail
 
 
 @pytest.mark.requires_spacy_models
@@ -600,68 +576,90 @@ def test_numbering_veto_suppression_is_audited_output_neutral() -> None:
     assert supp.outline_level is None
 
 
-def test_high_confidence_size_tiers() -> None:
-    """G5-6: +1pt alone stands; +0.5pt needs companions; isolated fails."""
-    records = _body(30)
-    records.append(_para("强信号标题", size=13.0))  # +1pt
-    records.append(_para("孤立弱信号", size=12.5))  # +0.5pt, alone… but see below
-    result = _gate(records)
-    texts = _texts(result)
-    assert "强信号标题" in texts
-    assert "孤立弱信号" not in texts
-
-    # With a same-size companion the weak tier passes (P2 pair).
-    records2 = _body(30)
-    records2.append(_para("弱信号甲", size=12.5))
-    records2 += _body(3)
-    records2.append(_para("弱信号乙", size=12.5))
-    result2 = _gate(records2)
-    texts2 = _texts(result2)
-    assert "弱信号甲" in texts2 and "弱信号乙" in texts2
-
-
-def test_weak_pair_ignores_strong_body_companion() -> None:
-    """A strong-body paragraph does not count as a weak-signal companion.
-
-    Therefore, a lone +0.5pt paragraph paired only with a same-size sentence
-    stays out of the heading set.
-    """
-    records = _body(30)
-    records.append(_para("孤立弱信号标题", size=12.5))  # +0.5pt, no real companion
-    records += _body(3)
-    # Same size but strong-body (ends in 。 → _stub_strong_body demotes it).
-    records.append(_para("这是一句以句号结尾的同字号长正文。", size=12.5))
-    result = _gate(records)
-    assert "孤立弱信号标题" not in _texts(result)
-
-
-def test_base_size_needs_numbering_or_bold() -> None:
-    records = _body(30)
-    records.append(_para("一、成套编号甲", size=12.0))
-    records += _body(3)
-    records.append(_para("二、成套编号乙", size=12.0))
-    records.append(_para("整段加粗短语", size=12.0, all_bold=True))
-    records.append(_para("普通同字号段落", size=12.0))
-    result = _gate(records)
-    texts = _texts(result)
-    assert "一、成套编号甲" in texts and "二、成套编号乙" in texts
-    assert "整段加粗短语" in texts
-    assert "普通同字号段落" not in texts
-
-
-def test_isolated_numbering_blocked_by_p2() -> None:
-    """孤立编号不成章: a lone numbered line at base size is rejected."""
-    records = _body(30) + [_para("一、只有这一个编号", size=12.0)]
-    result = _gate(records)
-    assert "一、只有这一个编号" not in _texts(result)
-
-
-def test_smaller_than_base_never_heading_without_outline() -> None:
-    records = _body(30) + [_para("一、小字号编号", size=10.5)]
-    records += [_para("二、小字号编号乙", size=10.5)]
-    result = _gate(records)
-    # Necessary condition: size >= FS_base (high confidence).
-    assert _texts(result) == []
+@pytest.mark.parametrize(
+    "case_id,extra_builder,expected_in,expected_out",
+    [
+        pytest.param(
+            "strong_vs_isolated_weak",
+            lambda: [
+                _para("强信号标题", size=13.0),
+                _para("孤立弱信号", size=12.5),
+            ],
+            ("强信号标题",),
+            ("孤立弱信号",),
+            id="strong_vs_isolated_weak",
+        ),
+        pytest.param(
+            "weak_pair_with_companion",
+            lambda: [
+                _para("弱信号甲", size=12.5),
+                *_body(3),
+                _para("弱信号乙", size=12.5),
+            ],
+            ("弱信号甲", "弱信号乙"),
+            (),
+            id="weak_pair_with_companion",
+        ),
+        pytest.param(
+            "weak_pair_ignores_strong_body_companion",
+            lambda: [
+                _para("孤立弱信号标题", size=12.5),
+                *_body(3),
+                _para("这是一句以句号结尾的同字号长正文。", size=12.5),
+            ],
+            (),
+            ("孤立弱信号标题",),
+            id="weak_pair_ignores_strong_body_companion",
+        ),
+        pytest.param(
+            "base_size_needs_numbering_or_bold",
+            lambda: [
+                _para("一、成套编号甲", size=12.0),
+                *_body(3),
+                _para("二、成套编号乙", size=12.0),
+                _para("整段加粗短语", size=12.0, all_bold=True),
+                _para("普通同字号段落", size=12.0),
+            ],
+            ("一、成套编号甲", "二、成套编号乙", "整段加粗短语"),
+            ("普通同字号段落",),
+            id="base_size_needs_numbering_or_bold",
+        ),
+        pytest.param(
+            "isolated_numbering_blocked_by_p2",
+            lambda: [_para("一、只有这一个编号", size=12.0)],
+            (),
+            ("一、只有这一个编号",),
+            id="isolated_numbering_blocked_by_p2",
+        ),
+        pytest.param(
+            "smaller_than_base_never_heading_without_outline",
+            lambda: [
+                _para("一、小字号编号", size=10.5),
+                _para("二、小字号编号乙", size=10.5),
+            ],
+            (),
+            ("一、小字号编号", "二、小字号编号乙"),
+            id="smaller_than_base_never_heading_without_outline",
+        ),
+    ],
+)
+def test_high_confidence_gate_admission_rules(
+    case_id: str,
+    extra_builder,
+    expected_in: tuple[str, ...],
+    expected_out: tuple[str, ...],
+) -> None:
+    """High-confidence FS_base gate rules: strong/weak size tiers, strong-body
+    companion exclusion, base-size composite requirements, P2 isolation, and
+    strict below-base rejection without outline."""
+    records = _body(30) + extra_builder()
+    texts = _texts(_gate(records))
+    for t in expected_in:
+        assert t in texts
+    for t in expected_out:
+        assert t not in texts
+    if case_id == "smaller_than_base_never_heading_without_outline":
+        assert texts == []
 
 
 def test_low_confidence_disables_bare_size_advantage() -> None:
@@ -685,128 +683,151 @@ def test_low_confidence_disables_bare_size_advantage() -> None:
     assert "一、复合信号标题" in texts and "二、复合信号标题乙" in texts
 
 
-def test_centered_companion_channel_low_confidence() -> None:
-    """G5-7: centered same-size lines separated by body are companions;
-    an isolated centered line and back-to-back centered runs are not."""
-    records = []
-    records += _body(6, size=10.0)
-    records += _body(5, size=12.0)
-    records += _body(4, size=14.0)  # low-confidence mix
-    indices = list(range(len(records)))
-    fs = document_fs_base(records, indices)
+@pytest.mark.parametrize(
+    "case_id,extra_builder,expected_in,expected_out",
+    [
+        pytest.param(
+            "cross_run_companions_vs_adjacent_run",
+            lambda: [
+                _para("居中标题一", size=14.0, alignment="center"),
+                *_body(3, size=10.0),
+                _para("居中标题二", size=14.0, alignment="center"),
+                *_body(3, size=10.0),
+                _para("孤立居中行", size=14.0, alignment="center"),
+                *_body(2, size=10.0),
+                _para("连续居中甲", size=13.0, alignment="center"),
+                _para("连续居中乙", size=13.0, alignment="center"),
+            ],
+            ("居中标题一", "居中标题二"),
+            ("连续居中甲", "连续居中乙"),
+            id="cross_run_companions_vs_adjacent_run",
+        ),
+        pytest.param(
+            "globally_unique_isolated_rejected",
+            lambda: [_para("全局唯一居中行", size=14.0, alignment="center")],
+            (),
+            ("全局唯一居中行",),
+            id="globally_unique_isolated_rejected",
+        ),
+    ],
+)
+def test_low_confidence_centered_channel_rules(
+    case_id: str,
+    extra_builder,
+    expected_in: tuple[str, ...],
+    expected_out: tuple[str, ...],
+) -> None:
+    """Under low-confidence FS_base, centered lines require a cross-run
+    companion: adjacent same-run pairs and globally unique lines are rejected."""
+    records = _body(6, size=10.0) + _body(5, size=12.0) + _body(4, size=14.0)
+    fs = document_fs_base(records, list(range(len(records))))
     assert not fs.confidence_high
 
-    records.append(_para("居中标题一", size=14.0, alignment="center"))
-    records += _body(3, size=10.0)
-    records.append(_para("居中标题二", size=14.0, alignment="center"))
-    records += _body(3, size=10.0)
-    records.append(_para("孤立居中行", size=14.0, alignment="center"))
-    # 孤立居中行 has companions? It IS same size/shape as 一/二 — so it
-    # qualifies too (companions需不同run即可). Control: adjacent pair below.
-    records += _body(2, size=10.0)
-    records.append(_para("连续居中甲", size=13.0, alignment="center"))
-    records.append(_para("连续居中乙", size=13.0, alignment="center"))
-
-    result = _gate(records)
-    texts = _texts(result)
-    assert "居中标题一" in texts and "居中标题二" in texts
-    # Same-run neighbours are each other's ONLY same-size shape lines →
-    # no cross-run companion → both rejected.
-    assert "连续居中甲" not in texts and "连续居中乙" not in texts
+    records += extra_builder()
+    texts = _texts(_gate(records))
+    for t in expected_in:
+        assert t in texts
+    for t in expected_out:
+        assert t not in texts
 
 
-def test_centered_run_longer_than_four_loses_channel() -> None:
-    """G5-8: an 8-line centered poem block never gains candidacy."""
-    records = _body(30)
-    poem = [_para(f"诗歌居中行{i}", size=12.0, alignment="center") for i in range(8)]
-    records += poem
-    records += _body(3)
-    records.append(_para("居中标题一", size=12.0, alignment="center"))
-    records += _body(2)
-    records.append(_para("居中标题二", size=12.0, alignment="center"))
-    result = _gate(records)
-    texts = _texts(result)
-    assert all(f"诗歌居中行{i}" not in texts for i in range(8))
-    assert "居中标题一" in texts and "居中标题二" in texts
-
-
-def test_space_padded_centered_line_loses_the_channel() -> None:
-    """A leading space pad defeats w:jc=center: the 落款 an author positions
-    bottom-right by padding a centered paragraph is not heading-shaped.
-
-    The two lines are identical in every gate input except the pad, so the pad
-    is provably the discriminator — and losing the centered channel is not a
-    veto, so the leveling band split must see the same verdict.
-    """
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        pytest.param(
+            "poem_run_longer_than_four_loses_channel",
+            id="poem_run_longer_than_four_loses_channel",
+        ),
+        pytest.param("space_padded_loses_channel", id="space_padded_loses_channel"),
+        pytest.param(
+            "padded_admitted_by_other_channel_uncentered",
+            id="padded_admitted_by_other_channel_uncentered",
+        ),
+        pytest.param("solo_centered_line_admitted", id="solo_centered_line_admitted"),
+        pytest.param(
+            "two_line_centered_title_both_admitted",
+            id="two_line_centered_title_both_admitted",
+        ),
+        pytest.param(
+            "run_of_four_loses_channel_not_size_path",
+            id="run_of_four_loses_channel_not_size_path",
+        ),
+    ],
+)
+def test_high_confidence_centered_channel_rules(case_id: str) -> None:
+    """High-confidence centered channel: solo and 2-line titles admit, space
+    padding strips centeredness (without vetoing other channels), and runs
+    >=4 lose only the centered channel (preserving size_strong)."""
     from lightrag.parser.docx.smart_heading.guardrails import (
         CENTER_MAX_LEADING_PAD_EM,
     )
 
     records = _body(30)
-    records.append(_para("孤立居中标题", size=12.0, alignment="center"))
-    records += _body(3)
-    records.append(
-        _para(
-            "某某市科学技术局",
-            size=12.0,
-            alignment="center",
-            leading_pad_em=CENTER_MAX_LEADING_PAD_EM * 3,
+    if case_id == "poem_run_longer_than_four_loses_channel":
+        records += [
+            _para(f"诗歌居中行{i}", size=12.0, alignment="center") for i in range(8)
+        ]
+        records += _body(3)
+        records.append(_para("居中标题一", size=12.0, alignment="center"))
+        records += _body(2)
+        records.append(_para("居中标题二", size=12.0, alignment="center"))
+        texts = _texts(_gate(records))
+        assert all(f"诗歌居中行{i}" not in texts for i in range(8))
+        assert "居中标题一" in texts and "居中标题二" in texts
+    elif case_id == "space_padded_loses_channel":
+        records.append(_para("孤立居中标题", size=12.0, alignment="center"))
+        records += _body(3)
+        records.append(
+            _para(
+                "某某市科学技术局",
+                size=12.0,
+                alignment="center",
+                leading_pad_em=CENTER_MAX_LEADING_PAD_EM * 3,
+            )
         )
-    )
-    result = _gate(records)
-    texts = _texts(result)
-    assert "孤立居中标题" in texts
-    assert "某某市科学技术局" not in texts
-    # The admitted line still reports itself as centered to the leveling pass.
-    assert next(x for x in result.decisions if x.text == "孤立居中标题").centered
-
-
-def test_padded_centered_line_still_admitted_by_another_channel() -> None:
-    """Losing centeredness is not a veto — numbering / size / bold still admit,
-    and such a line is then leveled as UNcentered (its w:jc is not what the
-    reader sees)."""
-    records = _body(30)
-    records.append(
-        _para("一、工作安排", size=12.0, alignment="center", leading_pad_em=14.5)
-    )
-    records += _body(3)
-    records.append(_para("二、联系方式", size=12.0, alignment="center"))
-    result = _gate(records)
-    by_text = {d.text: d for d in result.decisions}
-    assert by_text["一、工作安排"].rule_trail[0] == "base_series"
-    assert by_text["二、联系方式"].rule_trail[0] == "base_series"
-    # Same alignment attribute, same size, same numbering — only the pad
-    # differs, and only the padded line is leveled as uncentered.
-    assert by_text["一、工作安排"].centered is False
-    assert by_text["二、联系方式"].centered is True
-
-
-def test_solo_centered_line_is_heading_under_high_confidence() -> None:
-    """The solo-centered channel admits a clean line at a reliable body size.
-
-    Under a high-confidence FS_base, a centered base-size line free of every
-    body signal is a heading on its
-    own — no cross-run companion needed."""
-    records = _body(30)
-    records.append(_para("孤立居中标题", size=12.0, alignment="center"))
-    result = _gate(records)
-    d = next(x for x in result.decisions if x.text == "孤立居中标题")
-    assert d.rule_trail[0] == "base_center"
-
-
-def test_two_line_centered_title_both_admitted() -> None:
-    """A two-line centered title (adjacent lines = one run, so it never had
-    a cross-run companion) is admitted whole; merge_split_headings later
-    joins the pair."""
-    records = _body(30)
-    records.append(
-        _para("广州市城市安全风险综合监测预警平台", size=12.0, alignment="center")
-    )
-    records.append(_para("建设的工作方案", size=12.0, alignment="center"))
-    result = _gate(records)
-    texts = _texts(result)
-    assert "广州市城市安全风险综合监测预警平台" in texts
-    assert "建设的工作方案" in texts
+        result = _gate(records)
+        texts = _texts(result)
+        assert "孤立居中标题" in texts
+        assert "某某市科学技术局" not in texts
+        assert next(x for x in result.decisions if x.text == "孤立居中标题").centered
+    elif case_id == "padded_admitted_by_other_channel_uncentered":
+        records.append(
+            _para("一、工作安排", size=12.0, alignment="center", leading_pad_em=14.5)
+        )
+        records += _body(3)
+        records.append(_para("二、联系方式", size=12.0, alignment="center"))
+        by_text = {d.text: d for d in _gate(records).decisions}
+        assert by_text["一、工作安排"].rule_trail[0] == "base_series"
+        assert by_text["二、联系方式"].rule_trail[0] == "base_series"
+        assert by_text["一、工作安排"].centered is False
+        assert by_text["二、联系方式"].centered is True
+    elif case_id == "solo_centered_line_admitted":
+        records.append(_para("孤立居中标题", size=12.0, alignment="center"))
+        result = _gate(records)
+        d = next(x for x in result.decisions if x.text == "孤立居中标题")
+        assert d.rule_trail[0] == "base_center"
+    elif case_id == "two_line_centered_title_both_admitted":
+        records.append(
+            _para("广州市城市安全风险综合监测预警平台", size=12.0, alignment="center")
+        )
+        records.append(_para("建设的工作方案", size=12.0, alignment="center"))
+        texts = _texts(_gate(records))
+        assert "广州市城市安全风险综合监测预警平台" in texts
+        assert "建设的工作方案" in texts
+    else:
+        records += [
+            _para("居中簇一", size=12.0, alignment="center"),
+            _para("居中簇二", size=12.0, alignment="center"),
+            _para("大字号居中行", size=16.0, alignment="center"),
+            _para("居中簇四", size=12.0, alignment="center"),
+        ]
+        result = _gate(records)
+        texts = _texts(result)
+        assert "居中簇一" not in texts
+        assert "居中簇二" not in texts
+        assert "居中簇四" not in texts
+        d = next(x for x in result.decisions if x.text == "大字号居中行")
+        assert d.rule_trail[0] == "size_strong"
 
 
 def test_solo_centered_channel_exclusions() -> None:
@@ -834,43 +855,7 @@ def test_solo_centered_channel_exclusions() -> None:
         assert t not in texts
 
 
-def test_centered_run_of_four_loses_channel_but_not_size_path() -> None:
-    """Anti-poetry tightened to >= 4: a 4-line centered cluster loses the
-    centered channel as a WHOLE run, but losing the channel is not a veto —
-    a big line inside the cluster still rises via size_strong."""
-    records = _body(30)
-    records.append(_para("居中簇一", size=12.0, alignment="center"))
-    records.append(_para("居中簇二", size=12.0, alignment="center"))
-    records.append(_para("大字号居中行", size=16.0, alignment="center"))
-    records.append(_para("居中簇四", size=12.0, alignment="center"))
-    result = _gate(records)
-    texts = _texts(result)
-    assert "居中簇一" not in texts
-    assert "居中簇二" not in texts
-    assert "居中簇四" not in texts
-    d = next(x for x in result.decisions if x.text == "大字号居中行")
-    assert d.rule_trail[0] == "size_strong"
-
-
-def test_lowconf_truly_isolated_centered_line_needs_companion() -> None:
-    """Low confidence keeps the companion requirement: a globally UNIQUE
-    centered-shape line (no same-size centered line in ANY other run —
-    unlike G5-7's "isolated" line, which has cross-run companions) is not
-    admitted."""
-    records = []
-    records += _body(6, size=10.0)
-    records += _body(5, size=12.0)
-    records += _body(4, size=14.0)
-    indices = list(range(len(records)))
-    fs = document_fs_base(records, indices)
-    assert not fs.confidence_high
-
-    records.append(_para("全局唯一居中行", size=14.0, alignment="center"))
-    result = _gate(records)
-    assert "全局唯一居中行" not in _texts(result)
-
-
-def test_cb1_reestimation_recovers_density(monkeypatch, caplog) -> None:
+def test_cb1_reestimation_recovers_density(monkeypatch, lightrag_caplog) -> None:
     """G3-4 branch 1: dominant fake-heading size folds into the body; the
     re-gated density collapses and the breaker does NOT trip."""
     records = _body(60, size=10.5)
@@ -883,7 +868,7 @@ def test_cb1_reestimation_recovers_density(monkeypatch, caplog) -> None:
     assert fs.confidence_high
 
     warnings: dict = {}
-    with caplog.at_level(logging.INFO, logger="lightrag"):
+    with lightrag_caplog.at_level(logging.INFO, logger="lightrag"):
         result = gate_with_cb1(
             records,
             indices,
@@ -898,15 +883,11 @@ def test_cb1_reestimation_recovers_density(monkeypatch, caplog) -> None:
     # 12pt became the body baseline; the bare lines lost candidacy.
     assert result.decisions == []
     # Re-gate outcome logged as a converged (INFO) event.
-    regate = next(m for m in _log_messages(caplog) if "CB1 re-gate:" in m)
+    regate = next(m for m in _log_messages(lightrag_caplog) if "CB1 re-gate:" in m)
     assert "converged" in regate and "threshold" in regate
 
 
-def _log_messages(caplog) -> list[str]:
-    return [r.getMessage() for r in caplog.records]
-
-
-def test_cb1_extreme_sample_trips_breaker(monkeypatch, caplog) -> None:
+def test_cb1_extreme_sample_trips_breaker(monkeypatch, lightrag_caplog) -> None:
     """G3-4 branch 2: a question-bank doc stays dense after one
     re-estimation → the breaker trips (sub-document falls back)."""
     records = []
@@ -917,7 +898,7 @@ def test_cb1_extreme_sample_trips_breaker(monkeypatch, caplog) -> None:
     fs = document_fs_base(records, indices)
 
     warnings: dict = {}
-    with caplog.at_level(logging.INFO, logger="lightrag"):
+    with lightrag_caplog.at_level(logging.INFO, logger="lightrag"):
         result = gate_with_cb1(
             records,
             indices,
@@ -931,7 +912,9 @@ def test_cb1_extreme_sample_trips_breaker(monkeypatch, caplog) -> None:
     assert result.cb1_tripped
     assert warnings.get("smart_cb1_tripped") == 1
     # Re-gate outcome logged as a still-over (WARNING) fallback event.
-    regate = next(r for r in caplog.records if "CB1 re-gate:" in r.getMessage())
+    regate = next(
+        r for r in lightrag_caplog.records if "CB1 re-gate:" in r.getMessage()
+    )
     assert regate.levelno == logging.WARNING
     assert "outline-only fallback" in regate.getMessage()
 
@@ -1005,49 +988,93 @@ def _grad_gate(records, warnings):
     )
 
 
-def test_cb1_graduated_recovers_same_size_numbered_headings(caplog) -> None:
-    """Fix-proof: same-size numbered headings that the blanket re-estimation
-    would wipe are recovered by peeling the weak tiers (list items + deepest
-    MLN). The EnNum root and the mln raw-2 tier survive; CB1 does NOT trip."""
-    records = _gbt_shape_records(ennum_root=True)
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        pytest.param(
+            "recovers_same_size_numbered_headings",
+            id="recovers_same_size_numbered_headings",
+        ),
+        pytest.param(
+            "ennum_root_not_demoted_before_mln",
+            id="ennum_root_not_demoted_before_mln",
+        ),
+        pytest.param("sparse_only_trigger", id="sparse_only_trigger"),
+        pytest.param(
+            "exhausted_falls_back_to_blanket",
+            id="exhausted_falls_back_to_blanket",
+        ),
+    ],
+)
+def test_cb1_graduated_gate_scenarios(lightrag_caplog, case_id: str) -> None:
+    """CB1 graduated demotion peels weak same-size tiers, respects EnNum-root
+    deferral, handles spacing-only triggers, and falls back cleanly when exhausted."""
     warnings: dict = {}
-    with caplog.at_level(logging.INFO, logger="lightrag"):
+    if case_id == "recovers_same_size_numbered_headings":
+        records = _gbt_shape_records(ennum_root=True)
+        with lightrag_caplog.at_level(logging.INFO, logger="lightrag"):
+            result = _grad_gate(records, warnings)
+        assert not result.cb1_reestimated
+        assert not result.cb1_tripped
+        assert not result.cb1_strong_body_recovered
+        assert result.cb1_graduated_stages == ["en_single_paren", "mln_raw3"]
+        assert result.cb1_graduated_ennum_root is True
+        assert result.cb1_graduated_demoted == 20
+        styles = sorted(d.numbering.style_key for d in result.decisions)
+        assert styles == ["EnNum"] * 10 + ["MultiLevelNum"] * 8
+        demoted = [d for d in result.demoted if "cb1_graduated_demoted" in d.rule_trail]
+        assert len(demoted) == 20
+        for d in demoted:
+            assert not d.is_heading
+            assert d.use_raw_text is False
+            assert any(t.startswith("cb1_stage:") for t in d.rule_trail)
+            assert d.rule_trail[0] in {"base_series", "base_bold", "base_center"}
+        assert warnings["smart_cb1_graduated_demotions"] == 20
+        assert result.density == pytest.approx(18 / 78, abs=1e-4)
+        assert result.cb1_graduated_density == pytest.approx(18 / 78, abs=1e-4)
+        assert result.cb1_graduated_inter_chars is not None
+        assert result.cb1_graduated_inter_chars >= 200
+        assert any("CB1 graduated" in m for m in _log_messages(lightrag_caplog))
+    elif case_id == "ennum_root_not_demoted_before_mln":
+        records = _gbt_shape_records(ennum_root=False)
         result = _grad_gate(records, warnings)
-
-    # No blanket re-estimation / trip / look-ahead recovery — the graduated
-    # path handled it.
-    assert not result.cb1_reestimated
-    assert not result.cb1_tripped
-    assert not result.cb1_strong_body_recovered
-    # Weakest body-prior tier first, then deepest MLN; EnNum root deferred so it
-    # is NOT reached (stops before it).
-    assert result.cb1_graduated_stages == ["en_single_paren", "mln_raw3"]
-    assert result.cb1_graduated_ennum_root is True
-    assert result.cb1_graduated_demoted == 20  # 6 list items + 14 mln raw-3
-
-    kept = {d.record_index: d for d in result.decisions}
-    styles = sorted(d.numbering.style_key for d in kept.values())
-    assert styles == ["EnNum"] * 10 + ["MultiLevelNum"] * 8  # root + raw-2 kept
-
-    # Demoted members: original admitting rule kept, plus the two audit marks,
-    # output-neutral (never re-rendered from raw text — they are not outline).
-    demoted = [d for d in result.demoted if "cb1_graduated_demoted" in d.rule_trail]
-    assert len(demoted) == 20
-    for d in demoted:
-        assert not d.is_heading
-        assert d.use_raw_text is False
-        assert any(t.startswith("cb1_stage:") for t in d.rule_trail)
-        assert d.rule_trail[0] in {"base_series", "base_bold", "base_center"}
-    assert warnings["smart_cb1_graduated_demotions"] == 20
-
-    # With no strong-body candidates the real ratio and the projection basis
-    # coincide (18/78); their DIVERGENCE is exercised separately in
-    # test_cb1_graduated_density_reflects_real_decisions_not_projection.
-    assert result.density == pytest.approx(18 / 78, abs=1e-4)
-    assert result.cb1_graduated_density == pytest.approx(18 / 78, abs=1e-4)
-    assert result.cb1_graduated_inter_chars is not None
-    assert result.cb1_graduated_inter_chars >= 200
-    assert any("CB1 graduated" in m for m in _log_messages(caplog))
+        assert result.cb1_graduated_ennum_root is False
+        assert result.cb1_graduated_stages == ["en_single_paren", "en_num"]
+        styles = sorted(d.numbering.style_key for d in result.decisions)
+        assert styles == ["MultiLevelNum"] * 22
+    elif case_id == "sparse_only_trigger":
+        records = [_grad_body_para(), _grad_body_para()]
+        for i in range(4):
+            records += [
+                _para(f"{i + 1}.1 子节标题{i}", size=12.0),
+                _grad_body_para(),
+                _grad_body_para(),
+            ]
+        records.append(_grad_body_para())
+        for i in range(6):
+            records.append(_para(f"a) 列表项{i}", size=12.0))
+        records += [_grad_body_para(), _grad_body_para()]
+        result = _grad_gate(records, warnings)
+        assert not result.cb1_reestimated and not result.cb1_tripped
+        assert result.cb1_graduated_stages == ["en_single_paren"]
+        assert result.cb1_graduated_density is not None
+        assert result.cb1_graduated_density <= 0.35
+        assert result.cb1_graduated_inter_chars >= 200
+        assert sorted(d.numbering.style_key for d in result.decisions) == (
+            ["MultiLevelNum"] * 4
+        )
+    else:
+        records = [_para(_GRAD_BODY, size=10.5) for _ in range(20)]
+        for i in range(30):
+            records.append(_para(f"大纲标题{i}", size=10.5, outline_level=0))
+        for i in range(10):
+            records.append(_para(f"a) 列表项{i}", size=10.5))
+        result = _grad_gate(records, warnings)
+        assert result.cb1_graduated_stages == []
+        assert result.cb1_graduated_demoted == 0
+        assert "smart_cb1_graduated_demotions" not in warnings
+        assert result.cb1_reestimated
+        assert not any("cb1_graduated_demoted" in d.rule_trail for d in result.demoted)
 
 
 def test_cb1_graduated_density_reflects_real_decisions_not_projection() -> None:
@@ -1090,10 +1117,14 @@ def test_cb1_graduated_density_reflects_real_decisions_not_projection() -> None:
     assert final_headings == round(result.cb1_graduated_density * result.non_empty)
 
 
-def test_cb1_graduated_ladder_orders_mln_last_and_ennum_root_deferred() -> None:
-    """The ladder fixes the demotion order: weakest body-prior first, then MLN
-    deepest-raw-level-first, and the EnNum root relocated to the very end."""
-    from lightrag.parser.docx.smart_heading.heading_flow import _cb1_ladder
+def test_cb1_graduated_ladder_and_root_helpers() -> None:
+    """The ladder orders weakest body-prior first, then MLN deepest-first,
+    deferring EnNum to the end only when >=2 overlapping ordinals cover >=half
+    of the MLN leading components."""
+    from lightrag.parser.docx.smart_heading.heading_flow import (
+        _cb1_ennum_is_mln_root,
+        _cb1_ladder,
+    )
 
     present = {
         "en_single_paren": [],
@@ -1117,102 +1148,15 @@ def test_cb1_graduated_ladder_orders_mln_last_and_ennum_root_deferred() -> None:
         "en_num",
     ]
 
-
-def test_cb1_graduated_ennum_root_detection() -> None:
-    """EnNum is the MLN root only with >= 2 distinct overlapping ordinals AND
-    >= half the MLN leading components covered — a lone {1} overlap is too weak.
-    """
-    from lightrag.parser.docx.smart_heading.heading_flow import (
-        _cb1_ennum_is_mln_root,
-    )
-
-    def _mln(top: int) -> HeadingDecision:
-        return HeadingDecision(
-            record_index=top,
-            text=f"{top}.1 子节",
-            is_heading=True,
-            numbering=classify_numbering(f"{top}.1 子节"),
-        )
+    mlns = [_make_decision(f"{t}.1 子节", idx=t, numbered=True) for t in (1, 2, 3, 4)]
 
     def _en(ordinal: int) -> HeadingDecision:
-        return HeadingDecision(
-            record_index=1000 + ordinal,
-            text=f"{ordinal} 章节",
-            is_heading=True,
-            numbering=classify_numbering(f"{ordinal} 章节"),
-        )
+        return _make_decision(f"{ordinal} 章节", idx=1000 + ordinal, numbered=True)
 
-    mlns = [_mln(t) for t in (1, 2, 3, 4)]
     assert _cb1_ennum_is_mln_root(mlns, [_en(o) for o in (1, 2, 3, 4)]) is True
     assert _cb1_ennum_is_mln_root(mlns, [_en(1)]) is False  # single {1} overlap
     assert _cb1_ennum_is_mln_root(mlns, [_en(o) for o in (90, 91)]) is False  # none
     assert _cb1_ennum_is_mln_root([], [_en(1), _en(2)]) is False  # no MLN family
-
-
-def test_cb1_graduated_ennum_root_not_demoted_before_mln() -> None:
-    """Contrast: when the EnNum ordinals do NOT cover the MLN tops, EnNum is not
-    the root and is demoted at its base-ladder position (before MLN); the MLN
-    tiers survive instead."""
-    records = _gbt_shape_records(ennum_root=False)
-    warnings: dict = {}
-    result = _grad_gate(records, warnings)
-
-    assert result.cb1_graduated_ennum_root is False
-    assert result.cb1_graduated_stages == ["en_single_paren", "en_num"]
-    styles = sorted(d.numbering.style_key for d in result.decisions)
-    assert styles == ["MultiLevelNum"] * 22  # all MLN kept, EnNum demoted
-
-
-def test_cb1_graduated_sparse_only_trigger() -> None:
-    """CB1 can trigger on spacing alone (density under the bar). A packed run of
-    same-size list items makes the mean inter-heading spacing sparse; peeling
-    that one tier restores spacing without touching the real headings."""
-    records = [_grad_body_para(), _grad_body_para()]
-    for i in range(4):  # 4 well-spaced MLN headings
-        records += [
-            _para(f"{i + 1}.1 子节标题{i}", size=12.0),
-            _grad_body_para(),
-            _grad_body_para(),
-        ]
-    records.append(_grad_body_para())
-    for i in range(6):  # a packed run of list items — no body between them
-        records.append(_para(f"a) 列表项{i}", size=12.0))
-    records += [_grad_body_para(), _grad_body_para()]
-
-    warnings: dict = {}
-    result = _grad_gate(records, warnings)
-
-    assert not result.cb1_reestimated and not result.cb1_tripped
-    assert result.cb1_graduated_stages == ["en_single_paren"]
-    # Density was already within bounds; spacing was the trigger and recovered.
-    assert result.cb1_graduated_density is not None
-    assert result.cb1_graduated_density <= 0.35
-    assert result.cb1_graduated_inter_chars >= 200
-    assert sorted(d.numbering.style_key for d in result.decisions) == (
-        ["MultiLevelNum"] * 4
-    )
-
-
-def test_cb1_graduated_exhausted_falls_back_to_blanket() -> None:
-    """When no ladder prefix converges (exempt outline candidates hold density
-    over the bar), the ladder leaves the result untouched and CB1 falls back to
-    blanket re-estimation — proving the simulation is side-effect free."""
-    records = [_para(_GRAD_BODY, size=10.5) for _ in range(20)]
-    for i in range(30):  # exempt outline headings keep density high
-        records.append(_para(f"大纲标题{i}", size=10.5, outline_level=0))
-    for i in range(10):  # the only demotable tier
-        records.append(_para(f"a) 列表项{i}", size=10.5))
-
-    warnings: dict = {}
-    result = _grad_gate(records, warnings)
-
-    # Ladder ran (a demotable tier existed) but found no converging prefix:
-    # no graduated state, no graduated demotions, blanket path taken instead.
-    assert result.cb1_graduated_stages == []
-    assert result.cb1_graduated_demoted == 0
-    assert "smart_cb1_graduated_demotions" not in warnings
-    assert result.cb1_reestimated
-    assert not any("cb1_graduated_demoted" in d.rule_trail for d in result.demoted)
 
 
 def test_cb1_graduated_outline_and_larger_size_exempt() -> None:
@@ -1309,225 +1253,238 @@ def _decision(
     numbered: bool = True,
     idx: int = 0,
 ) -> HeadingDecision:
-    cls = classify_numbering(text) if numbered else None
-    return HeadingDecision(
-        record_index=idx,
-        text=text,
-        is_heading=True,
-        font_size_pt=size,
-        numbering=cls,
-        centered=centered,
+    return _make_decision(
+        text, size=size, centered=centered, numbered=numbered, idx=idx
     )
 
 
-def test_size_bands_consecutive_levels() -> None:
-    """G6-1: 16/14/12pt headings → levels 1/2/3."""
+@pytest.mark.parametrize(
+    "case_id,specs,expected_levels",
+    [
+        pytest.param(
+            "consecutive_size_bands",
+            [
+                ("总览", 16.0, False, True),
+                ("第一章 分述", 14.0, True, False),
+                ("一、细项", 12.0, True, False),
+            ],
+            [1, 2, 3],
+            id="consecutive_size_bands",
+        ),
+        pytest.param(
+            "same_band_centered_numbered_uncentered",
+            [
+                ("居中无编号", 14.0, False, True),
+                ("一、编号标题", 14.0, True, False),
+                ("非居中无编号", 14.0, False, False),
+            ],
+            [1, 2, 3],
+            id="same_band_centered_numbered_uncentered",
+        ),
+        pytest.param(
+            "step2_spec_example_table",
+            [
+                ("居中无编号标题", 14.0, False, True),
+                ("1.2 多级编号", 14.0, True, False),
+                ("一、中文数字", 14.0, True, False),
+                ("2.3 多级编号", 14.0, True, False),
+                ("1.1.2 多级编号", 14.0, True, False),
+                ("（一）中文括号", 14.0, True, False),
+            ],
+            [1, 2, 3, 2, 3, 4],
+            id="step2_spec_example_table",
+        ),
+    ],
+)
+def test_assign_levels_by_size_cases(
+    case_id: str,
+    specs: list[tuple[str, float, bool, bool]],
+    expected_levels: list[int],
+) -> None:
+    """G6 size banding assigns consecutive levels across bands and
+    centered < numbered < uncentered within one band."""
     ds = [
-        _decision("总览", size=16.0, numbered=False, centered=True, idx=0),
-        _decision("第一章 分述", size=14.0, idx=1),
-        _decision("一、细项", size=12.0, idx=2),
+        _decision(text, size=size, numbered=numbered, centered=centered, idx=i)
+        for i, (text, size, numbered, centered) in enumerate(specs)
     ]
     assign_levels_by_size(ds)
-    assert [d.level for d in ds] == [1, 2, 3]
+    assert [d.level for d in ds] == expected_levels
 
 
-def test_same_band_centered_numbered_uncentered_order() -> None:
-    """G6-2: within one band, centered < numbered < uncentered."""
-    ds = [
-        _decision("居中无编号", size=14.0, numbered=False, centered=True, idx=0),
-        _decision("一、编号标题", size=14.0, idx=1),
-        _decision("非居中无编号", size=14.0, numbered=False, idx=2),
-    ]
-    assign_levels_by_size(ds)
-    assert [d.level for d in ds] == [1, 2, 3]
-
-
-def test_step2_spec_example_table() -> None:
-    """Size bands assign centered, numbered, and plain headings in order."""
-    ds = [
-        _decision("居中无编号标题", size=14.0, numbered=False, centered=True, idx=0),
-        _decision("1.2 多级编号", size=14.0, idx=1),
-        _decision("一、中文数字", size=14.0, idx=2),
-        _decision("2.3 多级编号", size=14.0, idx=3),
-        _decision("1.1.2 多级编号", size=14.0, idx=4),
-        _decision("（一）中文括号", size=14.0, idx=5),
-    ]
-    assign_levels_by_size(ds)
-    assert [d.level for d in ds] == [2 - 1, 3 - 1, 4 - 1, 3 - 1, 4 - 1, 5 - 1]
-    # (the spec table starts at 2 because a shallower band exists there;
-    # with a single band our levels start at 1 — relative order matches)
-
-
-def test_step4_spec_example_table() -> None:
-    """Same-series alignment uses the modal level with a shallow tie-break."""
-    rows = [
-        ("居中无编号标题", 2, 2, False),
-        ("1.2 节", 3, 3, True),
-        ("一、目标", 4, 4, True),
-        ("二、方法", 5, 4, True),  # same CnNum series as the row above
-        ("1.1.2 小节", 4, 4, True),
-        ("1.3 节", 4, 3, True),  # aligns with the raw-level-2 series
-        ("三、总结", 3, 3, True),  # a NEW CnNum series (closed by the shallower 1.3)
-        ("（一）分项", 5, 4, True),
-        ("（二）分项", 4, 4, True),
-    ]
+@pytest.mark.parametrize(
+    "case_id,rows,size",
+    [
+        pytest.param(
+            "step4_spec_example_table",
+            [
+                ("居中无编号标题", 2, 2, False),
+                ("1.2 节", 3, 3, True),
+                ("一、目标", 4, 4, True),
+                ("二、方法", 5, 4, True),
+                ("1.1.2 小节", 4, 4, True),
+                ("1.3 节", 4, 3, True),
+                ("三、总结", 3, 3, True),
+                ("（一）分项", 5, 4, True),
+                ("（二）分项", 4, 4, True),
+            ],
+            14.0,
+            id="step4_spec_example_table",
+        ),
+        pytest.param(
+            "alignment_shifts_subtree",
+            [
+                ("一、第一部分", 4, 4, True),
+                ("子标题甲", 5, 5, False),
+                ("二、第二部分", 5, 4, True),
+                ("子标题乙", 6, 5, False),
+                ("孙标题", 7, 6, False),
+            ],
+            None,
+            id="alignment_shifts_subtree",
+        ),
+    ],
+)
+def test_align_numbering_series_cases(
+    case_id: str,
+    rows: list[tuple[str, int, int, bool]],
+    size: float | None,
+) -> None:
+    """Same-series alignment uses modal level with shallow tie-break and shifts
+    the aligned heading's subtree along with it."""
     ds = []
     for i, (text, level, _expected, numbered) in enumerate(rows):
-        d = _decision(text, size=14.0, numbered=numbered, idx=i)
+        d = _decision(text, size=size, numbered=numbered, idx=i)
         d.level = level
         ds.append(d)
     align_numbering_series(ds)
     assert [d.level for d in ds] == [r[2] for r in rows]
 
 
-def test_alignment_shifts_subtree() -> None:
-    """G8-5 precursor: aligning a parent drags its subtree along."""
+@pytest.mark.parametrize(
+    "case_id,specs,promoted_idxs,expected_levels,expected_styles,expected_warnings",
+    [
+        pytest.param(
+            "absorbs_ennum_with_ordinal_linkage",
+            [
+                ("1. 总则", 14.0, 2),
+                ("1.1 范围", 12.0, 3),
+                ("1.2 定义", 12.0, 3),
+                ("2. 要求", 14.0, 2),
+                ("2.1 基本要求", 12.0, 3),
+                ("第一章 干扰章节", 14.0, 2),
+            ],
+            (0, 3),
+            {0: 2, 3: 2},
+            {5: "CnChapter"},
+            {},
+            id="absorbs_ennum_with_ordinal_linkage",
+        ),
+        pytest.param(
+            "linkage_waives_size_threshold",
+            [
+                ("1. 总则", 10.5, 4),
+                ("1.1 范围", 12.0, 3),
+                ("1.2 定义", 12.0, 3),
+                ("2. 要求", 10.5, 4),
+                ("2.1 基本要求", 12.0, 3),
+            ],
+            (0, 3),
+            {0: 2, 3: 2},
+            {},
+            {},
+            id="linkage_waives_size_threshold",
+        ),
+        pytest.param(
+            "single_linkage_pair_skipped_with_warning",
+            [
+                ("1. 总则", 10.5, 4),
+                ("1.1 范围", 12.0, 3),
+                ("1.2 定义", 12.0, 3),
+                ("2. 附则", 10.5, 4),
+            ],
+            (),
+            {},
+            {0: "EnNum"},
+            {"smart_backfill_single_linkage": 1},
+            id="single_linkage_pair_skipped_with_warning",
+        ),
+        pytest.param(
+            "counter_example_blocks_linkage",
+            [
+                ("1. 总则", 10.5, 4),
+                ("2.1 错位小节", 12.0, 3),
+                ("2. 要求", 10.5, 4),
+                ("2.2 又一节", 12.0, 3),
+            ],
+            (),
+            {},
+            {0: "EnNum"},
+            {},
+            id="counter_example_blocks_linkage",
+        ),
+        pytest.param(
+            "only_promotes_top_level_roots",
+            [
+                ("1. 价格文件", 10.5, 4),
+                ("1.1 开标一览表", 14.0, 3),
+                ("2. 商务文件", 10.5, 4),
+                ("2.1 投标函", 14.0, 3),
+                ("1. 我方按招标文件递交投标文件正本。", 10.5, 6),
+                ("2. 我方承认招标人有权决定中标人。", 10.5, 6),
+            ],
+            (0, 2),
+            {},
+            {4: "EnNum", 5: "EnNum"},
+            {},
+            id="only_promotes_top_level_roots",
+        ),
+        pytest.param(
+            "noop_without_mln",
+            [
+                ("1. 总则", 14.0, 2),
+                ("2. 附则", 14.0, 2),
+            ],
+            (),
+            {},
+            {0: "EnNum", 1: "EnNum"},
+            {},
+            id="noop_without_mln",
+        ),
+    ],
+)
+def test_backfill_top_level_cases(
+    case_id: str,
+    specs: list[tuple[str, float, int]],
+    promoted_idxs: tuple[int, ...],
+    expected_levels: dict[int, int],
+    expected_styles: dict[int, str],
+    expected_warnings: dict[str, int],
+) -> None:
+    """backfill_top_level promotes only genuine ordinal-linked top-level roots
+    (waiving size threshold with >=2 links), skips single/refuted links and
+    MLN-free docs, and never lifts colliding nested body lists."""
     ds = []
-    specs = [
-        ("一、第一部分", 4, True),
-        ("子标题甲", 5, False),
-        ("二、第二部分", 5, True),  # same series → align to 4
-        ("子标题乙", 6, False),  # subtree of 二、 → shifts to 5
-        ("孙标题", 7, False),  # deeper subtree → shifts to 6
-    ]
-    for i, (text, level, numbered) in enumerate(specs):
-        d = _decision(text, size=None, numbered=numbered, idx=i)
-        d.level = level
-        ds.append(d)
-    align_numbering_series(ds)
-    assert [d.level for d in ds] == [4, 5, 4, 5, 6]
-
-
-def test_backfill_absorbs_ennum_with_ordinal_linkage() -> None:
-    """G6-4: 第一章/1.1 style docs — EnNum with matching top ordinals is
-    absorbed as MultiLevelNum raw 1; competing keys keep their class."""
-    texts = [
-        ("1. 总则", 14.0, 2),
-        ("1.1 范围", 12.0, 3),
-        ("1.2 定义", 12.0, 3),
-        ("2. 要求", 14.0, 2),
-        ("2.1 基本要求", 12.0, 3),
-        ("第一章 干扰章节", 14.0, 2),  # competing CnChapter, no linkage
-    ]
-    ds = []
-    for i, (text, size, level) in enumerate(texts):
+    for i, (text, size, level) in enumerate(specs):
         d = _decision(text, size=size, idx=i)
         d.level = level
         ds.append(d)
     warnings: dict = {}
     backfill_top_level(ds, warnings=warnings)
-    en1, en2 = ds[0], ds[3]
-    assert en1.numbering.style_key == "MultiLevelNum" and en1.numbering.raw_level == 1
-    assert en2.numbering.style_key == "MultiLevelNum" and en2.numbering.raw_level == 1
-    assert ds[5].numbering.style_key == "CnChapter"  # not absorbed
-    # levels rise above the raw-2 layer
-    assert en1.level == 2 and en2.level == 2  # already shallower than 1.x → kept
 
-
-def test_backfill_linkage_waives_size_threshold() -> None:
-    """G6-6 main group: parents typed SMALLER than children (10.5 < 12) are
-    still absorbed when ≥2 ordinal linkages hold."""
-    texts = [
-        ("1. 总则", 10.5, 4),
-        ("1.1 范围", 12.0, 3),
-        ("1.2 定义", 12.0, 3),
-        ("2. 要求", 10.5, 4),
-        ("2.1 基本要求", 12.0, 3),
-    ]
-    ds = []
-    for i, (text, size, level) in enumerate(texts):
-        d = _decision(text, size=size, idx=i)
-        d.level = level
-        ds.append(d)
-    warnings: dict = {}
-    backfill_top_level(ds, warnings=warnings)
-    assert ds[0].numbering.style_key == "MultiLevelNum"
-    assert ds[0].numbering.raw_level == 1
-    # Levels rose above the raw-2 layer (min raw level was 3 → parents at 2).
-    assert ds[0].level == 2 and ds[3].level == 2
-
-
-def test_backfill_single_linkage_pair_skipped_with_warning() -> None:
-    """G6-6 control 1: only one linked ordinal → no waiver + warning."""
-    texts = [
-        ("1. 总则", 10.5, 4),  # below the 12pt size threshold
-        ("1.1 范围", 12.0, 3),
-        ("1.2 定义", 12.0, 3),
-        ("2. 附则", 10.5, 4),  # scope holds no 2.x → only ordinal 1 links
-    ]
-    ds = []
-    for i, (text, size, level) in enumerate(texts):
-        d = _decision(text, size=size, idx=i)
-        d.level = level
-        ds.append(d)
-    warnings: dict = {}
-    backfill_top_level(ds, warnings=warnings)
-    assert ds[0].numbering.style_key == "EnNum"
-    assert warnings.get("smart_backfill_single_linkage") == 1
-
-
-def test_backfill_counter_example_blocks_linkage() -> None:
-    """A foreign top value inside a parent scope refutes the linkage; with
-    the size channel also failing, nothing is absorbed."""
-    texts = [
-        ("1. 总则", 10.5, 4),
-        ("2.1 错位小节", 12.0, 3),  # top=2 inside scope of 1 → counter-example
-        ("2. 要求", 10.5, 4),
-        ("2.2 又一节", 12.0, 3),
-    ]
-    ds = []
-    for i, (text, size, level) in enumerate(texts):
-        d = _decision(text, size=size, idx=i)
-        d.level = level
-        ds.append(d)
-    backfill_top_level(ds, warnings={})
-    assert ds[0].numbering.style_key == "EnNum"  # linkage refuted, size too low
-
-
-def test_backfill_only_promotes_top_level_roots() -> None:
-    """test11 bug: backfill must absorb ONLY the genuine top-level parents,
-    not a nested body list sharing the bare numbering key. The gate keys the
-    linkage channel on the parent RECORD IDENTITY (not the ordinal value): a
-    body list ``1./2.`` COLLIDES ordinals with the real roots ``1./2.``, so
-    an ordinal-membership test would wrongly promote it. Here the roots are
-    10.5pt (< the 14pt child-size threshold) and carry no outline, so ONLY
-    the record-index linkage channel can lift them — isolating the fix."""
-    specs = [
-        # (text, size, outline_level, level)
-        ("1. 价格文件", 10.5, None, 4),  # root: linked (scope holds 1.1), no outline
-        ("1.1 开标一览表", 14.0, None, 3),  # MLN child (top_ordinal 1)
-        ("2. 商务文件", 10.5, None, 4),  # root: linked (scope holds 2.1)
-        ("2.1 投标函", 14.0, None, 3),  # MLN child (top_ordinal 2)
-        (
-            "1. 我方按招标文件递交投标文件正本。",
-            10.5,
-            None,
-            6,
-        ),  # body, ordinal 1 COLLIDES
-        (
-            "2. 我方承认招标人有权决定中标人。",
-            10.5,
-            None,
-            6,
-        ),  # body, ordinal 2 COLLIDES
-    ]
-    ds = []
-    for i, (text, size, outline, level) in enumerate(specs):
-        d = _decision(text, size=size, idx=i)
-        d.level = level
-        d.outline_level = outline
-        ds.append(d)
-    backfill_top_level(ds, warnings={})
-    # The two roots (linked by record identity) are absorbed as MLN raw 1.
-    for r in (ds[0], ds[2]):
-        assert r.numbering.style_key == "MultiLevelNum" and r.numbering.raw_level == 1
-        assert "backfill_top_level" in r.rule_trail
-    # The body list — colliding ordinals 1/2 — is NOT promoted (would be, if
-    # the gate matched ordinal VALUES instead of parent record identity).
-    for b in (ds[4], ds[5]):
-        assert b.numbering.style_key == "EnNum"
-        assert "backfill_top_level" not in b.rule_trail
-    assert sum("backfill_top_level" in d.rule_trail for d in ds) == 2
+    for idx in promoted_idxs:
+        assert ds[idx].numbering.style_key == "MultiLevelNum"
+        assert ds[idx].numbering.raw_level == 1
+        assert "backfill_top_level" in ds[idx].rule_trail
+    for idx in range(len(ds)):
+        if idx not in promoted_idxs:
+            assert "backfill_top_level" not in ds[idx].rule_trail
+    assert sum("backfill_top_level" in d.rule_trail for d in ds) == len(promoted_idxs)
+    for idx, level in expected_levels.items():
+        assert ds[idx].level == level
+    for idx, style in expected_styles.items():
+        assert ds[idx].numbering.style_key == style
+    for key, count in expected_warnings.items():
+        assert warnings.get(key) == count
 
 
 def test_outlined_part_root_survives_end_to_end(monkeypatch) -> None:
@@ -1608,20 +1565,6 @@ def test_outlined_part_root_survives_end_to_end(monkeypatch) -> None:
             )
 
 
-def test_backfill_noop_without_mln() -> None:
-    """No MultiLevelNum headings → backfill is a no-op (guards the legal-doc
-    corpus test8/test9, which have no MLN and must be untouched)."""
-    ds = [
-        _decision("1. 总则", size=14.0, idx=0),
-        _decision("2. 附则", size=14.0, idx=1),
-    ]
-    for d in ds:
-        d.level = 2
-    backfill_top_level(ds, warnings={})
-    assert all(d.numbering.style_key == "EnNum" for d in ds)
-    assert all("backfill_top_level" not in d.rule_trail for d in ds)
-
-
 def test_fs_base_excludes_toc_lines() -> None:
     records = _body(10, size=12.0)
     records += [
@@ -1674,71 +1617,27 @@ def test_cb1_second_pass_keeps_sizes_above_reestimated_base() -> None:
     assert all(f"伪标题短语{i}" not in texts for i in range(30))
 
 
-def test_cb1_sparse_body_average_triggers_reestimation() -> None:
-    """Sparse body text between candidates triggers CB1 re-estimation.
-
-    Candidate density stays under the cap, but the average CJK-weighted body
-    characters between adjacent headings falls below 200.
-    """
-    records = []
-    for i in range(4):
-        records.append(_para(f"密集标题{i}", size=16.0))
-        records += _body(2, size=12.0)  # normal-length body...
-        records[-1] = _para("短", size=12.0)  # ...but keep gaps tiny
-        records[-2] = _para("句", size=12.0)
-    records += _body(60, size=12.0)  # tail body keeps density low
-    indices = list(range(len(records)))
-    fs = document_fs_base(records, indices)
-    assert fs.confidence_high
-
-    warnings: dict = {}
-    result = gate_with_cb1(
-        records,
-        indices,
-        fs_base=fs,
-        warnings=warnings,
-        strong_body=_stub_strong_body,
-        numbering_veto=_stub_no_veto,
-        caption_veto=_stub_no_caption,
-    )
-    assert warnings.get("smart_cb1_reestimated") == 1
-    assert result.cb1_reestimated
-
-
-def test_cb1_long_inter_heading_body_does_not_trigger() -> None:
-    """A2 control: healthy documents (long body between headings) never
-    trip the sparse-body trigger; the first-pass result is returned."""
-    records = []
-    for i in range(4):
-        records.append(_para(f"正常标题{i}", size=16.0))
-        records += _body(3, size=12.0)  # ~90 CJK chars ≈ 270 weighted per gap
-    records += _body(40, size=12.0)
-    indices = list(range(len(records)))
-    fs = document_fs_base(records, indices)
-
-    result = gate_with_cb1(
-        records,
-        indices,
-        fs_base=fs,
-        warnings={},
-        strong_body=_stub_strong_body,
-        numbering_veto=_stub_no_veto,
-        caption_veto=_stub_no_caption,
-    )
-    assert not result.cb1_reestimated
-    assert all(f"正常标题{i}" in _texts(result) for i in range(4))
+def _cb1_sparse_or_long_records(*, sparse: bool) -> list[ParagraphRecord]:
+    records: list[ParagraphRecord] = []
+    if sparse:
+        for i in range(4):
+            records.append(_para(f"密集标题{i}", size=16.0))
+            records += [_para("句", size=12.0), _para("短", size=12.0)]
+        records += _body(60, size=12.0)
+    else:
+        for i in range(4):
+            records.append(_para(f"正常标题{i}", size=16.0))
+            records += _body(3, size=12.0)
+        records += _body(40, size=12.0)
+    return records
 
 
 def _cb1_baseline_density_records() -> list:
     """4 headings (16pt) with long body gaps → 44.4% candidate density but the
     mean inter-heading spacing stays well over 200 weighted chars (no
-    sparse-body trip). Layout: H B B H B B H B H → 4 headings / 9 paras = 0.444.
-
-    The 0.444 density is chosen to straddle the 0.40 floor: with a low baseline
-    the threshold is the 0.40 floor (trips), while a 0.35 baseline lifts the
-    threshold to 0.45 (spared) — see the two tests below."""
+    sparse-body trip). Layout: H B B H B B H B H → 4 headings / 9 paras = 0.444."""
     long_body = "这是一段刻意写长的正文内容，用来把相邻标题之间的正文字符数撑到二百加权字符以上，从而避开稀疏正文触发条件的判定。"
-    gaps = (2, 2, 1)  # body paras after headings 0,1,2 (last heading has none)
+    gaps = (2, 2, 1)
     records: list = []
     for i in range(4):
         records.append(_para(f"标题第{i}节", size=16.0))
@@ -1748,52 +1647,94 @@ def _cb1_baseline_density_records() -> list:
     return records
 
 
-def test_cb1_threshold_is_baseline_aware() -> None:
-    """The density ceiling is max(floor 0.40, baseline_density + 0.10). A
-    richly-outlined sub-document (high baseline) tolerates a candidate density
-    the flat floor would reject, so CB1 does NOT trip and every heading is
-    kept."""
-    records = _cb1_baseline_density_records()
+@pytest.mark.parametrize(
+    "case_id,builder,baseline_density,min_inter_env,expect_reestimated,expected_headings",
+    [
+        pytest.param(
+            "sparse_body_triggers",
+            lambda: _cb1_sparse_or_long_records(sparse=True),
+            None,
+            None,
+            True,
+            (),
+            id="sparse_body_triggers",
+        ),
+        pytest.param(
+            "long_inter_heading_body_spared",
+            lambda: _cb1_sparse_or_long_records(sparse=False),
+            None,
+            None,
+            False,
+            tuple(f"正常标题{i}" for i in range(4)),
+            id="long_inter_heading_body_spared",
+        ),
+        pytest.param(
+            "min_inter_heading_chars_env_override",
+            lambda: _cb1_sparse_or_long_records(sparse=False),
+            None,
+            "400",
+            True,
+            (),
+            id="min_inter_heading_chars_env_override",
+        ),
+        pytest.param(
+            "baseline_aware_high_baseline_spared",
+            _cb1_baseline_density_records,
+            0.35,
+            None,
+            False,
+            tuple(f"标题第{i}节" for i in range(4)),
+            id="baseline_aware_high_baseline_spared",
+        ),
+        pytest.param(
+            "baseline_aware_low_baseline_trips",
+            _cb1_baseline_density_records,
+            0.0,
+            None,
+            True,
+            (),
+            id="baseline_aware_low_baseline_trips",
+        ),
+    ],
+)
+def test_cb1_reestimation_threshold_cases(
+    monkeypatch,
+    case_id: str,
+    builder,
+    baseline_density: float | None,
+    min_inter_env: str | None,
+    expect_reestimated: bool,
+    expected_headings: tuple[str, ...],
+) -> None:
+    """CB1 re-estimation thresholds: sparse inter-heading spacing, env override
+    of MIN_INTER_HEADING_CHARS, and baseline-aware density ceiling."""
+    if min_inter_env is not None:
+        monkeypatch.setenv("DOCX_SMART_MIN_INTER_HEADING_CHARS", min_inter_env)
+
+    records = builder()
     indices = list(range(len(records)))
     fs = document_fs_base(records, indices)
     assert fs.confidence_high
 
-    # baseline outline density 0.35 → threshold max(0.40, 0.45) = 0.45;
-    # the 44.4% candidate density sits under it.
-    result = gate_with_cb1(
-        records,
-        indices,
-        fs_base=fs,
-        baseline_density=0.35,
-        warnings={},
-        strong_body=_stub_strong_body,
-        numbering_veto=_stub_no_veto,
-        caption_veto=_stub_no_caption,
-    )
-    assert not result.cb1_reestimated
-    assert all(f"标题第{i}节" in _texts(result) for i in range(4))
-
-
-def test_cb1_low_baseline_still_trips_same_density() -> None:
-    """Control for baseline-awareness: the SAME 44.4% candidate density, but a
-    low baseline (threshold falls back to the 0.40 floor), trips CB1."""
-    records = _cb1_baseline_density_records()
-    indices = list(range(len(records)))
-    fs = document_fs_base(records, indices)
-
     warnings: dict = {}
+    kw = {}
+    if baseline_density is not None:
+        kw["baseline_density"] = baseline_density
     result = gate_with_cb1(
         records,
         indices,
         fs_base=fs,
-        baseline_density=0.0,
         warnings=warnings,
         strong_body=_stub_strong_body,
         numbering_veto=_stub_no_veto,
         caption_veto=_stub_no_caption,
+        **kw,
     )
-    assert result.cb1_reestimated
-    assert warnings.get("smart_cb1_reestimated") == 1
+    assert result.cb1_reestimated is expect_reestimated
+    if expect_reestimated:
+        assert warnings.get("smart_cb1_reestimated") == 1
+    for heading in expected_headings:
+        assert heading in _texts(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1910,36 +1851,6 @@ def test_cb1_body_in_disguise_still_demoted_after_ceiling_raise() -> None:
     )
 
 
-def test_min_inter_heading_chars_env_override(monkeypatch) -> None:
-    """DOCX_SMART_MIN_INTER_HEADING_CHARS tunes the sparse-body trigger: a
-    document whose inter-heading spacing clears the default 200 trips
-    re-estimation once the floor is raised above that spacing."""
-    records: list = []
-    for i in range(4):
-        records.append(_para(f"正常标题{i}", size=16.0))
-        records += _body(3, size=12.0)  # ~250 weighted chars between headings
-    records += _body(40, size=12.0)  # tail body keeps density low
-    indices = list(range(len(records)))
-    fs = document_fs_base(records, indices)
-
-    def _run():
-        return gate_with_cb1(
-            records,
-            indices,
-            fs_base=fs,
-            warnings={},
-            strong_body=_stub_strong_body,
-            numbering_veto=_stub_no_veto,
-            caption_veto=_stub_no_caption,
-        )
-
-    # Default 200: the gaps are wide enough → not sparse, no re-estimation.
-    assert not _run().cb1_reestimated
-    # Raise the floor above the gap width → the same doc now reads as sparse.
-    monkeypatch.setenv("DOCX_SMART_MIN_INTER_HEADING_CHARS", "400")
-    assert _run().cb1_reestimated
-
-
 def test_caption_veto_spares_outline_paragraphs() -> None:
     """A5 (P3 × I2): an outline paragraph hitting the caption blacklist keeps
     its candidacy (silently dropping it would trip the I2 machine check);
@@ -1971,59 +1882,66 @@ def test_llm_body_veto_revokes_candidacy() -> None:
     assert "被判为正文的大字号行" not in _texts(vetoed)
 
 
-def test_llm_grant_carries_no_admission_force() -> None:
-    """An LLM heading vote is audit-only (the test9 regression: a
-    right-aligned running-header line the LLM named a heading became a
-    level-2 ghost): a granted base-size line with no normal signal stays
-    body and is recorded in ``grant_rejected``, output-neutral."""
-    records = _body(30)
-    records.append(_para("GB/T 9704—2012", size=12.0, alignment="right"))
+@pytest.mark.parametrize(
+    "case_id,target,veto_fn,expect_admitted_rule,expected_rejected_marks",
+    [
+        pytest.param(
+            "no_admission_force",
+            _para("GB/T 9704—2012", size=12.0, alignment="right"),
+            None,
+            None,
+            ("llm_grant_rejected",),
+            id="no_admission_force",
+        ),
+        pytest.param(
+            "does_not_block_normal_admission",
+            _para("真正的大字号标题", size=16.0),
+            None,
+            "size_strong",
+            (),
+            id="does_not_block_normal_admission",
+        ),
+        pytest.param(
+            "rejected_with_numbering_veto_single_ledger_row",
+            _para("一、被撤销编号且被点名的行", size=12.0),
+            lambda _c, _t: "homophone_stub",
+            None,
+            ("homophone_stub", "numbering_veto_suppressed", "llm_grant_rejected"),
+            id="rejected_with_numbering_veto_single_ledger_row",
+        ),
+    ],
+)
+def test_llm_grant_gate_cases(
+    case_id: str,
+    target: ParagraphRecord,
+    veto_fn,
+    expect_admitted_rule: str | None,
+    expected_rejected_marks: tuple[str, ...],
+) -> None:
+    """LLM heading grants are audit-only: they neither admit on their own nor
+    block normal admission, and combine into one ledger row with numbering veto."""
+    records = _body(30) + [target]
     idx = len(records) - 1
+    gate_kw = {"llm_heading_grants": {idx}}
+    if veto_fn is not None:
+        gate_kw["numbering_veto"] = veto_fn
 
-    result = _gate(records, llm_heading_grants={idx})
-    assert "GB/T 9704—2012" not in _texts(result)
+    result = _gate(records, **gate_kw)
+    if expect_admitted_rule is not None:
+        d = next(x for x in result.decisions if x.record_index == idx)
+        assert d.rule_trail[0] == expect_admitted_rule
+        assert result.grant_rejected == []
+        return
+
+    assert target.text not in _texts(result)
+    assert result.veto_suppressed == []
     assert [d.record_index for d in result.grant_rejected] == [idx]
     rej = result.grant_rejected[0]
     assert rej.is_heading is False
     assert rej.level is None
-    assert rej.use_raw_text is False  # output-neutral ledger row
-    assert "llm_grant_rejected" in rej.rule_trail
-
-
-def test_llm_grant_does_not_block_normal_admission() -> None:
-    """A granted paragraph that passes a normal rule is admitted under that
-    rule (the grant neither helps nor hinders) and is not 'rejected'."""
-    records = _body(30)
-    records.append(_para("真正的大字号标题", size=16.0))
-    idx = len(records) - 1
-
-    result = _gate(records, llm_heading_grants={idx})
-    d = next(x for x in result.decisions if x.record_index == idx)
-    assert d.rule_trail[0] == "size_strong"
-    assert result.grant_rejected == []
-
-
-def test_llm_grant_rejected_with_numbering_veto_single_ledger_row() -> None:
-    """A granted paragraph whose numbering was ALSO homophone-vetoed leaves
-    ONE ledger decision carrying both marks (a second row would be dropped
-    by the caller's setdefault merge), in ``grant_rejected`` — not doubled
-    into ``veto_suppressed``."""
-    records = _body(30)
-    records.append(_para("一、被撤销编号且被点名的行", size=12.0))
-    idx = len(records) - 1
-
-    result = _gate(
-        records,
-        llm_heading_grants={idx},
-        numbering_veto=lambda _c, _t: "homophone_stub",
-    )
-    assert "一、被撤销编号且被点名的行" not in _texts(result)
-    assert result.veto_suppressed == []
-    assert [d.record_index for d in result.grant_rejected] == [idx]
-    trail = result.grant_rejected[0].rule_trail
-    assert "homophone_stub" in trail
-    assert "numbering_veto_suppressed" in trail
-    assert "llm_grant_rejected" in trail
+    assert rej.use_raw_text is False
+    for mark in expected_rejected_marks:
+        assert mark in rej.rule_trail
 
 
 def test_llm_grant_rejected_end_to_end_audit(monkeypatch) -> None:
@@ -2523,7 +2441,7 @@ def test_audit_decision_fields_enriched(monkeypatch) -> None:
     assert heading_row["sub_fs_base"] == 12.0  # the sub-document body baseline
 
 
-def test_run_logs_physical_feature_summary(monkeypatch, caplog) -> None:
+def test_run_logs_physical_feature_summary(monkeypatch, lightrag_caplog) -> None:
     """Requirement 1: a document-level info line (FS_base, paragraph count,
     outline histogram) fires once physical features are extracted."""
     from lightrag.parser.docx.smart_heading.heading_flow import run_smart_heading
@@ -2532,7 +2450,7 @@ def test_run_logs_physical_feature_summary(monkeypatch, caplog) -> None:
     records = [_para("第一章 绪论", size=16.0, outline_level=0)]
     records += _body(30, size=12.0)
 
-    with caplog.at_level(logging.INFO, logger="lightrag"):
+    with lightrag_caplog.at_level(logging.INFO, logger="lightrag"):
         run_smart_heading(
             records,
             llm_judge=None,
@@ -2543,7 +2461,7 @@ def test_run_logs_physical_feature_summary(monkeypatch, caplog) -> None:
         )
 
     summary = next(
-        (m for m in _log_messages(caplog) if "physical features:" in m), None
+        (m for m in _log_messages(lightrag_caplog) if "physical features:" in m), None
     )
     assert summary is not None
     assert "FS_base=12.0pt" in summary
@@ -2693,30 +2611,59 @@ def test_title_block_empty_members_defense() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cb1_strong_body_lookahead_keeps_cnnum_headings(caplog) -> None:
-    """A flat, same-size 公文 whose body is ``CnParentNum`` "(一)…。" clauses
-    floods raw density (all numbered candidates at one size), but projecting the
-    downstream strong-body + CB2 series propagation drops it back under the bar.
-    CB1 must withhold the trip WITHOUT re-estimating, so the genuine same-size
-    ``CnNum`` headings survive the normal demotion sweep instead of being wiped
-    out by the blanket "same-size composite off" re-gate."""
-    clause = "加强组织领导，落实工作责任，明确任务分工，确保各项措施落地见效。"
+@pytest.mark.parametrize(
+    "case_id,second_heading,clause_texts,check_logs",
+    [
+        pytest.param(
+            "all_strong_clauses",
+            "二、主要任务",
+            (
+                "加强组织领导，落实工作责任，明确任务分工，确保各项措施落地见效。",
+                "加强组织领导，落实工作责任，明确任务分工，确保各项措施落地见效。",
+                "加强组织领导，落实工作责任，明确任务分工，确保各项措施落地见效。",
+            ),
+            True,
+            id="all_strong_clauses",
+        ),
+        pytest.param(
+            "partial_series_propagation",
+            "二、保障措施",
+            (
+                "加强组织领导，落实工作责任，明确任务分工，确保各项措施落地见效。",
+                "完善制度机制，强化监督问责，明确任务分工，压实各方责任",
+                "完善制度机制，强化监督问责，明确任务分工，压实各方责任",
+            ),
+            False,
+            id="partial_series_propagation",
+        ),
+    ],
+)
+def test_cb1_strong_body_lookahead_cases(
+    lightrag_caplog,
+    case_id: str,
+    second_heading: str,
+    clause_texts: tuple[str, str, str],
+    check_logs: bool,
+) -> None:
+    """CB1 look-ahead evaluates density after strong-body + CB2 series
+    propagation, sparing the trip without re-estimation so same-size CnNum
+    headings survive the downstream sweep."""
     records = [
         _para("一、总体要求"),
-        _para(f"（一）{clause}"),
-        _para(f"（二）{clause}"),
-        _para(f"（三）{clause}"),
-        _para("二、主要任务"),
-        _para(f"（四）{clause}"),
-        _para(f"（五）{clause}"),
-        _para(f"（六）{clause}"),
+        _para(f"（一）{clause_texts[0]}"),
+        _para(f"（二）{clause_texts[1]}"),
+        _para(f"（三）{clause_texts[2]}"),
+        _para(second_heading),
+        _para(f"（四）{clause_texts[0]}"),
+        _para(f"（五）{clause_texts[1]}"),
+        _para(f"（六）{clause_texts[2]}"),
     ]
     indices = list(range(len(records)))
     fs = document_fs_base(records, indices)
     assert fs.size_pt == 12.0 and fs.confidence_high
 
     warnings: dict = {}
-    with caplog.at_level(logging.INFO, logger="lightrag"):
+    with lightrag_caplog.at_level(logging.INFO, logger="lightrag"):
         gate = gate_with_cb1(
             records,
             indices,
@@ -2726,65 +2673,22 @@ def test_cb1_strong_body_lookahead_keeps_cnnum_headings(caplog) -> None:
             numbering_veto=_stub_no_veto,
             caption_veto=_stub_no_caption,
         )
-    # Look-ahead spared the trip WITHOUT re-estimation or a fallback.
     assert warnings.get("smart_cb1_strong_body_recovered") == 1
     assert gate.cb1_strong_body_recovered
     assert not gate.cb1_reestimated and not gate.cb1_tripped
-    regate = next(r for r in caplog.records if "not tripping" in r.getMessage())
-    assert regate.levelno == logging.INFO
-    assert not any("re-estimated FS_base" in m for m in _log_messages(caplog))
-
-    # gate_with_cb1 defers the real demotion — run the downstream sweep exactly
-    # as run_smart_heading does; the CnParentNum body collapses, the CnNum
-    # headings remain.
-    ds = gate.decisions
-    assign_levels_by_size(ds)
-    demote_strong_body_headings(ds, strong_body=_stub_strong_body, warnings=warnings)
-    assert {d.text for d in ds if d.is_heading} == {"一、总体要求", "二、主要任务"}
-
-
-def test_cb1_lookahead_propagates_demotion_across_partial_series(caplog) -> None:
-    """CB2 propagation inside the look-ahead: only one member of each
-    ``CnParentNum`` series is sentence-like, but a 33% hit share (≥ the 20%
-    body ratio, no physical outline) propagates the body demotion to the whole
-    series — so the projected density still falls under threshold and CB1 is
-    spared, keeping the ``CnNum`` headings."""
-    sentence = "加强组织领导，落实工作责任，明确任务分工，确保各项措施落地见效。"
-    phrase = (
-        "完善制度机制，强化监督问责，明确任务分工，压实各方责任"  # no 。, < 60 chars
-    )
-    records = [
-        _para("一、总体要求"),
-        _para(f"（一）{sentence}"),  # sentence-like -> individual hit
-        _para(f"（二）{phrase}"),  # not an individual hit
-        _para(f"（三）{phrase}"),  # not an individual hit
-        _para("二、保障措施"),
-        _para(f"（四）{sentence}"),  # sentence-like -> individual hit
-        _para(f"（五）{phrase}"),
-        _para(f"（六）{phrase}"),
-    ]
-    indices = list(range(len(records)))
-    fs = document_fs_base(records, indices)
-
-    warnings: dict = {}
-    with caplog.at_level(logging.INFO, logger="lightrag"):
-        gate = gate_with_cb1(
-            records,
-            indices,
-            fs_base=fs,
-            warnings=warnings,
-            strong_body=_stub_strong_body,
-            numbering_veto=_stub_no_veto,
-            caption_veto=_stub_no_caption,
+    if check_logs:
+        regate = next(
+            r for r in lightrag_caplog.records if "not tripping" in r.getMessage()
         )
-    assert gate.cb1_strong_body_recovered
-    assert not gate.cb1_reestimated and not gate.cb1_tripped
+        assert regate.levelno == logging.INFO
+        assert not any(
+            "re-estimated FS_base" in m for m in _log_messages(lightrag_caplog)
+        )
 
     ds = gate.decisions
     assign_levels_by_size(ds)
     demote_strong_body_headings(ds, strong_body=_stub_strong_body, warnings=warnings)
-    # Whole CnParentNum series demoted via propagation, not just the two hits.
-    assert {d.text for d in ds if d.is_heading} == {"一、总体要求", "二、保障措施"}
+    assert {d.text for d in ds if d.is_heading} == {"一、总体要求", second_heading}
 
 
 # ---------------------------------------------------------------------------
@@ -2812,32 +2716,56 @@ def test_early_strong_body_keys_covers_only_chapter_classes() -> None:
     assert EN_CLAUSE not in EARLY_STRONG_BODY_KEYS
 
 
-def test_body_clause_series_demoted_via_post_merge_sweep() -> None:
-    """Regression (test8 应急管理部令第11号): a mostly-body 第X条 series is
-    demoted as a WHOLE by the post-merge CB2 sweep — including short colon-lead
-    survivors (第六/八条) that trip no strong-body rule on their own.
-
-    Must enter from the gate, NOT hand-built decisions: the bug is that CnClause
-    was strong-body-demoted at RECOGNITION (per-paragraph, no propagation), so
-    the body clauses left the candidate list before the sweep and could not act
-    as the CB2 hits that drag the survivors down. With CnClause early (buggy)
-    ``result.decisions`` keeps only the two colon survivors → no hits → they
-    leak as headings; with CnClause deferred (fixed) all clauses stay → the
-    。-ending ones are hits → CB2 (hit share 60% ≥ 20%, no outline) demotes the
-    whole series. This test is RED on the pre-fix code and GREEN after.
-    """
-    sentence = (
-        "为了加强安全生产领域信用体系建设，规范严重失信主体名单管理，依法制定本办法。"
-    )
-    survivor_six = "第六条  下列单位及其人员应当列入严重失信主体名单："
-    survivor_eight = "第八条  应急管理部门可以采取下列管理措施："
-    records = _body(20) + [
-        _para(f"第一条  {sentence}"),  # 。-ending → individual hit
-        _para(f"第二条  {sentence}"),  # 。-ending → individual hit
-        _para(f"第三条  {sentence}"),  # 。-ending → individual hit
-        _para(survivor_six),  # colon, < 60 chars → NOT an individual hit
-        _para(survivor_eight),  # colon, < 60 chars → NOT an individual hit
-    ]
+@pytest.mark.parametrize(
+    "case_id,clauses,expected_headings,demoted_survivors",
+    [
+        pytest.param(
+            "cn_clause_mostly_body",
+            [
+                "第一条  为了加强安全生产领域信用体系建设，规范严重失信主体名单管理，依法制定本办法。",
+                "第二条  为了加强安全生产领域信用体系建设，规范严重失信主体名单管理，依法制定本办法。",
+                "第三条  为了加强安全生产领域信用体系建设，规范严重失信主体名单管理，依法制定本办法。",
+                "第六条  下列单位及其人员应当列入严重失信主体名单：",
+                "第八条  应急管理部门可以采取下列管理措施：",
+            ],
+            set(),
+            (
+                "第六条  下列单位及其人员应当列入严重失信主体名单：",
+                "第八条  应急管理部门可以采取下列管理措施：",
+            ),
+            id="cn_clause_mostly_body",
+        ),
+        pytest.param(
+            "cn_clause_short_bare_survive",
+            ["第一条", "第二条", "第三条", "第四条"],
+            {"第一条", "第二条", "第三条", "第四条"},
+            (),
+            id="cn_clause_short_bare_survive",
+        ),
+        pytest.param(
+            "en_clause_mostly_body",
+            [
+                "Article 1  This article establishes the comprehensive requirements and the detailed obligations applicable to all covered entities herein.",
+                "Article 2  This article establishes the comprehensive requirements and the detailed obligations applicable to all covered entities herein.",
+                "Article 3  This article establishes the comprehensive requirements and the detailed obligations applicable to all covered entities herein.",
+                "Article 5  introduces the following measures:",
+            ],
+            set(),
+            ("Article 5  introduces the following measures:",),
+            id="en_clause_mostly_body",
+        ),
+    ],
+)
+def test_clause_series_post_merge_sweep_cases(
+    case_id: str,
+    clauses: list[str],
+    expected_headings: set[str],
+    demoted_survivors: tuple[str, ...],
+) -> None:
+    """Deferred CnClause/EnClause series demote as a whole via CB2 when mostly
+    body (dragging short colon-lead survivors down), while bare short clause
+    headings with zero hits survive intact."""
+    records = _body(20) + [_para(t) for t in clauses]
     warnings: dict = {}
     result = _gate(records, warnings=warnings)
     ds = result.decisions
@@ -2845,58 +2773,9 @@ def test_body_clause_series_demoted_via_post_merge_sweep() -> None:
     demote_strong_body_headings(ds, strong_body=_stub_strong_body, warnings=warnings)
 
     by_text = {d.text: d for d in ds}
-    # The colon survivors are exactly what leaked pre-fix; CB2 must demote them.
-    assert by_text[survivor_six].is_heading is False
-    assert by_text[survivor_eight].is_heading is False
-    # No 第X条 survives as a heading at all.
-    assert not any(d.is_heading and "条" in d.text for d in ds)
-
-
-def test_short_bare_clause_series_survive_as_headings() -> None:
-    """Guard against over-demotion: a 第X条 series whose every member is a short
-    bare heading (no strong-body feature) has zero hits, so CB2 never
-    propagates and all survive. Passes both before and after the fix — the
-    safety net for the deferral change (cf. e2e regulation clauses)."""
-    records = _body(20) + [
-        _para("第一条"),
-        _para("第二条"),
-        _para("第三条"),
-        _para("第四条"),
-    ]
-    result = _gate(records)
-    ds = result.decisions
-    assign_levels_by_size(ds)
-    demote_strong_body_headings(ds, strong_body=_stub_strong_body, warnings={})
-    assert {d.text for d in ds if d.is_heading} == {
-        "第一条",
-        "第二条",
-        "第三条",
-        "第四条",
-    }
-
-
-def test_body_article_series_demoted_via_post_merge_sweep() -> None:
-    """EnClause parity with CnClause: a mostly-body ``Article`` series demotes
-    as a whole, dragging a short colon-lead survivor down. Uses ``Article``
-    (not ``Section``/``Sec`` — those classify as EnChapter, which stays early)."""
-    long_en = (
-        "This article establishes the comprehensive requirements and the "
-        "detailed obligations applicable to all covered entities herein."
-    )  # > 60 chars → _stub length hit
-    survivor = "Article 5  introduces the following measures:"  # colon, < 60
-    records = _body(20) + [
-        _para(f"Article 1  {long_en}"),
-        _para(f"Article 2  {long_en}"),
-        _para(f"Article 3  {long_en}"),
-        _para(survivor),
-    ]
-    result = _gate(records)
-    ds = result.decisions
-    assign_levels_by_size(ds)
-    demote_strong_body_headings(ds, strong_body=_stub_strong_body, warnings={})
-    by_text = {d.text: d for d in ds}
-    assert by_text[survivor].is_heading is False
-    assert not any(d.is_heading and d.text.startswith("Article") for d in ds)
+    for survivor in demoted_survivors:
+        assert by_text[survivor].is_heading is False
+    assert {d.text for d in ds if d.is_heading} == expected_headings
 
 
 # ---------------------------------------------------------------------------
@@ -2908,12 +2787,26 @@ def test_body_article_series_demoted_via_post_merge_sweep() -> None:
 # CJK sentence terminator (string check), so no spaCy models are needed.
 
 
-def test_imprint_candidate_demoted_at_recognition() -> None:
-    """An imprint line admitted by a size rule is demoted at recognition time
-    (unnumbered → check_now always applies) with the imprint rule id."""
+@pytest.mark.parametrize(
+    "case_id,para_kwargs,expect_raw_text,check_i2",
+    [
+        pytest.param("size_channel", {"size": 16.0}, False, False, id="size_channel"),
+        pytest.param(
+            "outline_channel",
+            {"size": 12.0, "outline_level": 1},
+            True,
+            True,
+            id="outline_channel",
+        ),
+    ],
+)
+def test_imprint_gate_demotion_cases(
+    case_id: str, para_kwargs: dict, expect_raw_text: bool, check_i2: bool
+) -> None:
+    """Imprint lines demote at recognition time; outline ones keep I2 retention."""
     from lightrag.parser.docx.smart_heading import guardrails
 
-    records = _body(20) + [_para("抄送：各区人民政府", size=16.0)]
+    records = _body(20) + [_para("抄送：各区人民政府", **para_kwargs)]
     warnings: dict = {}
     result = _gate(
         records, strong_body=guardrails.strong_body_reason, warnings=warnings
@@ -2921,23 +2814,13 @@ def test_imprint_candidate_demoted_at_recognition() -> None:
     assert "抄送：各区人民政府" not in _texts(result)
     assert len(result.demoted) == 1
     dem = result.demoted[0]
+    assert dem.is_heading is False
     assert dem.rule_trail == ["imprint_marker", "strong_body_demoted"]
-    assert dem.use_raw_text is False  # never a baseline heading: output-neutral
+    assert dem.use_raw_text is expect_raw_text
     assert warnings["smart_strong_body_demotions"] == 1
-
-
-def test_imprint_outline_demotion_passes_i2() -> None:
-    """An OUTLINE imprint line demotes with use_raw_text and an I2-recognized
-    rule trail, so the retention check stays green."""
-    from lightrag.parser.docx.smart_heading import guardrails
-
-    records = _body(20) + [_para("抄送：各区人民政府", size=12.0, outline_level=1)]
-    result = _gate(records, strong_body=guardrails.strong_body_reason)
-    assert len(result.demoted) == 1
-    dem = result.demoted[0]
-    assert dem.is_heading is False and dem.use_raw_text is True
-    merged = list(result.decisions) + result.demoted
-    assert guardrails.verify_baseline_heading_retention(records, merged) == []
+    if check_i2:
+        merged = list(result.decisions) + result.demoted
+        assert guardrails.verify_baseline_heading_retention(records, merged) == []
 
 
 def test_postmerge_sweep_demotes_imprint_heading() -> None:
@@ -3017,14 +2900,29 @@ def test_cb4_short_subdoc_fallback_wires_imprint(monkeypatch) -> None:
     assert warnings["smart_strong_body_demotions"] == 1
 
 
-def test_whole_doc_cb4_skip_leaves_imprint_to_baseline(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "tail_records",
+    [
+        pytest.param(
+            [_para("抄送：各成员单位", size=12.0, outline_level=1)],
+            id="imprint_line",
+        ),
+        pytest.param(
+            [
+                _para("抄送：各区", size=12.0),
+                _para("某某办公室 2026年 印发", size=12.0, outline_level=1),
+            ],
+            id="imprint_region",
+        ),
+    ],
+)
+def test_below_whole_doc_cb4_gate_returns_none(monkeypatch, tail_records) -> None:
     """Guarantee boundary: below the whole-document CB4 gate smart never runs
-    (returns None) — the imprint rules do NOT reach the untouched baseline
-    output, by design."""
+    (returns None) — imprint line and region rules never reach baseline output."""
     from lightrag.parser.docx.smart_heading.heading_flow import run_smart_heading
 
     monkeypatch.setenv("DOCX_SMART_MIN_TOKENS", "1000000")
-    records = _body(5) + [_para("抄送：各成员单位", size=12.0, outline_level=1)]
+    records = _body(5) + list(tail_records)
     result = run_smart_heading(
         records,
         llm_judge=None,
@@ -3042,11 +2940,17 @@ def test_whole_doc_cb4_skip_leaves_imprint_to_baseline(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_imprint_region_demoted_when_multi_line_title_block_follows(
-    monkeypatch,
-) -> None:
-    """A later multi-paragraph cover remains valid evidence for a 公文汇编
-    boundary, so the preceding 抄送…印发 region is force-demoted as before."""
+@pytest.mark.parametrize(
+    "mode",
+    [
+        pytest.param("multi_line_cover", id="multi_line_cover"),
+        pytest.param("single_line_cover", id="single_line_cover"),
+        pytest.param("no_following_title_block", id="no_following_title_block"),
+    ],
+)
+def test_imprint_region_conditional_demotion_cases(monkeypatch, mode: str) -> None:
+    """版记 region demotes when followed by a confirmed cover (multi-line or
+    imprint-anchored single-line), and stays veto-only without a following cover."""
     import json
 
     from lightrag.parser.docx.smart_heading.guardrails import (
@@ -3057,13 +2961,21 @@ def test_imprint_region_demoted_when_multi_line_title_block_follows(
     monkeypatch.setenv("DOCX_SMART_MIN_TOKENS", "10")
     doc1 = _body(20)
     region = [
-        _para("抄送：各区人民政府", size=12.0),  # anchor (body)
-        _para("中间说明行不带大纲", size=12.0),  # middle (plain body)
-        _para("某某办公室 2026年6月30日 印发", size=12.0, outline_level=1),  # closer
-        ParagraphRecord(kind="empty_para"),
-        _para("数字政府建设白皮书", size=18.0, page_break_before=True),  # doc2 cover
-        _para("（2026年版）", size=12.0),  # makes the cover a multi-window
+        _para("抄送：各区人民政府", size=12.0),
+        _para("中间说明行不带大纲", size=12.0),
+        _para("某某办公室 2026年6月30日 印发", size=12.0, outline_level=1),
     ]
+    if mode == "multi_line_cover":
+        region += [
+            ParagraphRecord(kind="empty_para"),
+            _para("数字政府建设白皮书", size=18.0, page_break_before=True),
+            _para("（2026年版）", size=12.0),
+        ]
+    elif mode == "single_line_cover":
+        region += [
+            ParagraphRecord(kind="empty_para"),
+            _para("数字政府建设白皮书", size=18.0, page_break_before=True),
+        ]
     records = doc1 + region + _body(20)
     closer_idx = len(doc1) + 2
     cover_idx = len(doc1) + 4
@@ -3077,76 +2989,23 @@ def test_imprint_region_demoted_when_multi_line_title_block_follows(
     warnings: dict = {}
     result = run_smart_heading(
         records,
-        llm_judge=_llm,
+        llm_judge=None if mode == "no_following_title_block" else _llm,
         warnings=warnings,
         strong_body=_stub_strong_body,
         numbering_veto=_stub_no_veto,
         caption_veto=_stub_no_caption,
     )
     assert result is not None
-    assert result.decisions[cover_idx].is_title_block  # doc2 cover confirmed
-    # The TRAILING 印发 outline line — invisible to the strong_body stub — is
-    # force-demoted to body because the title block immediately follows.
-    dem = result.decisions[closer_idx]
-    assert dem.is_heading is False and dem.use_raw_text is True
-    assert dem.rule_trail[-2:] == ["imprint_region", "strong_body_demoted"]
-    assert warnings["smart_imprint_region_demotions"] == 1
-    assert (
-        verify_baseline_heading_retention(records, list(result.decisions.values()))
-        == []
-    )
+    if mode == "no_following_title_block":
+        assert result.decisions[closer_idx].is_heading is True
+        assert "smart_imprint_region_demotions" not in warnings
+        return
 
-
-def test_imprint_region_demoted_for_later_single_line_cover(monkeypatch) -> None:
-    """用户裁决翻转（原 test_imprint_region_not_demoted_for_later_single_line）：
-    版记收尾是强文档边界信号，其后的单行大字号标题（版记吸收中间的换页/
-    空段）经 ``imprint_single`` 通道成为候选；LLM 判真 → title block 确认、
-    版记区域按 §版记 条件降级——:1806 多行封面链路的单行镜像。无版记的
-    "换页+单行"仍不成候选（title_block 层 B8 测试承接原负面语义）。"""
-    import json
-
-    from lightrag.parser.docx.smart_heading.guardrails import (
-        verify_baseline_heading_retention,
-    )
-    from lightrag.parser.docx.smart_heading.heading_flow import run_smart_heading
-
-    monkeypatch.setenv("DOCX_SMART_MIN_TOKENS", "10")
-    doc1 = _body(20)
-    records = (
-        doc1
-        + [
-            _para("抄送：各区人民政府", size=12.0),
-            _para("中间说明行不带大纲", size=12.0),
-            _para("某某办公室 2026年6月30日 印发", size=12.0, outline_level=1),
-            ParagraphRecord(kind="empty_para"),
-            _para("数字政府建设白皮书", size=18.0, page_break_before=True),
-        ]
-        + _body(20)
-    )
-    closer_idx = len(doc1) + 2
-    cover_idx = len(doc1) + 4
-
-    def _llm(prompt: str, *, system_prompt: str | None = None) -> str:
-        return json.dumps(
-            {"is_title_block": True, "main_title": "数字政府建设白皮书"},
-            ensure_ascii=False,
-        )
-
-    warnings: dict = {}
-    result = run_smart_heading(
-        records,
-        llm_judge=_llm,
-        warnings=warnings,
-        strong_body=_stub_strong_body,
-        numbering_veto=_stub_no_veto,
-        caption_veto=_stub_no_caption,
-    )
-    assert result is not None
     d_cover = result.decisions[cover_idx]
-    assert d_cover.is_title_block and d_cover.level == 0
-    assert "title_block:imprint_single" in d_cover.rule_trail
-    # The trailing 印发 outline line is force-demoted: the confirmed title
-    # block immediately follows the region (the 公文汇编 boundary).
+    assert d_cover.is_title_block
+    if mode == "single_line_cover":
+        assert d_cover.level == 0
+        assert "title_block:imprint_single" in d_cover.rule_trail
     dem = result.decisions[closer_idx]
     assert dem.is_heading is False and dem.use_raw_text is True
     assert dem.rule_trail[-2:] == ["imprint_region", "strong_body_demoted"]
@@ -3155,59 +3014,6 @@ def test_imprint_region_demoted_for_later_single_line_cover(monkeypatch) -> None
         verify_baseline_heading_retention(records, list(result.decisions.values()))
         == []
     )
-
-
-def test_imprint_region_veto_only_without_following_title_block(monkeypatch) -> None:
-    """No valid title block after the 印发 closer → the region is NOT confirmed:
-    veto-only, the outline lines are kept as headings (never force-demoted)."""
-    from lightrag.parser.docx.smart_heading.heading_flow import run_smart_heading
-
-    monkeypatch.setenv("DOCX_SMART_MIN_TOKENS", "10")
-    doc1 = _body(20)
-    records = (
-        doc1
-        + [
-            _para("抄送：各区人民政府", size=12.0),
-            _para("中间说明行不带大纲", size=12.0),
-            _para("某某办公室 2026年6月30日 印发", size=12.0, outline_level=1),
-        ]
-        + _body(20)
-    )
-    closer_idx = len(doc1) + 2
-
-    warnings: dict = {}
-    result = run_smart_heading(
-        records,
-        llm_judge=None,  # nothing to confirm a following title block
-        warnings=warnings,
-        strong_body=_stub_strong_body,
-        numbering_veto=_stub_no_veto,
-        caption_veto=_stub_no_caption,
-    )
-    assert result is not None
-    assert result.decisions[closer_idx].is_heading is True
-    assert "smart_imprint_region_demotions" not in warnings
-
-
-def test_imprint_region_below_cb4_gate_untouched(monkeypatch) -> None:
-    """Guarantee boundary: below the whole-document CB4 gate run_smart_heading
-    returns None — the region / closer rules never reach the baseline output."""
-    from lightrag.parser.docx.smart_heading.heading_flow import run_smart_heading
-
-    monkeypatch.setenv("DOCX_SMART_MIN_TOKENS", "1000000")
-    records = _body(5) + [
-        _para("抄送：各区", size=12.0),
-        _para("某某办公室 2026年 印发", size=12.0, outline_level=1),
-    ]
-    result = run_smart_heading(
-        records,
-        llm_judge=None,
-        warnings={},
-        strong_body=_stub_strong_body,
-        numbering_veto=_stub_no_veto,
-        caption_veto=_stub_no_caption,
-    )
-    assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -3426,138 +3232,153 @@ def _leveled(
     anchored: bool = False,
 ) -> HeadingDecision:
     """A surviving post-leveling decision (numbering derived from text)."""
-    return HeadingDecision(
-        record_index=idx,
-        text=text,
-        is_heading=True,
-        level=level,
-        font_size_pt=12.0,
-        numbering=None if plain else classify_numbering(text),
-        outline_level=outline,
+    return _make_decision(
+        text,
+        level,
+        idx=idx,
+        size=12.0,
+        numbered=not plain,
+        outline=outline,
         anchored=anchored or outline is not None,
         is_title_block=title_block,
     )
 
 
-def test_gap_close_test7_shape() -> None:
-    """The test7-专利说明书 shape: an EnNum claims series occupied the class
-    slot (L2) then got demoted wholesale — sections must lift 3 → 2."""
+@pytest.mark.parametrize(
+    ("ds_factory", "expected_levels", "moved_indices"),
+    [
+        pytest.param(
+            # test7-专利说明书 shape: sections lift 3 -> 2 over vacated L2.
+            lambda: [
+                _leveled(0, "一种层级感知的文档语义分块方法及系统", 1, plain=True),
+                _leveled(1, "技术领域", 3, plain=True),
+                _leveled(2, "背景技术", 3, plain=True),
+            ],
+            [1, 2, 2],
+            (1, 2),
+            id="test7-vacated-class-slot",
+        ),
+        pytest.param(
+            # Deliberate MLN raw-level gap (2 -> 4): pinned, trailing plain stays.
+            lambda: [
+                _leveled(0, "总标题", 1, plain=True),
+                _leveled(1, "1.1 概述", 2),
+                _leveled(2, "1.1.1.1 深层小节", 4),
+                _leveled(3, "普通小节", 5, plain=True),
+            ],
+            [1, 2, 4, 5],
+            (),
+            id="preserves-mln-deliberate-gaps",
+        ),
+        pytest.param(
+            # Cascading movable levels re-pack consecutively (1/3/4 -> 1/2/3).
+            lambda: [
+                _leveled(0, "主标题", 1, plain=True),
+                _leveled(1, "加粗章", 3, plain=True),
+                _leveled(2, "加粗节", 4, plain=True),
+            ],
+            [1, 2, 3],
+            (1, 2),
+            id="cascading-gaps",
+        ),
+        pytest.param(
+            # Gap between two pinned numbered levels stays untouched.
+            lambda: [
+                _leveled(0, "第一章 总则", 1),
+                _leveled(1, "（一）分项", 3),
+                _leveled(2, "加粗小节", 4, plain=True),
+            ],
+            [1, 3, 4],
+            (),
+            id="numbered-numbered-gap-out-of-scope",
+        ),
+        pytest.param(
+            # Mixed level (numbered + unnumbered at L3) is conservatively pinned.
+            lambda: [
+                _leveled(0, "主标题", 1, plain=True),
+                _leveled(1, "一、编号章", 3),
+                _leveled(2, "加粗章", 3, plain=True),
+            ],
+            [1, 3, 3],
+            (),
+            id="mixed-level-pinned",
+        ),
+        pytest.param(
+            # Outline-bearing is pinned; round-2 anchored plain heading still lifts.
+            lambda: [
+                _leveled(0, "样式标题", 1, outline=0),
+                _leveled(1, "加粗小节", 4, plain=True, anchored=True),
+            ],
+            [1, 2],
+            (1,),
+            id="outline-pinned-round2-anchored-movable",
+        ),
+        pytest.param(
+            # Title-block root stays pinned even off a vacated shallower level.
+            lambda: [
+                _leveled(0, "封面主标题", 2, plain=True, title_block=True),
+                _leveled(1, "加粗章", 4, plain=True),
+            ],
+            [2, 3],
+            (1,),
+            id="title-block-pinned",
+        ),
+    ],
+)
+def test_close_unnumbered_level_gaps_cases(
+    ds_factory, expected_levels: list[int], moved_indices: tuple[int, ...]
+) -> None:
+    ds = ds_factory()
     warnings: dict = {}
-    ds = [
-        _leveled(0, "一种层级感知的文档语义分块方法及系统", 1, plain=True),
-        _leveled(1, "技术领域", 3, plain=True),
-        _leveled(2, "背景技术", 3, plain=True),
-    ]
     close_unnumbered_level_gaps(ds, warnings=warnings)
-    assert [d.level for d in ds] == [1, 2, 2]
-    assert "unnumbered_gap_closed" in ds[1].rule_trail
-    assert "unnumbered_gap_closed" in ds[2].rule_trail
-    # Unmoved levels leave no note; the counter matches moved headings only.
-    assert "unnumbered_gap_closed" not in ds[0].rule_trail
-    assert warnings["smart_unnumbered_gap_closed"] == 2
+    assert [d.level for d in ds] == expected_levels
+    for idx, d in enumerate(ds):
+        if idx in moved_indices:
+            assert "unnumbered_gap_closed" in d.rule_trail
+        else:
+            assert "unnumbered_gap_closed" not in d.rule_trail
+    if moved_indices:
+        assert warnings["smart_unnumbered_gap_closed"] == len(moved_indices)
+    else:
+        assert "smart_unnumbered_gap_closed" not in warnings
 
 
-def test_gap_close_preserves_mln_deliberate_gaps() -> None:
-    """MultiLevelNum raw-level gaps are the author's choice: pinned levels
-    keep their values and the trailing unnumbered heading stays put."""
-    ds = [
-        _leveled(0, "总标题", 1, plain=True),
-        _leveled(1, "1.1 概述", 2),
-        _leveled(2, "1.1.1.1 深层小节", 4),  # deliberate gap at 3
-        _leveled(3, "普通小节", 5, plain=True),
-    ]
+@pytest.mark.parametrize(
+    ("ds_factory", "after_gap_close", "after_nest_child_level"),
+    [
+        pytest.param(
+            # Child at L2 <= lifted parent (4 -> 3): nest lands on corrected 3+1=4.
+            lambda: [
+                _leveled(0, "主标题", 1, plain=True),
+                _leveled(1, "加粗章", 4, plain=True),
+                _leveled(2, "1. 子项", 2),
+            ],
+            [1, 3, 2],
+            4,
+            id="child-lands-on-corrected-parent",
+        ),
+        pytest.param(
+            # Child at L4 > lifted parent (3 -> 2): nest is one-directional, stays 4.
+            lambda: [
+                _leveled(0, "主标题", 1, plain=True),
+                _leveled(1, "加粗章", 3, plain=True),
+                _leveled(2, "1. 子项", 4),
+            ],
+            [1, 2, 4],
+            4,
+            id="deeper-child-keeps-documented-gap",
+        ),
+    ],
+)
+def test_gap_close_then_nest_interactions(
+    ds_factory, after_gap_close: list[int], after_nest_child_level: int
+) -> None:
+    ds = ds_factory()
     close_unnumbered_level_gaps(ds)
-    assert [d.level for d in ds] == [1, 2, 4, 5]
-    assert all("unnumbered_gap_closed" not in d.rule_trail for d in ds)
-
-
-def test_gap_close_cascading_gaps() -> None:
-    """Several movable levels re-pack consecutively (1/3/4 → 1/2/3)."""
-    ds = [
-        _leveled(0, "主标题", 1, plain=True),
-        _leveled(1, "加粗章", 3, plain=True),
-        _leveled(2, "加粗节", 4, plain=True),
-    ]
-    close_unnumbered_level_gaps(ds)
-    assert [d.level for d in ds] == [1, 2, 3]
-
-
-def test_gap_close_numbered_numbered_gap_out_of_scope() -> None:
-    """A gap BETWEEN two pinned numbered levels is out of scope: numbered
-    levels never move (series equality), so the gap stays."""
-    ds = [
-        _leveled(0, "第一章 总则", 1),
-        _leveled(1, "（一）分项", 3),  # gap at 2 between numbered classes
-        _leveled(2, "加粗小节", 4, plain=True),
-    ]
-    close_unnumbered_level_gaps(ds)
-    assert [d.level for d in ds] == [1, 3, 4]
-
-
-def test_gap_close_mixed_level_is_pinned() -> None:
-    """A level holding both a numbered and an unnumbered heading is
-    conservatively pinned — moving only the unnumbered half would split it."""
-    ds = [
-        _leveled(0, "主标题", 1, plain=True),
-        _leveled(1, "一、编号章", 3),
-        _leveled(2, "加粗章", 3, plain=True),  # same level as the numbered one
-    ]
-    close_unnumbered_level_gaps(ds)
-    assert [d.level for d in ds] == [1, 3, 3]
-
-
-def test_gap_close_outline_pinned_round2_anchored_still_movable() -> None:
-    """Physical-outline headings are pinned via ``outline_level`` — but a
-    plain heading that anchoring round 2 flagged ``anchored=True`` (mere
-    bookkeeping, not an outline lock) must still be movable."""
-    ds = [
-        _leveled(0, "样式标题", 1, outline=0),
-        _leveled(1, "加粗小节", 4, plain=True, anchored=True),
-    ]
-    close_unnumbered_level_gaps(ds)
-    assert ds[0].level == 1  # outline pinned
-    assert ds[1].level == 2  # round-2 anchored plain heading still lifts
-
-
-def test_gap_close_title_block_is_pinned() -> None:
-    """A title-block root never moves, even off a vacated shallower level."""
-    ds = [
-        _leveled(0, "封面主标题", 2, plain=True, title_block=True),
-        _leveled(1, "加粗章", 4, plain=True),
-    ]
-    close_unnumbered_level_gaps(ds)
-    assert [d.level for d in ds] == [2, 3]
-
-
-def test_gap_close_then_nest_child_lands_on_corrected_parent() -> None:
-    """Nest interaction (a): a numbered child nest WILL move (child level ≤
-    parent level) lands on the parent's corrected level, not the stale one."""
-    ds = [
-        _leveled(0, "主标题", 1, plain=True),
-        _leveled(1, "加粗章", 4, plain=True),  # stranded deep by a demoted class
-        _leveled(2, "1. 子项", 2),  # EnNum class slot above the section
-    ]
-    close_unnumbered_level_gaps(ds)
-    assert [d.level for d in ds] == [1, 3, 2]  # section lifted 4 → 3
+    assert [d.level for d in ds] == after_gap_close
     nest_numbered_under_parent(ds)
-    assert ds[2].level == 4  # corrected parent (3) + 1, not stale 4 + 1
-
-
-def test_gap_close_then_nest_deeper_child_keeps_documented_gap() -> None:
-    """Nest interaction (b), the documented scope boundary: nest is
-    one-directional (``d.level > parent.level`` skips), so a child already
-    deeper than its lifted parent keeps its level — the numeric gap stays,
-    heading ORDER (child strictly deeper) and series equality hold."""
-    ds = [
-        _leveled(0, "主标题", 1, plain=True),
-        _leveled(1, "加粗章", 3, plain=True),
-        _leveled(2, "1. 子项", 4),
-    ]
-    close_unnumbered_level_gaps(ds)
-    assert [d.level for d in ds] == [1, 2, 4]  # gap between parent and child
-    nest_numbered_under_parent(ds)
-    assert ds[2].level == 4  # nest never pulls a deeper child up
-    assert ds[2].level > ds[1].level  # order invariant holds
+    assert ds[2].level == after_nest_child_level
+    assert ds[2].level > ds[1].level
 
 
 def test_gap_close_end_to_end_bold_sections_reach_level_2(monkeypatch) -> None:
@@ -3613,7 +3434,6 @@ def test_gap_close_end_to_end_bold_sections_reach_level_2(monkeypatch) -> None:
         assert d.is_heading, records[i].text
         assert d.level == 2, (records[i].text, d.level, d.rule_trail)
         assert "unnumbered_gap_closed" in d.rule_trail
-    # The claims series is body (demoted by the post-merge sweep).
     for i in range(1, 9):
         d = result.decisions.get(i)
         assert d is None or not d.is_heading
@@ -3622,145 +3442,131 @@ def test_gap_close_end_to_end_bold_sections_reach_level_2(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 # Zero-visible-char placeholder paragraphs (pure <drawing>/<object>/<equation>)
 # ---------------------------------------------------------------------------
-# Production records for placeholder-only paragraphs carry
-# ``visible_char_count == 0`` (placeholder markup never enters run_features).
-# Manually built test records MUST set it explicitly: the default None makes
-# ``_record_weight`` fall back to ``len(text.strip())`` and the placeholder
-# tag text would count as visible characters.
 
 
-def test_zero_weight_placeholder_not_size_promoted() -> None:
-    """The test11 offender: a 14pt drawing-only paragraph over FS_base=12
-    must not take size_strong — its size is synthesized style metadata, not
-    measured text."""
-    records = _body(20) + [
-        _para('<drawing id="1" path="x.emf" />', size=14.0, visible_char_count=0)
-    ]
-    result = _gate(records)
-    assert result.decisions == []
+@pytest.mark.parametrize(
+    ("tail_records", "expected_texts"),
+    [
+        pytest.param(
+            # 14pt drawing-only paragraph over FS_base=12 must not take size_strong.
+            [_para('<drawing id="1" path="x.emf" />', size=14.0, visible_char_count=0)],
+            [],
+            id="not-size-promoted",
+        ),
+        pytest.param(
+            # Pure-OMML paragraph (size=None, centered, 0 visible chars) never candidate.
+            [
+                _para(
+                    "<equation>E=mc^2</equation>",
+                    size=None,
+                    alignment="center",
+                    visible_char_count=0,
+                )
+            ],
+            [],
+            id="pure-equation-never-candidate",
+        ),
+        pytest.param(
+            # Placeholder at fs+0.5 does not act as a weak-pair companion.
+            [
+                _para("候选标题甲", size=12.5),
+                _para('<drawing id="1" />', size=12.5, visible_char_count=0),
+            ],
+            [],
+            id="not-weak-pair-companion",
+        ),
+        pytest.param(
+            # Auto-numbered image line does not lend the second numbering-series vote.
+            [
+                _para("3.1 真实编号标题", size=12.0),
+                _para('3.2 <drawing id="1" />', size=12.0, visible_char_count=0),
+            ],
+            [],
+            id="not-numbering-series-companion",
+        ),
+        pytest.param(
+            # Centered placeholder between centered titles is transparent in run.
+            [
+                _para("居中标题一", size=12.0, alignment="center"),
+                _para(
+                    '<drawing id="1" />',
+                    size=12.0,
+                    alignment="center",
+                    visible_char_count=0,
+                ),
+                _para("居中标题二", size=12.0, alignment="center"),
+                _para("居中标题三", size=12.0, alignment="center"),
+            ],
+            ["居中标题一", "居中标题二", "居中标题三"],
+            id="transparent-in-centered-run",
+        ),
+    ],
+)
+def test_zero_weight_placeholder_gate_channels(
+    tail_records: list[ParagraphRecord], expected_texts: list[str]
+) -> None:
+    result = _gate(_body(20) + tail_records)
+    assert _texts(result) == expected_texts
     assert result.demoted == []
     assert result.veto_suppressed == []
 
 
-def test_pure_equation_paragraph_never_candidate() -> None:
-    """Invariant pin: a pure-OMML paragraph (no w-namespace runs → size=None,
-    zero visible chars) is never a candidate on any channel."""
-    records = _body(20) + [
-        _para(
-            "<equation>E=mc^2</equation>",
-            size=None,
-            alignment="center",
-            visible_char_count=0,
-        )
-    ]
-    result = _gate(records)
-    assert result.decisions == []
-    assert result.demoted == []
-
-
-def test_zero_weight_not_weak_companion() -> None:
-    """A placeholder at fs+0.5 is no weak-pair companion: the lone real
-    12.5pt line must NOT be admitted via weak_pair on the placeholder's
-    synthesized-size second vote."""
-    records = _body(20) + [
-        _para("候选标题甲", size=12.5),
-        _para('<drawing id="1" />', size=12.5, visible_char_count=0),
-    ]
-    result = _gate(records)
-    assert "候选标题甲" not in _texts(result)
-
-
-def test_zero_weight_placeholder_not_numbering_series_companion() -> None:
-    """An auto-numbered image line must not lend the second series vote: the
-    lone real numbered line stays a singleton (no base_series admission)."""
-    records = _body(20) + [
-        _para("3.1 真实编号标题", size=12.0),
-        _para('3.2 <drawing id="1" />', size=12.0, visible_char_count=0),
-    ]
-    result = _gate(records)
-    assert "3.1 真实编号标题" not in _texts(result)
-    assert "3.2 " not in " ".join(_texts(result))
-
-
-def test_zero_weight_placeholder_transparent_in_centered_run() -> None:
-    """A decorative centered placeholder between centered title lines is
-    TRANSPARENT: it neither joins the centered run (which would push a
-    3-line cluster over the anti-poetry cap) nor breaks it."""
-    records = _body(20) + [
-        _para("居中标题一", size=12.0, alignment="center"),
-        _para(
-            '<drawing id="1" />', size=12.0, alignment="center", visible_char_count=0
-        ),
-        _para("居中标题二", size=12.0, alignment="center"),
-        _para("居中标题三", size=12.0, alignment="center"),
-    ]
-    result = _gate(records)
-    texts = _texts(result)
-    for t in ("居中标题一", "居中标题二", "居中标题三"):
-        assert t in texts, t
-    assert '<drawing id="1" />' not in texts
-
-
-def test_outline_zero_weight_placeholder_demoted() -> None:
-    """User ruling: an author-styled (outlineLvl) placeholder paragraph is
-    NOT a heading either — it takes an explicit I2 demotion decision, and the
-    retention check accepts the ``placeholder_demoted`` tag."""
+@pytest.mark.parametrize("path", ["gate", "outline_only_fallback"])
+def test_zero_weight_outline_placeholder_demotion(lightrag_caplog, path: str) -> None:
+    """An outline-bearing zero-weight placeholder takes an explicit I2 demotion
+    in both the normal gate and the CB4/CB1 outline-only fallback."""
     from lightrag.parser.docx.smart_heading.guardrails import (
         verify_baseline_heading_retention,
     )
-
-    records = _body(20) + [
-        _para('<drawing id="1" />', size=14.0, outline_level=0, visible_char_count=0)
-    ]
-    result = _gate(records)
-    assert result.decisions == []
-    assert len(result.demoted) == 1
-    dem = result.demoted[0]
-    assert dem.is_heading is False
-    assert dem.use_raw_text is True
-    assert "placeholder_demoted" in dem.rule_trail
-    assert "zero_visible_chars" in dem.rule_trail
-    merged = list(result.decisions) + result.demoted
-    assert verify_baseline_heading_retention(records, merged) == []
-
-
-def test_outline_only_fallback_demotes_placeholder(caplog) -> None:
-    """The CB4/CB1 fallback path (_outline_only_decisions) demotes a
-    zero-weight outline paragraph instead of reverting it to a heading, and
-    counts + logs exactly once (it is a terminal path)."""
     from lightrag.parser.docx.smart_heading.heading_flow import (
         _outline_only_decisions,
     )
 
-    records = _body(5) + [
-        _para("正常大纲标题", size=12.0, outline_level=0),
-        _para('<drawing id="1" />', size=12.0, outline_level=0, visible_char_count=0),
-    ]
-    warnings: dict = {}
-    with caplog.at_level(logging.WARNING, logger="lightrag"):
-        out = _outline_only_decisions(records, range(len(records)), warnings=warnings)
-    by_idx = {d.record_index: d for d in out}
-    real = by_idx[len(records) - 2]
-    assert real.is_heading and "subdoc_fallback_outline_only" in real.rule_trail
-    dem = by_idx[len(records) - 1]
-    assert dem.is_heading is False
-    assert dem.use_raw_text is True
-    assert "placeholder_demoted" in dem.rule_trail
-    assert warnings["smart_placeholder_demotions"] == 1
-    logs = [m for m in _log_messages(caplog) if "placeholder" in m]
-    assert len(logs) == 1
+    if path == "gate":
+        records = _body(20) + [
+            _para(
+                '<drawing id="1" />', size=14.0, outline_level=0, visible_char_count=0
+            )
+        ]
+        result = _gate(records)
+        assert result.decisions == []
+        assert len(result.demoted) == 1
+        dem = result.demoted[0]
+        assert dem.is_heading is False and dem.use_raw_text is True
+        assert "placeholder_demoted" in dem.rule_trail
+        assert "zero_visible_chars" in dem.rule_trail
+        merged = list(result.decisions) + result.demoted
+        assert verify_baseline_heading_retention(records, merged) == []
+    else:
+        records = _body(5) + [
+            _para("正常大纲标题", size=12.0, outline_level=0),
+            _para(
+                '<drawing id="1" />', size=12.0, outline_level=0, visible_char_count=0
+            ),
+        ]
+        warnings: dict = {}
+        with lightrag_caplog.at_level(logging.WARNING, logger="lightrag"):
+            out = _outline_only_decisions(
+                records, range(len(records)), warnings=warnings
+            )
+        by_idx = {d.record_index: d for d in out}
+        real = by_idx[len(records) - 2]
+        assert real.is_heading and "subdoc_fallback_outline_only" in real.rule_trail
+        dem = by_idx[len(records) - 1]
+        assert dem.is_heading is False and dem.use_raw_text is True
+        assert "placeholder_demoted" in dem.rule_trail
+        assert warnings["smart_placeholder_demotions"] == 1
+        assert (
+            len([m for m in _log_messages(lightrag_caplog) if "placeholder" in m]) == 1
+        )
 
 
 @pytest.mark.parametrize("cb1_terminal", ["converged", "tripped"])
 def test_placeholder_demotion_counted_once_across_cb1(
-    monkeypatch, caplog, cb1_terminal
+    monkeypatch, lightrag_caplog, cb1_terminal
 ) -> None:
     """``smart_placeholder_demotions`` counts at the FINAL adoption point
-    only: CB1 runs gate_candidates twice with the same warnings dict, and an
-    eager in-gate count would double. Both CB1 terminal states — (i) the
-    re-estimated second pass is adopted, (ii) the breaker trips and the
-    sub-document falls back to _outline_only_decisions — must count the one
-    outline placeholder exactly once and emit exactly one I2 log line."""
+    only across both CB1 terminal states (re-estimated converged vs tripped)."""
     import json
 
     from lightrag.parser.docx.smart_heading.heading_flow import run_smart_heading
@@ -3768,13 +3574,9 @@ def test_placeholder_demotion_counted_once_across_cb1(
     monkeypatch.setenv("DOCX_SMART_MIN_TOKENS", "10")
 
     if cb1_terminal == "converged":
-        # 30 bare 12pt lines over a 10.5pt body: CB1 re-estimates FS_base to
-        # 12 and the second pass converges (test_cb1_reestimation shape).
         records = _body(60, size=10.5)
         records += [_para(f"伪标题短语{i}", size=12.0) for i in range(30)]
     else:
-        # Question-bank shape: density stays over the bar after re-estimation
-        # → the breaker trips and the sub-document falls back.
         records = []
         for i in range(40):
             records.append(_para(f"{i + 1}. 选择题题干第{i}题", size=12.0))
@@ -3788,7 +3590,7 @@ def test_placeholder_demotion_counted_once_across_cb1(
         return json.dumps({"is_title_block": False}, ensure_ascii=False)
 
     warnings: dict = {}
-    with caplog.at_level(logging.WARNING, logger="lightrag"):
+    with lightrag_caplog.at_level(logging.WARNING, logger="lightrag"):
         result = run_smart_heading(
             records,
             llm_judge=_llm,
@@ -3798,10 +3600,6 @@ def test_placeholder_demotion_counted_once_across_cb1(
             caption_veto=_stub_no_caption,
         )
     assert result is not None
-    # Pin the ACTUAL terminal state: a future drift in the fixture shapes
-    # that stops reaching the target branch must fail loudly, not pass
-    # vacuously. Both states prove CB1 re-estimated (two gate passes ran —
-    # the double-count premise); they differ in the adoption path.
     sub_docs = result.audit["sub_documents"]
     assert any("cb1_reestimated_fs" in s for s in sub_docs)
     if cb1_terminal == "tripped":
@@ -3813,20 +3611,16 @@ def test_placeholder_demotion_counted_once_across_cb1(
     assert dem.is_heading is False
     assert "placeholder_demoted" in dem.rule_trail
     i2_logs = [
-        m for m in _log_messages(caplog) if "zero-visible-char outline paragraph" in m
+        m
+        for m in _log_messages(lightrag_caplog)
+        if "zero-visible-char outline paragraph" in m
     ]
     assert len(i2_logs) == 1
 
 
 def test_zero_weight_llm_grant_leaves_rejected_ledger() -> None:
-    """LLM audit contract for zero-weight paragraphs: a granted placeholder
-    line must land in ``grant_rejected`` (not vanish silently), and the
-    final-adoption merge counts it once and inserts the ledger row.
-
-    Layered on purpose: a pure-drawing line cannot obtain a grant through
-    the full run_smart_heading — the title-block window strips drawing tags
-    (no semantic text → not in the LLM index_map) — so the grant is injected
-    at the gate layer and the merge layer is exercised directly."""
+    """A granted placeholder line lands in ``grant_rejected`` and the
+    final-adoption merge counts it once and inserts the ledger row."""
     from lightrag.parser.docx.smart_heading.heading_flow import _merge_ledger_only
 
     records = _body(20) + [_para('<drawing id="1" />', size=14.0, visible_char_count=0)]
@@ -4105,54 +3899,36 @@ def _assert_four_way(doc_heading, blocks, meta) -> None:
     assert child["parent_headings"][0] == doc_heading
 
 
-def test_merged_doc_title_weighted_truncation_four_way(monkeypatch) -> None:
-    """A merged CJK doc title over the default weighted cap truncates with '...'
-    and the same value lands at all four sites."""
-    from lightrag.constants import DEFAULT_DOCX_SMART_HEADING_MAX_CHARS
+@pytest.mark.parametrize(
+    ("cap_env", "main", "sub", "check_raw_ceiling"),
+    [
+        pytest.param(
+            "default", "标" * 60, "案" * 30, False, id="merged-weighted-truncation"
+        ),
+        pytest.param("300", "x" * 130, "y" * 130, True, id="raw-ceiling-above-cap"),
+        pytest.param("default", "则" * 70, None, False, id="main-only-long-title"),
+    ],
+)
+def test_merged_doc_title_truncation_four_way(
+    monkeypatch, cap_env: str, main: str, sub: str | None, check_raw_ceiling: bool
+) -> None:
+    """Merged and main-only long doc titles truncate identically across all
+    four landing sites (H1, doc_title, first_heading, child parent_headings)."""
+    from lightrag.constants import (
+        DEFAULT_DOCX_SMART_HEADING_MAX_CHARS,
+        MAX_HEADING_LENGTH,
+    )
     from lightrag.parser.docx.smart_heading.guardrails import weighted_char_length
 
-    doc_heading, blocks, meta = _assemble_bounded_title(
-        monkeypatch,
-        str(DEFAULT_DOCX_SMART_HEADING_MAX_CHARS),
-        "标" * 60,  # weighted 180
-        "案" * 30,  # merged weighted 180 + 2 + 90 = 272 -> truncated
+    env_val = (
+        str(DEFAULT_DOCX_SMART_HEADING_MAX_CHARS) if cap_env == "default" else cap_env
     )
+    doc_heading, blocks, meta = _assemble_bounded_title(monkeypatch, env_val, main, sub)
     assert doc_heading.endswith("...")
-    assert weighted_char_length(doc_heading) <= DEFAULT_DOCX_SMART_HEADING_MAX_CHARS
-    _assert_four_way(doc_heading, blocks, meta)
-
-
-def test_merged_doc_title_raw_ceiling_above_cap_four_way(monkeypatch) -> None:
-    """Even with the env cap set above 200, a long ASCII title is bounded by the
-    raw MAX_HEADING_LENGTH ceiling so the H1 truncate_heading stays a no-op and
-    the four sites never split (the pre-fix bug)."""
-    from lightrag.constants import MAX_HEADING_LENGTH
-
-    doc_heading, blocks, meta = _assemble_bounded_title(
-        monkeypatch,
-        "300",
-        "x" * 130,
-        "y" * 130,  # merged 262 raw ASCII
-    )
-    assert len(doc_heading) == MAX_HEADING_LENGTH
-    assert doc_heading.endswith("...")
-    _assert_four_way(doc_heading, blocks, meta)
-
-
-def test_main_only_long_doc_title_truncated_four_way(monkeypatch) -> None:
-    """Unified handling (user ruling): a concatenated main_title with no sub is
-    bounded the same way, and stays consistent across the four sites."""
-    from lightrag.constants import DEFAULT_DOCX_SMART_HEADING_MAX_CHARS
-    from lightrag.parser.docx.smart_heading.guardrails import weighted_char_length
-
-    doc_heading, blocks, meta = _assemble_bounded_title(
-        monkeypatch,
-        str(DEFAULT_DOCX_SMART_HEADING_MAX_CHARS),
-        "则" * 70,  # weighted 210 > 180, no sub
-        None,
-    )
-    assert doc_heading.endswith("...")
-    assert weighted_char_length(doc_heading) <= DEFAULT_DOCX_SMART_HEADING_MAX_CHARS
+    if check_raw_ceiling:
+        assert len(doc_heading) == MAX_HEADING_LENGTH
+    else:
+        assert weighted_char_length(doc_heading) <= DEFAULT_DOCX_SMART_HEADING_MAX_CHARS
     _assert_four_way(doc_heading, blocks, meta)
 
 
