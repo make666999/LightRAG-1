@@ -202,7 +202,9 @@ async def test_node_merge_entity_type_vote(stored_type, new_types, expected):
         for i, entity_type in enumerate(new_types, start=1)
     ]
 
-    await _merge_nodes_then_upsert("ALICE", nodes_data, graph, None, make_merge_config())
+    await _merge_nodes_then_upsert(
+        "ALICE", nodes_data, graph, None, make_merge_config()
+    )
 
     assert graph.nodes["ALICE"]["entity_type"] == expected
 

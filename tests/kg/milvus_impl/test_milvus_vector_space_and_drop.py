@@ -78,7 +78,12 @@ def fake_milvus(collections=None, fields=None):
 
 
 def _storage(
-    client, *, model: str | None = "model-b", dim: int = 768, workspace="a", namespace="chunks"
+    client,
+    *,
+    model: str | None = "model-b",
+    dim: int = 768,
+    workspace="a",
+    namespace="chunks",
 ) -> MilvusVectorDBStorage:
     storage = MilvusVectorDBStorage(
         namespace=namespace,
@@ -140,7 +145,11 @@ class TestMilvusVectorSpaceRefusal:
             pytest.param(
                 {
                     "fields": [
-                        {"name": "vector", "type": "FloatVector", "params": {"dim": 1536}}
+                        {
+                            "name": "vector",
+                            "type": "FloatVector",
+                            "params": {"dim": 1536},
+                        }
                     ]
                 },
                 None,

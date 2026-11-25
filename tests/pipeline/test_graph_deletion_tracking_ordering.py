@@ -153,16 +153,12 @@ class _TargetAdapter:
 
     def vdb(self, fixture: _Fixture):
         return (
-            fixture.entities_vdb
-            if self.kind == "entity"
-            else fixture.relationships_vdb
+            fixture.entities_vdb if self.kind == "entity" else fixture.relationships_vdb
         )
 
     def primary_store(self, fixture: _Fixture):
         return (
-            fixture.entity_chunks
-            if self.kind == "entity"
-            else fixture.relation_chunks
+            fixture.entity_chunks if self.kind == "entity" else fixture.relation_chunks
         )
 
     def owned_rows(self, fixture: _Fixture) -> list[tuple[object, str]]:

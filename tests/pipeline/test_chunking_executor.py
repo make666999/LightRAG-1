@@ -574,9 +574,7 @@ async def test_a_poisoned_snapshot_is_bounded_at_process_time(tmp_path, monkeypa
             file_paths="poisoned.txt",
             track_id="track-poisoned",
             process_options="R",
-            chunk_options={
-                "recursive_character": {"separators": POISONED_SEPARATORS}
-            },
+            chunk_options={"recursive_character": {"separators": POISONED_SEPARATORS}},
         )
         row = await rag.full_docs.get_by_id("doc-poisoned-snapshot")
         stored = row["chunk_options"]["recursive_character"]["separators"]
@@ -605,9 +603,7 @@ async def test_replaying_a_poisoned_snapshot_costs_a_bounded_number_of_encodes(
             file_paths="poisoned-cost.txt",
             track_id="track-poisoned-cost",
             process_options="R",
-            chunk_options={
-                "recursive_character": {"separators": POISONED_SEPARATORS}
-            },
+            chunk_options={"recursive_character": {"separators": POISONED_SEPARATORS}},
         )
         before = tokenizer_impl.encodes
         await rag.apipeline_process_enqueue_documents()

@@ -952,8 +952,12 @@ def _repeat(prefix: str, unit: str, suffix: str) -> Callable[[int], str]:
     ("build_line", "small_n", "large_n", "paren_max_chars", "verify_unchanged"),
     [
         # Parenthesis matching for malformed candidates (small window = 64).
-        pytest.param(_repeat("", "![](a(", ""), 1_024, 8_192, 64, False, id="paren-open"),
-        pytest.param(_repeat("", "![](a)", ""), 1_024, 8_192, 64, False, id="paren-close"),
+        pytest.param(
+            _repeat("", "![](a(", ""), 1_024, 8_192, 64, False, id="paren-open"
+        ),
+        pytest.param(
+            _repeat("", "![](a)", ""), 1_024, 8_192, 64, False, id="paren-close"
+        ),
         pytest.param(
             _repeat("", "![](a(b)", ""), 1_024, 8_192, 64, False, id="paren-nested"
         ),
@@ -1015,7 +1019,12 @@ def _repeat(prefix: str, unit: str, suffix: str) -> Callable[[int], str]:
         ),
         # Code span and escape checks.
         pytest.param(
-            _repeat("![x](a.png) ", "`a", ""), 1_024, 8_192, None, False, id="code-closed"
+            _repeat("![x](a.png) ", "`a", ""),
+            1_024,
+            8_192,
+            None,
+            False,
+            id="code-closed",
         ),
         pytest.param(
             _repeat("![x](a.png) ", "``a`", ""),

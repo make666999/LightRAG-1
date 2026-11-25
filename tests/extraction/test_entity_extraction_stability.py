@@ -1211,7 +1211,13 @@ def test_heading_formatter_per_level_char_cap(formatter_name: str, disable_cap: 
         ),
         pytest.param(
             "format_parent_headings",
-            {"heading": {"level": 2, "heading": "Leaf", "parent_headings": ["h1", "h2"]}},
+            {
+                "heading": {
+                    "level": 2,
+                    "heading": "Leaf",
+                    "parent_headings": ["h1", "h2"],
+                }
+            },
             "h1 → h2",
             None,
             id="parent_headings_excludes_leaf",
@@ -1264,7 +1270,9 @@ class _FakeChunksDB:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("deep_path", [True, False], ids=["deep_collapsed", "short_intact"])
+@pytest.mark.parametrize(
+    "deep_path", [True, False], ids=["deep_collapsed", "short_intact"]
+)
 async def test_attach_content_headings_budgeting(deep_path: bool):
     from lightrag.chunk_schema import HEADING_BREADCRUMB_SEP
     from lightrag.constants import DEFAULT_MAX_SECTION_CONTEXT_TOKENS
@@ -1274,7 +1282,15 @@ async def test_attach_content_headings_budgeting(deep_path: bool):
     parents = [f"Level{i:02d}" for i in range(100)] if deep_path else ["h1", "h2"]
     level = 99 if deep_path else 2
     db = _FakeChunksDB(
-        {"c1": {"heading": {"level": level, "heading": "Leaf", "parent_headings": parents}}},
+        {
+            "c1": {
+                "heading": {
+                    "level": level,
+                    "heading": "Leaf",
+                    "parent_headings": parents,
+                }
+            }
+        },
         tok,
     )
     chunks = [{"chunk_id": "c1"}]
@@ -1400,7 +1416,9 @@ async def test_extract_entities_bounds_pathological_heading_in_prompt():
         pytest.param("a\x00b\u200bc\ufeff", "abc", id="nul_zwsp_bom"),
         pytest.param("x\x07y", "xy", id="bel"),
         pytest.param("p\x1c\x1fq", "pq", id="file_unit_separators"),
-        pytest.param("方法 → 数据采集 (2024)!", "方法 数据采集 (2024)!", id="cjk_and_arrow"),
+        pytest.param(
+            "方法 → 数据采集 (2024)!", "方法 数据采集 (2024)!", id="cjk_and_arrow"
+        ),
         pytest.param("数据采集", "数据采集", id="adjacent_cjk"),
         pytest.param("a\nb\tc", "a b c", id="newline_tab_collapse"),
         pytest.param("a \x00 b", "a b", id="control_between_spaces"),

@@ -76,9 +76,7 @@ def _make_storage(
         global_config["vector_db_storage_cls_kwargs"] = {
             "cosine_better_than_threshold": 0.5
         }
-        embedding_func = EmbeddingFunc(
-            embedding_dim=8, max_token_size=512, func=_embed
-        )
+        embedding_func = EmbeddingFunc(embedding_dim=8, max_token_size=512, func=_embed)
     return NetworkXStorage(
         namespace=namespace,
         workspace="ws",

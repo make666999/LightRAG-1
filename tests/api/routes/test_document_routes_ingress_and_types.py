@@ -101,9 +101,7 @@ def _make_texts_limit_client(monkeypatch, limit):
     app = FastAPI()
     app.state.background_tasks = set()
     app.include_router(
-        create_document_routes(
-            _TextsLimitRag(), SimpleNamespace(), api_key="test-key"
-        )
+        create_document_routes(_TextsLimitRag(), SimpleNamespace(), api_key="test-key")
     )
     return TestClient(app), calls
 
@@ -308,7 +306,9 @@ def supported_types_client(tmp_path, monkeypatch):
 
 
 def test_default_deployment_contract(supported_types_client):
-    resp = supported_types_client.get("/documents/supported_file_types", headers=_HEADERS)
+    resp = supported_types_client.get(
+        "/documents/supported_file_types", headers=_HEADERS
+    )
     assert resp.status_code == 200
 
     body = resp.json()
@@ -332,12 +332,16 @@ def test_requires_auth(supported_types_client):
 
 
 def test_cache_headers(supported_types_client):
-    resp = supported_types_client.get("/documents/supported_file_types", headers=_HEADERS)
+    resp = supported_types_client.get(
+        "/documents/supported_file_types", headers=_HEADERS
+    )
     assert resp.headers["Cache-Control"] == "no-store"
     assert resp.headers["Vary"] == "LIGHTRAG-WORKSPACE"
 
 
-def test_mineru_routing_splits_allowlist_and_matrix(supported_types_client, monkeypatch):
+def test_mineru_routing_splits_allowlist_and_matrix(
+    supported_types_client, monkeypatch
+):
     monkeypatch.setenv("MINERU_API_MODE", "local")
     monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://localhost:8888")
     monkeypatch.setenv("LIGHTRAG_PARSER", "jpg:mineru;*:legacy-R")

@@ -57,9 +57,7 @@ def _rel_input(source_id: str) -> dict:
     }
 
 
-async def _graph_with_nodes(
-    names: tuple[str, ...], source_id: str
-) -> MemGraph:
+async def _graph_with_nodes(names: tuple[str, ...], source_id: str) -> MemGraph:
     g = MemGraph()
     for name in names:
         await g.upsert_node(

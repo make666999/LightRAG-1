@@ -400,13 +400,25 @@ def test_a_frozen_or_backwards_clock_still_yields_ordered_tokens(monkeypatch):
 @pytest.mark.parametrize(
     ("candidate", "current", "expected"),
     [
-        pytest.param(_seq_row(99, 501), _seq_row(100, 500), True, id="token-beats-clock-step"),
-        pytest.param(_seq_row(100, 500), _seq_row(99, 501), False, id="older-token-loses"),
-        pytest.param(_seq_row(101), _seq_row(100, 999), True, id="legacy-newer-second-wins"),
-        pytest.param(_seq_row(100, 999), _seq_row(101), False, id="legacy-older-second-loses"),
+        pytest.param(
+            _seq_row(99, 501), _seq_row(100, 500), True, id="token-beats-clock-step"
+        ),
+        pytest.param(
+            _seq_row(100, 500), _seq_row(99, 501), False, id="older-token-loses"
+        ),
+        pytest.param(
+            _seq_row(101), _seq_row(100, 999), True, id="legacy-newer-second-wins"
+        ),
+        pytest.param(
+            _seq_row(100, 999), _seq_row(101), False, id="legacy-older-second-loses"
+        ),
         pytest.param(_seq_row(100, 5), _seq_row(100, 5), False, id="equal-tokens-tie"),
-        pytest.param(_seq_row(100), _seq_row(100, 5), False, id="missing-token-candidate-tie"),
-        pytest.param(_seq_row(100, 5), _seq_row(100), False, id="missing-token-current-tie"),
+        pytest.param(
+            _seq_row(100), _seq_row(100, 5), False, id="missing-token-candidate-tie"
+        ),
+        pytest.param(
+            _seq_row(100, 5), _seq_row(100), False, id="missing-token-current-tie"
+        ),
         pytest.param(None, _seq_row(100, 1), False, id="absent-row-never-supersedes"),
     ],
 )

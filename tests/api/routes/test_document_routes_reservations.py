@@ -26,9 +26,7 @@ pytestmark = pytest.mark.offline
 
 def _get_endpoint(router, name: str):
     return [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == name
+        route.endpoint for route in router.routes if getattr(route, "name", "") == name
     ][-1]
 
 
@@ -512,9 +510,7 @@ async def test_background_task_releases_reservation_on_initial_fetch_cancellatio
         pytest.param(
             "_release_enqueue_slot",
             lambda token: {
-                "pending_enqueue_tokens": {
-                    token: {"pid": 0, "process_start_id": None}
-                },
+                "pending_enqueue_tokens": {token: {"pid": 0, "process_start_id": None}},
                 "pending_enqueues": 1,
             },
             {"pending_enqueues": 0, "pending_enqueue_tokens": {}},

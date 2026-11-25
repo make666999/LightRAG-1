@@ -91,7 +91,9 @@ async def test_openai_chat_reports_cached_prompt_tokens(
             base_url="https://example.invalid/v1",
             http_client=http_client,
         )
-        monkeypatch.setattr(openai_module, "create_openai_async_client", lambda **_: sdk)
+        monkeypatch.setattr(
+            openai_module, "create_openai_async_client", lambda **_: sdk
+        )
         result = await openai_complete_if_cache(
             "test-model",
             "extract entities",

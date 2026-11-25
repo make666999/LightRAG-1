@@ -50,12 +50,22 @@ pytestmark = pytest.mark.offline
         pytest.param("$\times2$", r"$\times2$", id="math-digit-times"),
         pytest.param("$$\nabla_x f$$", r"$$\nabla_x f$$", id="display-subscript-nabla"),
         # Line-break commands survive the inline line-break veto.
-        pytest.param("$\nabla f$", "$" + r"\nabla" + " f$", id="inline-nabla-veto-exempt"),
-        pytest.param("$x \notin A$", "$x " + r"\notin" + " A$", id="inline-notin-veto-exempt"),
-        pytest.param("$\rho + 1$", "$" + r"\rho" + " + 1$", id="inline-rho-veto-exempt"),
-        pytest.param("$x \right)$", "$x " + r"\right" + ")$", id="inline-right-veto-exempt"),
+        pytest.param(
+            "$\nabla f$", "$" + r"\nabla" + " f$", id="inline-nabla-veto-exempt"
+        ),
+        pytest.param(
+            "$x \notin A$", "$x " + r"\notin" + " A$", id="inline-notin-veto-exempt"
+        ),
+        pytest.param(
+            "$\rho + 1$", "$" + r"\rho" + " + 1$", id="inline-rho-veto-exempt"
+        ),
+        pytest.param(
+            "$x \right)$", "$x " + r"\right" + ")$", id="inline-right-veto-exempt"
+        ),
         # Display math spans across LF, CR, and CRLF line breaks.
-        pytest.param("$$\n\tau^2\n$$", "$$\n" + r"\tau^2" + "\n$$", id="display-lf-lines"),
+        pytest.param(
+            "$$\n\tau^2\n$$", "$$\n" + r"\tau^2" + "\n$$", id="display-lf-lines"
+        ),
         pytest.param("$$\n\nabla f$$", "$$\n" + r"\nabla f$$", id="display-lf-nabla"),
         pytest.param("$$a +\n\tau$$", "$$a +\n" + r"\tau$$", id="display-lf"),
         pytest.param("$$a +\r\tau$$", "$$a +\r" + r"\tau$$", id="display-cr"),
@@ -175,7 +185,9 @@ def test_repairs_and_idempotency(damaged, expected):
             r"$\frac{a}{b}$ and \beta with plain text", id="already-clean-latex"
         ),
         pytest.param("$5\rangle and $10", id="between-two-currency-amounts"),
-        pytest.param("$ x $ then\text column $y$", id="prose-between-padded-and-real-span"),
+        pytest.param(
+            "$ x $ then\text column $y$", id="prose-between-padded-and-real-span"
+        ),
         pytest.param("成本为$a$，领域\tau为$b$", id="cjk-prose-between-math-spans"),
         pytest.param("Unclosed $$x and\text$ suffix", id="unclosed-display-delimiter"),
         pytest.param("price $5 then\tau", id="unpaired-dollar"),
@@ -208,7 +220,9 @@ def test_repairs_and_idempotency(damaged, expected):
             '```sh\n```not a closer\necho "$HOME"\n\text=1\necho "$PATH"\n```',
             id="fake-closer-with-info-string",
         ),
-        pytest.param("```sh\n\t```\nA=$X; \text=1; B=$Y\n```", id="tab-indented-fake-closer"),
+        pytest.param(
+            "```sh\n\t```\nA=$X; \text=1; B=$Y\n```", id="tab-indented-fake-closer"
+        ),
         pytest.param(
             "   ```sh\n   A=$X; \text=1; B=$Y\n   ```", id="three-space-indented-fence"
         ),

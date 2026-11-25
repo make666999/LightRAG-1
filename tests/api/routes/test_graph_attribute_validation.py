@@ -626,9 +626,7 @@ class _DummyMergeGraphStorage:
 
     async def get_node_edges(self, node_id):
         return [
-            (src, tgt)
-            for src, tgt in self.edges
-            if src == node_id or tgt == node_id
+            (src, tgt) for src, tgt in self.edges if src == node_id or tgt == node_id
         ]
 
     async def get_edge(self, src, tgt):

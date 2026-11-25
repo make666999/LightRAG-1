@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-pytest.importorskip("asyncpg", reason="asyncpg is required for PostgreSQL storage tests")
+pytest.importorskip(
+    "asyncpg", reason="asyncpg is required for PostgreSQL storage tests"
+)
 
 import asyncpg  # noqa: E402
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt  # noqa: E402
@@ -111,9 +113,7 @@ class TestPostgresClientManager:
         db.initdb = AsyncMock()
         db.check_tables = AsyncMock()
 
-        with patch(
-            "lightrag.kg.postgres_impl.PostgreSQLDB", return_value=db
-        ) as db_cls:
+        with patch("lightrag.kg.postgres_impl.PostgreSQLDB", return_value=db) as db_cls:
             first = await ClientManager.get_client("PGVectorStorage")
             second = await ClientManager.get_client("PGVectorStorage")
 
@@ -162,9 +162,7 @@ class TestPostgresClientManager:
                 "lightrag.kg.postgres_impl.ClientManager.get_client",
                 new=AsyncMock(return_value=db),
             ) as get_client,
-            patch(
-                "lightrag.kg.postgres_impl.get_data_init_lock", return_value=_lock()
-            ),
+            patch("lightrag.kg.postgres_impl.get_data_init_lock", return_value=_lock()),
             patch.object(PGVectorStorage, "setup_table", new=AsyncMock(), create=True),
         ):
             await PGVectorStorage.initialize(storage)
@@ -376,7 +374,8 @@ class TestPostgresPoolReconnect:
                 await db._ensure_pool()
 
         assert any(
-            r.levelno == logging.ERROR and "Failed to connect database" in r.getMessage()
+            r.levelno == logging.ERROR
+            and "Failed to connect database" in r.getMessage()
             for r in lightrag_log_records
         )
 
@@ -393,7 +392,8 @@ class TestPostgresPoolReconnect:
 
         assert create_pool.await_count == 3
         assert any(
-            r.levelno == logging.ERROR and "Failed to connect database" in r.getMessage()
+            r.levelno == logging.ERROR
+            and "Failed to connect database" in r.getMessage()
             for r in lightrag_log_records
         )
 

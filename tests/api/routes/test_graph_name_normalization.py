@@ -1307,9 +1307,7 @@ class TestManualNameResolutionLifecycle:
         assert (entity.status, entity.status_code) == ("fail", 400)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "first_attempt", ["fails-after-node-removal", "succeeds"]
-    )
+    @pytest.mark.parametrize("first_attempt", ["fails-after-node-removal", "succeeds"])
     async def test_repeated_entity_delete_never_reaches_another_entity(
         self, rag, monkeypatch, first_attempt
     ):
@@ -1325,9 +1323,7 @@ class TestManualNameResolutionLifecycle:
                 "file_path": "",
             },
         )
-        await rag.entity_chunks.upsert(
-            {legacy: {"chunk_ids": ["chunk-1"], "count": 1}}
-        )
+        await rag.entity_chunks.upsert({legacy: {"chunk_ids": ["chunk-1"], "count": 1}})
         await rag.acreate_entity("Tesla(US)", {"description": "a different entity"})
 
         if first_attempt == "fails-after-node-removal":
@@ -1351,12 +1347,8 @@ class TestManualNameResolutionLifecycle:
         assert await rag.entity_chunks.get_by_id(legacy) is None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "first_attempt", ["fails-after-node-removal", "succeeds"]
-    )
-    @pytest.mark.parametrize(
-        "operation", ["merge_entities", "rename_with_allow_merge"]
-    )
+    @pytest.mark.parametrize("first_attempt", ["fails-after-node-removal", "succeeds"])
+    @pytest.mark.parametrize("operation", ["merge_entities", "rename_with_allow_merge"])
     async def test_repeated_merge_never_reaches_another_entity(
         self, rag, monkeypatch, operation, first_attempt
     ):

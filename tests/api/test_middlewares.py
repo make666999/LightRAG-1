@@ -167,9 +167,7 @@ class TestAdmissionMiddleware:
         downstream = _Downstream()
         recorder = _AdmissionRecorder()
 
-        await _admission_mw(rag, downstream)(
-            _scope(), recorder.receive, recorder.send
-        )
+        await _admission_mw(rag, downstream)(_scope(), recorder.receive, recorder.send)
 
         assert recorder.status == 429
         assert recorder.receives == 0
@@ -244,9 +242,7 @@ class TestAdmissionMiddleware:
         downstream = _Downstream(adopt=True)
         recorder = _AdmissionRecorder()
 
-        await _admission_mw(rag, downstream)(
-            _scope(), recorder.receive, recorder.send
-        )
+        await _admission_mw(rag, downstream)(_scope(), recorder.receive, recorder.send)
 
         ticket = downstream.tickets[0]
         assert ticket is not None and ticket.adopted is True
@@ -257,9 +253,7 @@ class TestAdmissionMiddleware:
         downstream = _Downstream(adopt=False)
         recorder = _AdmissionRecorder()
 
-        await _admission_mw(rag, downstream)(
-            _scope(), recorder.receive, recorder.send
-        )
+        await _admission_mw(rag, downstream)(_scope(), recorder.receive, recorder.send)
 
         assert recorder.status == 200
         assert await _tokens(rag) == {}
@@ -286,9 +280,7 @@ class TestAdmissionMiddleware:
         downstream = _Downstream()
         recorder = _AdmissionRecorder()
 
-        await _admission_mw(rag, downstream)(
-            _scope(), recorder.receive, recorder.send
-        )
+        await _admission_mw(rag, downstream)(_scope(), recorder.receive, recorder.send)
 
         assert recorder.status == 409
         assert recorder.receives == 0
@@ -362,9 +354,7 @@ class TestAdmissionMiddleware:
         downstream = _Downstream()
         recorder = _AdmissionRecorder()
 
-        await _admission_mw(rag, downstream)(
-            _scope(), recorder.receive, recorder.send
-        )
+        await _admission_mw(rag, downstream)(_scope(), recorder.receive, recorder.send)
 
         assert downstream.calls == 1
         assert downstream.tickets == [None]
@@ -597,7 +587,9 @@ class TestBodyLimitMiddleware:
             app = _BodyReader()
             recorder = _BodyRecorder([b""])
             await _body_limit_mw(app)(
-                _scope(path=path, headers=[(b"content-length", str(declared).encode())]),
+                _scope(
+                    path=path, headers=[(b"content-length", str(declared).encode())]
+                ),
                 recorder.receive,
                 recorder.send,
             )

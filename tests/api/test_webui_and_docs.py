@@ -283,7 +283,9 @@ class TestApiDocsToggle:
 
         for path in _DOC_SURFACES:
             resp = client.get(path)
-            assert resp.status_code == 404, f"{path} must 404 with ENABLE_API_DOCS=false"
+            assert resp.status_code == 404, (
+                f"{path} must 404 with ENABLE_API_DOCS=false"
+            )
 
     def test_disabling_docs_leaves_other_routes_alive(self, monkeypatch):
         client = _build_toggle_client(monkeypatch, enable_api_docs="false")

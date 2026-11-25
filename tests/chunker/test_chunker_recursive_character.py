@@ -662,4 +662,3 @@ def test_default_cascade_output_is_unchanged_by_the_skip():
     rejoined = "".join(c["content"] for c in chunks)
     assert "Para one." in rejoined and "Para three." in rejoined
     assert len(chunks) > 1
-

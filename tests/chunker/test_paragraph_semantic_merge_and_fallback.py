@@ -1326,4 +1326,3 @@ def test_public_chunking_adds_part_suffixes_for_long_text_fallback(
         "Heading [part 2]",
         "Heading [part 3]",
     ]
-

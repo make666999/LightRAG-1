@@ -869,9 +869,7 @@ class TestMongoDocStatusIdSort:
         def sort(self, criteria):
             self.collection.sorts.append(criteria)
             for field, direction in reversed(criteria):
-                self.documents.sort(
-                    key=lambda doc: doc[field], reverse=direction == -1
-                )
+                self.documents.sort(key=lambda doc: doc[field], reverse=direction == -1)
             return self
 
         def collation(self, value):

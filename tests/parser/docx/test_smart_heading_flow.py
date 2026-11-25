@@ -422,7 +422,6 @@ def test_subtree_demotion_keeps_outline_anchored_series_together() -> None:
     assert "smart_subtree_demotions" not in warnings
 
 
-
 @pytest.mark.requires_spacy_models
 def test_source_multisentence_gate_real_spacy_end_to_end(monkeypatch) -> None:
     """test11 regression through real NLP and the block assembler, now via the
@@ -809,9 +808,7 @@ def test_high_confidence_centered_channel_rules(case_id: str) -> None:
         assert d.rule_trail[0] == "base_center"
     elif case_id == "two_line_centered_title_both_admitted":
         records.append(
-            _para(
-                "广州市城市安全风险综合监测预警平台", size=12.0, alignment="center"
-            )
+            _para("广州市城市安全风险综合监测预警平台", size=12.0, alignment="center")
         )
         records.append(_para("建设的工作方案", size=12.0, alignment="center"))
         texts = _texts(_gate(records))
@@ -1025,9 +1022,7 @@ def test_cb1_graduated_gate_scenarios(lightrag_caplog, case_id: str) -> None:
         assert result.cb1_graduated_demoted == 20
         styles = sorted(d.numbering.style_key for d in result.decisions)
         assert styles == ["EnNum"] * 10 + ["MultiLevelNum"] * 8
-        demoted = [
-            d for d in result.demoted if "cb1_graduated_demoted" in d.rule_trail
-        ]
+        demoted = [d for d in result.demoted if "cb1_graduated_demoted" in d.rule_trail]
         assert len(demoted) == 20
         for d in demoted:
             assert not d.is_heading
@@ -1079,9 +1074,7 @@ def test_cb1_graduated_gate_scenarios(lightrag_caplog, case_id: str) -> None:
         assert result.cb1_graduated_demoted == 0
         assert "smart_cb1_graduated_demotions" not in warnings
         assert result.cb1_reestimated
-        assert not any(
-            "cb1_graduated_demoted" in d.rule_trail for d in result.demoted
-        )
+        assert not any("cb1_graduated_demoted" in d.rule_trail for d in result.demoted)
 
 
 def test_cb1_graduated_density_reflects_real_decisions_not_projection() -> None:
@@ -1155,9 +1148,7 @@ def test_cb1_graduated_ladder_and_root_helpers() -> None:
         "en_num",
     ]
 
-    mlns = [
-        _make_decision(f"{t}.1 子节", idx=t, numbered=True) for t in (1, 2, 3, 4)
-    ]
+    mlns = [_make_decision(f"{t}.1 子节", idx=t, numbered=True) for t in (1, 2, 3, 4)]
 
     def _en(ordinal: int) -> HeadingDecision:
         return _make_decision(f"{ordinal} 章节", idx=1000 + ordinal, numbered=True)
@@ -1166,7 +1157,6 @@ def test_cb1_graduated_ladder_and_root_helpers() -> None:
     assert _cb1_ennum_is_mln_root(mlns, [_en(1)]) is False  # single {1} overlap
     assert _cb1_ennum_is_mln_root(mlns, [_en(o) for o in (90, 91)]) is False  # none
     assert _cb1_ennum_is_mln_root([], [_en(1), _en(2)]) is False  # no MLN family
-
 
 
 def test_cb1_graduated_outline_and_larger_size_exempt() -> None:
@@ -3026,7 +3016,6 @@ def test_imprint_region_conditional_demotion_cases(monkeypatch, mode: str) -> No
     )
 
 
-
 # ---------------------------------------------------------------------------
 # mixed table/paragraph covers, end to end: absorbed paragraphs stay members
 # in SOURCE ORDER through judgment and assembly
@@ -3535,7 +3524,9 @@ def test_zero_weight_outline_placeholder_demotion(lightrag_caplog, path: str) ->
 
     if path == "gate":
         records = _body(20) + [
-            _para('<drawing id="1" />', size=14.0, outline_level=0, visible_char_count=0)
+            _para(
+                '<drawing id="1" />', size=14.0, outline_level=0, visible_char_count=0
+            )
         ]
         result = _gate(records)
         assert result.decisions == []
@@ -3549,11 +3540,15 @@ def test_zero_weight_outline_placeholder_demotion(lightrag_caplog, path: str) ->
     else:
         records = _body(5) + [
             _para("正常大纲标题", size=12.0, outline_level=0),
-            _para('<drawing id="1" />', size=12.0, outline_level=0, visible_char_count=0),
+            _para(
+                '<drawing id="1" />', size=12.0, outline_level=0, visible_char_count=0
+            ),
         ]
         warnings: dict = {}
         with lightrag_caplog.at_level(logging.WARNING, logger="lightrag"):
-            out = _outline_only_decisions(records, range(len(records)), warnings=warnings)
+            out = _outline_only_decisions(
+                records, range(len(records)), warnings=warnings
+            )
         by_idx = {d.record_index: d for d in out}
         real = by_idx[len(records) - 2]
         assert real.is_heading and "subdoc_fallback_outline_only" in real.rule_trail
@@ -3561,7 +3556,9 @@ def test_zero_weight_outline_placeholder_demotion(lightrag_caplog, path: str) ->
         assert dem.is_heading is False and dem.use_raw_text is True
         assert "placeholder_demoted" in dem.rule_trail
         assert warnings["smart_placeholder_demotions"] == 1
-        assert len([m for m in _log_messages(lightrag_caplog) if "placeholder" in m]) == 1
+        assert (
+            len([m for m in _log_messages(lightrag_caplog) if "placeholder" in m]) == 1
+        )
 
 
 @pytest.mark.parametrize("cb1_terminal", ["converged", "tripped"])

@@ -165,11 +165,19 @@ async def test_malformed_result_items_are_dropped_not_fatal(provider):
 @pytest.mark.parametrize(
     ("explicit_key", "provider_val", "generic_val", "expected"),
     [
-        pytest.param("explicit-key", "env-key", None, "explicit-key", id="explicit-wins"),
-        pytest.param(None, "env-key", None, "env-key", id="provider-env-fallback"),
-        pytest.param(None, None, "generic-key", "generic-key", id="generic-env-fallback"),
         pytest.param(
-            None, "provider-key", "generic-key", "provider-key", id="provider-over-generic"
+            "explicit-key", "env-key", None, "explicit-key", id="explicit-wins"
+        ),
+        pytest.param(None, "env-key", None, "env-key", id="provider-env-fallback"),
+        pytest.param(
+            None, None, "generic-key", "generic-key", id="generic-env-fallback"
+        ),
+        pytest.param(
+            None,
+            "provider-key",
+            "generic-key",
+            "provider-key",
+            id="provider-over-generic",
         ),
     ],
 )

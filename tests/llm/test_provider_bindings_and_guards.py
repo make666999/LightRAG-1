@@ -194,7 +194,9 @@ def test_install_guard_scanner_helpers():
     ]:
         assert _distribution_import_name(package_spec) == import_name
 
-    assert _first_import_line(ast.parse("from google import genai\n"), "google.genai") == 1
+    assert (
+        _first_import_line(ast.parse("from google import genai\n"), "google.genai") == 1
+    )
     assert _installed_packages(
         ast.parse('pm.install("google-genai")\npm.install("google-api-core")\n')
     ) == [

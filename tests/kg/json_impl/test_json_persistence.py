@@ -252,7 +252,10 @@ class TestWriteJsonOptimization:
                 {
                     "level1": {
                         "level2": {
-                            "level3": {"dirty": "text\ud800here", "clean": "normal text"},
+                            "level3": {
+                                "dirty": "text\ud800here",
+                                "clean": "normal text",
+                            },
                             "list": ["item1", "item\ud801dirty", "item3"],
                         }
                     }
@@ -308,7 +311,9 @@ class TestWriteJsonOptimization:
             ),
         ],
     )
-    def test_write_json_slow_path_sanitizes_surrogates(self, tmp_path, payload, expected):
+    def test_write_json_slow_path_sanitizes_surrogates(
+        self, tmp_path, payload, expected
+    ):
         target = tmp_path / "dirty.json"
         assert write_json(payload, str(target)) is True
         loaded = load_json(str(target))

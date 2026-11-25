@@ -638,7 +638,9 @@ async def test_merge_pre_delete_vdb_failure_raises_consistency_error(
     relationships_vdb = MockVDB()
 
     if fault_point == "relation_delete":
-        relationships_vdb.delete = AsyncMock(side_effect=RuntimeError("vdb delete down"))
+        relationships_vdb.delete = AsyncMock(
+            side_effect=RuntimeError("vdb delete down")
+        )
     elif fault_point == "relation_upsert":
         relationships_vdb.upsert = AsyncMock(side_effect=RuntimeError("embedder down"))
     elif fault_point == "entity_upsert":
@@ -1939,4 +1941,3 @@ async def test_rebuild_selects_one_workspace_and_preserves_siblings(
             release_working_dir_lock(tool.config_dir)
         tool.release_anchor_lock()
         finalize_share_data()
-

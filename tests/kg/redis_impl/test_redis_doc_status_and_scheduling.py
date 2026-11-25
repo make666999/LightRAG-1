@@ -398,7 +398,9 @@ class TestRedisTrackIdHydration:
         docs = await storage.get_docs_by_track_id("track_123")
 
         assert set(docs) == {"doc-a-written-by-newer-build", "doc-b-old"}
-        assert not hasattr(docs["doc-a-written-by-newer-build"], "field_from_the_future")
+        assert not hasattr(
+            docs["doc-a-written-by-newer-build"], "field_from_the_future"
+        )
 
     async def test_a_bad_row_does_not_truncate_the_rest_of_the_scan(self, storage):
         """An unhydratable row scanned first must not abort the SCAN loop."""
@@ -738,9 +740,7 @@ class TestRedisSchedulingPages:
     async def test_get_docs_by_ids_present_and_missing(self, storage):
         await _bootstrap(storage)
         await storage.upsert({"doc-1": _doc("pending"), "doc-2": _doc("failed")})
-        result = await storage.get_docs_by_ids(
-            ["doc-1", "doc-2", "ghost"], strict=True
-        )
+        result = await storage.get_docs_by_ids(["doc-1", "doc-2", "ghost"], strict=True)
         assert set(result) == {"doc-1", "doc-2"}
         assert result["doc-2"].status is DocStatus.FAILED
         assert not hasattr(result["doc-1"], "chunks_list")

@@ -101,9 +101,7 @@ async def _http_stub(*, first_delay: float = 0.0, every_delay: float = 0.0):
                 {
                     "object": "list",
                     "model": "m",
-                    "data": [
-                        {"object": "embedding", "index": 0, "embedding": _VECTOR}
-                    ],
+                    "data": [{"object": "embedding", "index": 0, "embedding": _VECTOR}],
                     "usage": {"prompt_tokens": 1, "total_tokens": 1},
                 }
             )
@@ -762,7 +760,12 @@ _WRAPPERS = [
         "openai_responses_complete_if_cache",
         _OPENAI_CLIENT_CONFIGS,
     ),
-    ("lightrag.llm.anthropic", "anthropic_complete", "anthropic_complete_if_cache", None),
+    (
+        "lightrag.llm.anthropic",
+        "anthropic_complete",
+        "anthropic_complete_if_cache",
+        None,
+    ),
     (
         "lightrag.llm.anthropic",
         "claude_3_opus_complete",

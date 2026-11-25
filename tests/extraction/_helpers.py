@@ -236,9 +236,7 @@ class MemKV:
         return deepcopy(value) if value is not None else None
 
     async def get_by_ids(self, keys: list[str]):
-        return [
-            deepcopy(self.data[k]) if k in self.data else None for k in keys
-        ]
+        return [deepcopy(self.data[k]) if k in self.data else None for k in keys]
 
     async def upsert(self, data: dict) -> None:
         self.ops.append(("upsert", tuple(data.keys())))
@@ -292,9 +290,7 @@ class MemVDB:
         return deepcopy(value) if value is not None else None
 
     async def get_by_ids(self, ids: list[str]):
-        return [
-            deepcopy(self.records[i]) if i in self.records else None for i in ids
-        ]
+        return [deepcopy(self.records[i]) if i in self.records else None for i in ids]
 
     async def query(self, query: str, top_k: int, query_embedding=None):
         return []

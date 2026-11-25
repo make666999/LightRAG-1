@@ -719,7 +719,14 @@ class TestMilvusIndexCreation:
         )
 
     @pytest.mark.parametrize(
-        ("namespace", "workspace", "dim", "model_name", "expected_legacy", "expected_final"),
+        (
+            "namespace",
+            "workspace",
+            "dim",
+            "model_name",
+            "expected_legacy",
+            "expected_final",
+        ),
         [
             pytest.param(
                 "chunks",

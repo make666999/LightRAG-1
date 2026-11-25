@@ -16,7 +16,11 @@ import pytest
 
 from lightrag import LightRAG
 from lightrag.base import DocStatus
-from lightrag.chunker import ChunkingContext, accepts_chunking_context, chunking_by_token_size
+from lightrag.chunker import (
+    ChunkingContext,
+    accepts_chunking_context,
+    chunking_by_token_size,
+)
 
 from ._fakes import make_lightrag, mock_json_llm
 

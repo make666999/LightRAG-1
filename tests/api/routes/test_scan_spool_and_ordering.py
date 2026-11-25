@@ -90,9 +90,9 @@ def test_each_workspace_gets_its_own_spool_directory(tmp_path, monkeypatch):
     )
     base = tmp_path / "rag_storage" / "scan_spool"
 
-    assert _scan_spool_base_dir(
-        _spool_rag(str(tmp_path / "rag_storage"), "alpha")
-    ) == (base / "named" / "alpha")
+    assert _scan_spool_base_dir(_spool_rag(str(tmp_path / "rag_storage"), "alpha")) == (
+        base / "named" / "alpha"
+    )
     assert _scan_spool_base_dir(_spool_rag(str(tmp_path / "rag_storage"), "beta")) == (
         base / "named" / "beta"
     )

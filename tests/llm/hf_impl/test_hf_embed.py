@@ -348,7 +348,9 @@ async def test_token_count_and_hidden_state_reduction_occur_in_float32(hf_module
 @pytest.mark.parametrize(
     ("raw_token_count", "model_max_length", "expected_max_length"),
     [
-        pytest.param(1277, UNSET_SENTINEL, 512, id="oversized-unset-sentinel-falls-back"),
+        pytest.param(
+            1277, UNSET_SENTINEL, 512, id="oversized-unset-sentinel-falls-back"
+        ),
         pytest.param(900, 384, 384, id="bounded-tokenizer-limit-used-directly"),
         pytest.param(100, UNSET_SENTINEL, 512, id="short-input-keeps-model-cap"),
     ],

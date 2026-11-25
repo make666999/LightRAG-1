@@ -358,7 +358,9 @@ def test_lock_based_tokenizer_deepcopy_boundary(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("tok_factory", [_char_tok, _tiktoken_tok], ids=["char", "tiktoken"])
+@pytest.mark.parametrize(
+    "tok_factory", [_char_tok, _tiktoken_tok], ids=["char", "tiktoken"]
+)
 def test_truncate_empty_whole_and_safe_prefix(tok_factory):
     tok = tok_factory()
     assert tok.truncate_by_token_limit("", 10) == TokenSpan(0, 0, 0)
@@ -374,7 +376,9 @@ def test_truncate_empty_whole_and_safe_prefix(tok_factory):
     assert span.token_count <= 7
 
 
-@pytest.mark.parametrize("tok_factory", [_char_tok, _tiktoken_tok], ids=["char", "tiktoken"])
+@pytest.mark.parametrize(
+    "tok_factory", [_char_tok, _tiktoken_tok], ids=["char", "tiktoken"]
+)
 def test_truncate_and_split_reject_invalid_arguments(tok_factory):
     tok = tok_factory()
     for bad_budget in (0, -1):
@@ -507,7 +511,9 @@ def test_split_empty_and_zero_overlap_fixed_windows():
     assert [text[s.start : s.end] for s in spans] == ["abcd", "efgh", "ij"]
 
 
-@pytest.mark.parametrize("tok_factory", [_char_tok, _tiktoken_tok], ids=["char", "tiktoken"])
+@pytest.mark.parametrize(
+    "tok_factory", [_char_tok, _tiktoken_tok], ids=["char", "tiktoken"]
+)
 def test_split_produces_real_overlap_and_strict_forward_progress(tok_factory):
     tok = tok_factory()
     text = "The quick brown fox jumps over the lazy dog. " * 6
@@ -590,16 +596,13 @@ def test_truncate_list_by_token_size_contract():
     """
     tok = _char_tok()
     # Separator tokens count: "aaa" (3) + "||" (2) + "bbb" (3) = 8 > 7 -> only ["aaa"].
-    assert (
-        truncate_list_by_token_size(
-            ["aaa", "bbb", "ccc"],
-            key=lambda x: x,
-            separator="||",
-            max_token_size=7,
-            tokenizer=tok,
-        )
-        == ["aaa"]
-    )
+    assert truncate_list_by_token_size(
+        ["aaa", "bbb", "ccc"],
+        key=lambda x: x,
+        separator="||",
+        max_token_size=7,
+        tokenizer=tok,
+    ) == ["aaa"]
     # Never splits a partial item.
     items = ["aaaa", "bbbb", "cccc", "dddd"]
     whole_only = truncate_list_by_token_size(

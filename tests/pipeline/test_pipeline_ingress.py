@@ -872,15 +872,11 @@ async def test_sequential_upload_wakeups_do_not_strand_later_files(tmp_path):
         await asyncio.wait_for(extract.started.wait(), timeout=5)
 
         for name, body in (("b.txt", "BBBB"), ("c.txt", "CCCC")):
-            await rag.apipeline_enqueue_documents(
-                input=f"{body} body", file_paths=name
-            )
+            await rag.apipeline_enqueue_documents(input=f"{body} body", file_paths=name)
             await rag.apipeline_process_enqueue_documents()  # refused: busy
 
         for name in ("b.txt", "c.txt"):
-            await _wait_status(
-                rag, compute_mdhash_id(name, prefix="doc-"), "processed"
-            )
+            await _wait_status(rag, compute_mdhash_id(name, prefix="doc-"), "processed")
         assert _status_text(await rag.doc_status.get_by_id(a_id)) != "processed"
 
         extract.release.set()

@@ -816,9 +816,7 @@ class TestSummary:
             pytest.param(
                 "Neo4JStorage", ConnectionError("neo4j down"), id="server_refuses"
             ),
-            pytest.param(
-                None, OSError("graphml unreadable"), id="local_unreadable"
-            ),
+            pytest.param(None, OSError("graphml unreadable"), id="local_unreadable"),
         ],
     )
     async def test_a_graph_read_failure_refuses_server_or_marks_local_unreadable(

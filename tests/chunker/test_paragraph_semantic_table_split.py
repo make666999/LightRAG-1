@@ -1476,7 +1476,9 @@ _SPAN_ROWS = _html_rows('<td rowspan="2">A</td><td>a1</td>', "<td>a2</td>")
             id="rowspan-not-a-number",
         ),
         pytest.param(
-            _html_rows('<td rowspan="2" colspan="1001">A</td><td>a1</td>', "<td>a2</td>"),
+            _html_rows(
+                '<td rowspan="2" colspan="1001">A</td><td>a1</td>', "<td>a2</td>"
+            ),
             "colspan is outside",
             id="colspan-over-limit",
         ),
@@ -1578,4 +1580,3 @@ def test_layout_stops_at_its_work_budget(monkeypatch, lightrag_log_records):
 def test_table_without_a_body_rowspan_needs_no_slicer(body, lightrag_log_records):
     assert build_rowspan_slicer(body, split_html_rows(body), table_label="t") is None
     assert lightrag_log_records == []
-

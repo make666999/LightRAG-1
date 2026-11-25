@@ -17,7 +17,9 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-pytest.importorskip("asyncpg", reason="asyncpg is required for PostgreSQL storage tests")
+pytest.importorskip(
+    "asyncpg", reason="asyncpg is required for PostgreSQL storage tests"
+)
 
 import asyncpg  # noqa: E402
 from tenacity import wait_none  # noqa: E402
@@ -306,8 +308,7 @@ class TestAgeDanglingLabelRetry:
 # ---------------------------------------------------------------------------
 
 _AGE_SESSION_SQL = (
-    'SET search_path = ag_catalog, "$user", public; '
-    "SELECT 'null'::ag_catalog.agtype"
+    "SET search_path = ag_catalog, \"$user\", public; SELECT 'null'::ag_catalog.agtype"
 )
 _GRAPH_LOOKUP_SQL = "SELECT 1 FROM ag_catalog.ag_graph WHERE name = left($1, 63)::name"
 _DEFAULT_SEARCH_PATH = '"$user", public'
@@ -456,7 +457,9 @@ class TestAgeGraphEnsure:
         storage.db = db
         return storage, db
 
-    async def _run_initialize(self, monkeypatch, existing_labels: list[str]) -> list[str]:
+    async def _run_initialize(
+        self, monkeypatch, existing_labels: list[str]
+    ) -> list[str]:
         monkeypatch.setattr(
             "lightrag.kg.postgres_impl.get_data_init_lock", lambda: _null_lock()
         )
@@ -933,9 +936,7 @@ class TestPGGraphBatchTransactions:
     @pytest.mark.asyncio
     async def test_upsert_nodes_batch_splits_by_payload_bytes(self):
         storage, cap = self._storage(max_upsert_records=0, max_upsert_payload=200)
-        nodes = [
-            (f"n{i}", {"entity_id": f"n{i}", "blob": "X" * 150}) for i in range(3)
-        ]
+        nodes = [(f"n{i}", {"entity_id": f"n{i}", "blob": "X" * 150}) for i in range(3)]
 
         await storage.upsert_nodes_batch(nodes)
 
@@ -1008,9 +1009,7 @@ class TestPGGraphReadContract:
     @pytest.mark.asyncio
     async def test_popular_labels_ranks_from_edges_without_scanning_the_vertices(self):
         storage = _make_graph_storage()
-        storage._query = AsyncMock(
-            return_value=[{"label": f"E{i}"} for i in range(7)]
-        )
+        storage._query = AsyncMock(return_value=[{"label": f"E{i}"} for i in range(7)])
 
         labels = await storage.get_popular_labels(limit=7)
 
@@ -1049,9 +1048,7 @@ class TestPGGraphReadContract:
     @pytest.mark.asyncio
     async def test_popular_labels_orders_by_degree_then_bytewise_label(self):
         storage = _make_graph_storage()
-        storage._query = AsyncMock(
-            return_value=[{"label": f"E{i}"} for i in range(3)]
-        )
+        storage._query = AsyncMock(return_value=[{"label": f"E{i}"} for i in range(3)])
 
         await storage.get_popular_labels(limit=3)
 

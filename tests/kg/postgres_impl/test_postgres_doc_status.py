@@ -7,7 +7,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-pytest.importorskip("asyncpg", reason="asyncpg is required for PostgreSQL storage tests")
+pytest.importorskip(
+    "asyncpg", reason="asyncpg is required for PostgreSQL storage tests"
+)
 
 from lightrag.kg.postgres_impl import (  # noqa: E402
     TABLES,

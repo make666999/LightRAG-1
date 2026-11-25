@@ -110,9 +110,7 @@ class _RecordingModel:
         return f"answer-{self.calls}"
 
 
-def _query_global_config(
-    llm_func, *, keyword_func=None, prefix=None, **extra
-) -> dict:
+def _query_global_config(llm_func, *, keyword_func=None, prefix=None, **extra) -> dict:
     role_llm_funcs = {"query": llm_func}
     if keyword_func is not None:
         role_llm_funcs["keyword"] = keyword_func

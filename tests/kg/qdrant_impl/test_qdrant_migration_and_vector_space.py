@@ -79,8 +79,8 @@ class TestQdrantMigration:
             workspace="test_ws",
         )
         legacy_collection = "lightrag_vdb_chunks"
-        mock_qdrant_client.collection_exists.side_effect = (
-            lambda name: name == legacy_collection
+        mock_qdrant_client.collection_exists.side_effect = lambda name: (
+            name == legacy_collection
         )
 
         migration_state = {"new_workspace_count": 0}
@@ -137,8 +137,8 @@ class TestQdrantMigration:
             embedding_func=_embedding_func(),
             workspace="test_ws",
         )
-        mock_qdrant_client.collection_exists.side_effect = (
-            lambda name: name == storage.final_namespace
+        mock_qdrant_client.collection_exists.side_effect = lambda name: (
+            name == storage.final_namespace
         )
 
         await storage.initialize()
@@ -185,8 +185,8 @@ class TestQdrantMigration:
         )
         legacy_collection = "lightrag_vdb_chunks"
         new_collection = storage.final_namespace
-        mock_qdrant_client.collection_exists.side_effect = (
-            lambda name: name == legacy_collection
+        mock_qdrant_client.collection_exists.side_effect = lambda name: (
+            name == legacy_collection
         )
 
         legacy_collection_info = MagicMock()
@@ -285,9 +285,12 @@ class TestQdrantMigration:
         legacy_collection = "lightrag_vdb_chunks"
         new_collection = storage.final_namespace
 
-        mock_qdrant_client.collection_exists.side_effect = lambda name: name in (
-            legacy_collection,
-            new_collection,
+        mock_qdrant_client.collection_exists.side_effect = lambda name: (
+            name
+            in (
+                legacy_collection,
+                new_collection,
+            )
         )
 
         def count_mock(collection_name, exact=True, count_filter=None):
@@ -504,7 +507,9 @@ class TestQdrantDropSiblingModels:
         client.delete.assert_not_called()
 
     async def test_reports_a_backend_failure(self):
-        client = self._client({"lightrag_vdb_chunks_model_a_1536d": {"workspace_id": 1}})
+        client = self._client(
+            {"lightrag_vdb_chunks_model_a_1536d": {"workspace_id": 1}}
+        )
         client.delete.side_effect = RuntimeError("boom")
         storage = self._storage(client)
 

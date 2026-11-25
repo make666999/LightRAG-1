@@ -858,7 +858,13 @@ async def test_release_token_set_reservation_survives_fetch_cancellation(monkeyp
 
 def test_reservation_owner_kind_reads_full_record_and_rejects_unidentifiable():
     assert reservation_owner_kind(make_owner_record("t", "admin")) == "admin"
-    for invalid in (None, "bare-token", {"token": "t"}, {"token": "t", "kind": None}, 42):
+    for invalid in (
+        None,
+        "bare-token",
+        {"token": "t"},
+        {"token": "t", "kind": None},
+        42,
+    ):
         assert reservation_owner_kind(invalid) is None
 
 

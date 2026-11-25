@@ -709,7 +709,9 @@ class TestPipelineMetrics:
         assert drain["count"] == 1 and drain["max_seconds"] == 0.0
 
     def test_freeze_rejection_is_counted_at_the_shared_chokepoint(self):
-        before = pipeline_metrics.snapshot()["counters"][pipeline_metrics.FREEZE_REJECTS]
+        before = pipeline_metrics.snapshot()["counters"][
+            pipeline_metrics.FREEZE_REJECTS
+        ]
 
         _conflict_for_status_flag("manual_freeze_requested")
         _conflict_for_status_flag("destructive_busy")  # different fence: not counted

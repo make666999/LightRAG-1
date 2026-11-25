@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
-pytest.importorskip("asyncpg", reason="asyncpg is required for PostgreSQL storage tests")
+pytest.importorskip(
+    "asyncpg", reason="asyncpg is required for PostgreSQL storage tests"
+)
 
 import lightrag.kg.postgres_impl as pg  # noqa: E402
 from lightrag.exceptions import (  # noqa: E402
@@ -265,9 +267,9 @@ class TestPostgresHalfvec:
         mock_pg_db.vchordrq_build_options = ""
 
         mock_pg_db.query = AsyncMock(
-            side_effect=lambda sql, *a, **k: {"?column?": 1}
-            if "pg_indexes" in sql
-            else None
+            side_effect=lambda sql, *a, **k: (
+                {"?column?": 1} if "pg_indexes" in sql else None
+            )
         )
         mock_pg_db.execute = AsyncMock()
 
@@ -533,7 +535,9 @@ class TestPostgresIterativeScan:
 
         with patch("lightrag.kg.postgres_impl.logger") as mock_logger:
             for _ in range(2):
-                connection = _ScanConnection(execute_error=Exception("permission denied"))
+                connection = _ScanConnection(
+                    execute_error=Exception("permission denied")
+                )
                 rows = await db._fetch_with_iterative_scan(connection, "SELECT 1", ())
                 assert connection.log == ["BEGIN", HNSW_SQL, "ROLLBACK", "FETCH"]
                 assert rows == [{"id": "a"}]
@@ -836,9 +840,7 @@ class TestVectorIndexDimension:
             },
         )
         db = self._bare_db("HNSW_HALFVEC")
-        db.check_table_exists = AsyncMock(
-            side_effect=lambda t: t == "LIGHTRAG_PRESENT"
-        )
+        db.check_table_exists = AsyncMock(side_effect=lambda t: t == "LIGHTRAG_PRESENT")
         db.query = AsyncMock(return_value=[])
         for name in dir(PostgreSQLDB):
             if name.startswith(("_migrate", "_check_llm_cache_needs_migration")):
@@ -900,8 +902,7 @@ class TestPostgresDropSiblingModels:
             "lightrag_vdb_chunks_model_c_1024d",
         ]
         assert all(
-            c.args[1] == {"workspace": "ws"}
-            for c in storage.db.execute.call_args_list
+            c.args[1] == {"workspace": "ws"} for c in storage.db.execute.call_args_list
         )
         assert storage.db.query.call_args.args[1][1] == storage.table_name.lower()
 
@@ -926,7 +927,9 @@ class TestPostgresDropSiblingModels:
         "name",
         [
             pytest.param("lightrag_vdbxchunks_model_a_1536d", id="like-wildcard-match"),
-            pytest.param('lightrag_vdb_chunks_a"; drop table x; --_8d', id="quoted-name"),
+            pytest.param(
+                'lightrag_vdb_chunks_a"; drop table x; --_8d', id="quoted-name"
+            ),
             pytest.param("lightrag_vdb_chunks_Model_8d", id="mixed-case"),
         ],
     )

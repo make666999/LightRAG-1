@@ -120,9 +120,7 @@ async def test_gleaning_round_count_by_flag_and_token_budget(
     """Gleaning runs when enabled and within budget (or guard disabled with 0)."""
     monkeypatch.setenv("MAX_EXTRACT_INPUT_TOKENS", max_tokens)
 
-    global_config = make_extract_global_config(
-        entity_extract_max_gleaning=max_gleaning
-    )
+    global_config = make_extract_global_config(entity_extract_max_gleaning=max_gleaning)
     llm_func = global_config["llm_model_func"]
     llm_func.return_value = MINIMAL_EXTRACTION_RESULT
 
@@ -470,9 +468,7 @@ async def test_merge_cancelled_during_task_creation_drains_writers(monkeypatch, 
     monkeypatch.setattr(operate, "_merge_nodes_then_upsert", writer)
     monkeypatch.setattr(operate, "_merge_edges_then_upsert", writer)
     nodes = {f"E{i}": [{}] for i in range(16)} if phase == "entity" else {}
-    edges = (
-        {(f"S{i}", f"T{i}"): [{}] for i in range(32)} if phase == "relation" else {}
-    )
+    edges = {(f"S{i}", f"T{i}"): [{}] for i in range(32)} if phase == "relation" else {}
     parent = asyncio.create_task(
         operate.merge_nodes_and_edges(
             [(nodes, edges)],

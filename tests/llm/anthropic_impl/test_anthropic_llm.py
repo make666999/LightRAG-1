@@ -291,14 +291,10 @@ async def test_non_streaming_usage_is_tracked_without_reaching_sdk():
     response = SimpleNamespace(
         content=[SimpleNamespace(type="text", text="answer")],
         stop_reason="end_turn",
-        usage=_usage(
-            input_tokens=10, output_tokens=4, cache_creation=3, cache_read=2
-        ),
+        usage=_usage(input_tokens=10, output_tokens=4, cache_creation=3, cache_read=2),
     )
     create = AsyncMock(return_value=response)
-    client = SimpleNamespace(
-        messages=SimpleNamespace(create=create), close=AsyncMock()
-    )
+    client = SimpleNamespace(messages=SimpleNamespace(create=create), close=AsyncMock())
 
     with patch("lightrag.llm.anthropic.AsyncAnthropic", return_value=client):
         result = await anthropic_complete_if_cache(
@@ -332,9 +328,7 @@ async def test_usage_recorded_even_when_content_extraction_fails():
         usage=_usage(input_tokens=10, output_tokens=4),
     )
     create = AsyncMock(return_value=response)
-    client = SimpleNamespace(
-        messages=SimpleNamespace(create=create), close=AsyncMock()
-    )
+    client = SimpleNamespace(messages=SimpleNamespace(create=create), close=AsyncMock())
 
     with patch("lightrag.llm.anthropic.AsyncAnthropic", return_value=client):
         with pytest.raises(InvalidResponseError):
@@ -376,9 +370,7 @@ async def test_streaming_usage_is_tracked_after_full_consumption():
         ]
     )
     create = AsyncMock(return_value=stream)
-    client = SimpleNamespace(
-        messages=SimpleNamespace(create=create), close=AsyncMock()
-    )
+    client = SimpleNamespace(messages=SimpleNamespace(create=create), close=AsyncMock())
 
     with patch("lightrag.llm.anthropic.AsyncAnthropic", return_value=client):
         result = await anthropic_complete_if_cache(

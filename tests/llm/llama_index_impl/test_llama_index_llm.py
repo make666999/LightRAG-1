@@ -230,7 +230,9 @@ async def test_llama_index_adds_no_retry_layer(call):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("arg", [pytest.param(None, id="default"), pytest.param(Settings, id="explicit")])
+@pytest.mark.parametrize(
+    "arg", [pytest.param(None, id="default"), pytest.param(Settings, id="explicit")]
+)
 def test_settings_returns_sdk_singleton_unchanged(arg):
     before = vars(Settings).copy()
     result = configure_llama_index() if arg is None else configure_llama_index(arg)

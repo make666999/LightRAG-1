@@ -653,7 +653,11 @@ def _blocks(*contents: str) -> list[dict]:
         ),
         pytest.param(
             # Paired control: injected TOC copy subtracted, body copy satisfies I1.
-            [_para("第一章 绪论", is_toc_link=True), _para("第一章 绪论"), _para("正文段落。")],
+            [
+                _para("第一章 绪论", is_toc_link=True),
+                _para("第一章 绪论"),
+                _para("正文段落。"),
+            ],
             _blocks("第一章 绪论\n# 第一章 绪论\n正文段落。"),
             {"toc_indices": {0}, "ignored_output_texts": ["第一章 绪论"]},
             id="injected-toc-copy-with-body-present",
@@ -686,7 +690,11 @@ def test_i1_preservation_passing_cases(
         ),
         pytest.param(
             # Retained TOC copy subtracted first, surfacing lost body heading.
-            [_para("第一章 绪论", is_toc_link=True), _para("第一章 绪论"), _para("正文段落。")],
+            [
+                _para("第一章 绪论", is_toc_link=True),
+                _para("第一章 绪论"),
+                _para("正文段落。"),
+            ],
             _blocks("第一章 绪论\n正文段落。"),
             {"toc_indices": {0}, "ignored_output_texts": ["第一章 绪论"]},
             "第一章 绪论",

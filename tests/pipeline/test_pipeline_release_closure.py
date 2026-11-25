@@ -177,16 +177,13 @@ def _install_mineru_fake_download(
             dest = raw_dir / rel_path
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(blob)
-            manifest_files.append(
-                ManifestFile(path=rel_path, size=dest.stat().st_size)
-            )
+            manifest_files.append(ManifestFile(path=rel_path, size=dest.stat().st_size))
         src_size, src_hash = compute_size_and_hash(source_file_path)
         crit_size, crit_hash = compute_size_and_hash(content_path)
         manifest = Manifest(
             source_content_hash=src_hash,
             source_size_bytes=src_size,
-            source_filename_at_parse=kwargs.get("upload_name")
-            or source_file_path.name,
+            source_filename_at_parse=kwargs.get("upload_name") or source_file_path.name,
             critical_file=ManifestFile(
                 path="content_list.json", size=crit_size, sha256=crit_hash
             ),
@@ -404,7 +401,10 @@ def test_validate_process_options_rejects_invalid_combos():
     assert any("multiple chunking modes" in m for m in errs)
     assert any("F/R/V/P/C" in m for m in errs)
     assert any("'f'" in m for m in validate_process_options("f"))
-    assert sum(1 for m in validate_process_options("xyz") if "unsupported character" in m) == 3
+    assert (
+        sum(1 for m in validate_process_options("xyz") if "unsupported character" in m)
+        == 3
+    )
 
 
 def test_lightrag_parser_rule_supports_options_suffix(monkeypatch):
@@ -517,9 +517,9 @@ def test_doc_status_metadata_carry_over_helper():
         def __init__(self, metadata):
             self.metadata = metadata
 
-    assert doc_status_transition_metadata(_StubStatusDoc({"process_options": "iet"})) == {
-        "process_options": "iet"
-    }
+    assert doc_status_transition_metadata(
+        _StubStatusDoc({"process_options": "iet"})
+    ) == {"process_options": "iet"}
     assert doc_status_transition_metadata(
         _StubStatusDoc({"source_file": "demo.[mineru].pdf"})
     ) == {"source_file": "demo.[mineru].pdf"}
@@ -1138,9 +1138,7 @@ async def test_idle_trigger_releases_slot_silently_without_stop_message(
         calls["acquire"] += 1
         return await real_acquire(*args, **kwargs)
 
-    monkeypatch.setattr(
-        pipeline_module, "acquire_processing_reservation", _spy_acquire
-    )
+    monkeypatch.setattr(pipeline_module, "acquire_processing_reservation", _spy_acquire)
 
     async with _open_rag(tmp_path) as rag:
         await rag.apipeline_process_enqueue_documents()
@@ -1155,9 +1153,7 @@ async def test_idle_trigger_releases_slot_silently_without_stop_message(
             str(m).lower() for m in (pipeline_status.get("history_messages") or [])
         ]
         assert not any("stopped" in m for m in history)
-        assert (
-            "stopped" not in str(pipeline_status.get("latest_message") or "").lower()
-        )
+        assert "stopped" not in str(pipeline_status.get("latest_message") or "").lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1465,9 +1461,9 @@ async def test_state_machine_upsert_preserves_content_hash(tmp_path):
         initial_hash = (await rag.doc_status.get_by_id(doc_id))["content_hash"]
         assert initial_hash
 
-        status_doc = (
-            await rag.doc_status.get_docs_by_statuses([DocStatus.PENDING])
-        )[doc_id]
+        status_doc = (await rag.doc_status.get_docs_by_statuses([DocStatus.PENDING]))[
+            doc_id
+        ]
         for next_status in (
             DocStatus.PARSING,
             DocStatus.ANALYZING,
@@ -1859,7 +1855,11 @@ async def test_parse_mineru_to_lightrag_document(tmp_path, monkeypatch):
 
     async with _open_rag(tmp_path / "work") as rag:
         parsed = await _parse_via_registry(
-            rag, "mineru", doc_id="doc-1", file_path=str(src_file), content_data={"content": ""}
+            rag,
+            "mineru",
+            doc_id="doc-1",
+            file_path=str(src_file),
+            content_data={"content": ""},
         )
         assert parsed["parse_format"] == "lightrag"
         blocks_path = Path(parsed["blocks_path"])
@@ -1926,7 +1926,10 @@ async def test_parse_mineru_uses_hint_source_and_canonical_upload_name(
             content_data=content_data,
         )
         blocks_path = Path(parsed["blocks_path"])
-        assert blocks_path.parent == input_dir / PARSED_DIR_NAME / f"{canonical_name}.parsed"
+        assert (
+            blocks_path.parent
+            == input_dir / PARSED_DIR_NAME / f"{canonical_name}.parsed"
+        )
         assert (input_dir / PARSED_DIR_NAME / f"{canonical_name}.mineru_raw").is_dir()
         assert not src_file.exists()
         assert (input_dir / PARSED_DIR_NAME / hinted_name).is_file()
@@ -1991,7 +1994,12 @@ async def test_mm_chunks_and_modality_relations_from_sidecars(tmp_path):
         tmp_path,
         blocks_lines=[
             {"type": "meta", "format": "lightrag", "version": "1.0", "doc_id": "doc-1"},
-            {"type": "content", "blockid": "b1", "format": "plain_text", "content": "正文"},
+            {
+                "type": "content",
+                "blockid": "b1",
+                "format": "plain_text",
+                "content": "正文",
+            },
         ],
         drawings={
             "d1": {
@@ -2079,9 +2087,14 @@ def test_parse_mm_display_name_matches_chunk_format():
         )
         == "系统架构图"
     )
-    assert _parse_mm_display_name("[Table Name]性能对比表\n\n各方法的指标对比", "t1") == "性能对比表"
     assert (
-        _parse_mm_display_name("E = mc^2\n[Equation Name]质能方程\n\n爱因斯坦的质能等效公式", "e1")
+        _parse_mm_display_name("[Table Name]性能对比表\n\n各方法的指标对比", "t1")
+        == "性能对比表"
+    )
+    assert (
+        _parse_mm_display_name(
+            "E = mc^2\n[Equation Name]质能方程\n\n爱因斯坦的质能等效公式", "e1"
+        )
         == "质能方程"
     )
     assert _parse_mm_display_name("no marker here", "fallback-id") == "fallback-id"

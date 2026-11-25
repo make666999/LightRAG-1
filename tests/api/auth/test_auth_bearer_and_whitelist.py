@@ -117,14 +117,18 @@ class TestOllamaBearerApiKey:
         client = _ollama_client(monkeypatch, accounts=False)
 
         assert client.get("/documents", headers=_bearer(API_KEY)).status_code == 401
-        assert client.get("/documents", headers={"X-API-Key": API_KEY}).status_code == 200
+        assert (
+            client.get("/documents", headers={"X-API-Key": API_KEY}).status_code == 200
+        )
 
     def test_an_empty_bearer_never_matches_an_unset_key(self, monkeypatch):
         """Without a configured key there is nothing for a bearer value to match:
         under AUTH_ACCOUNTS it is validated as a JWT and refused."""
         client = _ollama_client(monkeypatch, accounts=True, api_key=None)
 
-        assert client.get("/api/version", headers=_bearer("anything")).status_code == 401
+        assert (
+            client.get("/api/version", headers=_bearer("anything")).status_code == 401
+        )
 
     @pytest.mark.parametrize(
         "presented,expected",

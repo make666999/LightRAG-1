@@ -86,7 +86,9 @@ class TestRoleTimeoutResolution:
             pytest.param("0", 0, id="zero-means-no-timeout"),
         ],
     )
-    def test_role_timeout_resolution(self, prepare_startup, query_timeout_env, expected):
+    def test_role_timeout_resolution(
+        self, prepare_startup, query_timeout_env, expected
+    ):
         startup = prepare_startup(
             {
                 "LLM_TIMEOUT": "240",

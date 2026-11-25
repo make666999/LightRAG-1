@@ -582,9 +582,7 @@ class PurgeGraphDouble:
     async def upsert_node(self, name: str, node_data: dict[str, Any]) -> None:
         self.nodes[name] = dict(node_data)
 
-    async def upsert_edge(
-        self, src: str, tgt: str, edge_data: dict[str, Any]
-    ) -> None:
+    async def upsert_edge(self, src: str, tgt: str, edge_data: dict[str, Any]) -> None:
         self.edges[(src, tgt)] = dict(edge_data)
 
     async def remove_nodes(self, names: list[str]) -> None:

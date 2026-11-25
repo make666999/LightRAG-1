@@ -292,7 +292,11 @@ class TestEnqueueIngressExclusion:
     @pytest.mark.parametrize(
         "fence,expected_conflict,expected_recovery",
         [
-            ("manual_freeze_requested", PipelineReservationConflict.MANUAL_FREEZE, False),
+            (
+                "manual_freeze_requested",
+                PipelineReservationConflict.MANUAL_FREEZE,
+                False,
+            ),
             ("scanning_exclusive", PipelineReservationConflict.SCANNING, False),
             ("destructive_busy", PipelineReservationConflict.DESTRUCTIVE, False),
         ],

@@ -137,9 +137,7 @@ class TestQueryFailureStatus:
 
         monkeypatch.setattr(_ollama_api, "aestimate_tokens", _count_tokens)
         app = FastAPI()
-        app.include_router(
-            _ollama_api.OllamaAPI(failing_rag[0]).router, prefix="/api"
-        )
+        app.include_router(_ollama_api.OllamaAPI(failing_rag[0]).router, prefix="/api")
         return TestClient(app)
 
     @pytest.mark.parametrize("mode", ["mix", "naive", "bypass"])
@@ -269,9 +267,7 @@ class TestQueryLlmGenerated:
 
         auth_module = sys.modules.get("lightrag.api.auth")
         if auth_module is not None:
-            monkeypatch.setattr(
-                auth_module.auth_handler, "accounts", {}, raising=False
-            )
+            monkeypatch.setattr(auth_module.auth_handler, "accounts", {}, raising=False)
         utils_api_module = sys.modules.get("lightrag.api.utils_api")
         if utils_api_module is not None:
             monkeypatch.setattr(

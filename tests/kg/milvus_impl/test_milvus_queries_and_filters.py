@@ -516,7 +516,9 @@ class TestOversizePageBisection:
         ("error", "page_size"),
         [
             pytest.param(_QuotaExhaustedRpcError(), 8, id="bare-resource-exhausted"),
-            pytest.param(MilvusException(message="milvus down"), 4, id="non-size-error"),
+            pytest.param(
+                MilvusException(message="milvus down"), 4, id="non-size-error"
+            ),
         ],
     )
     async def test_non_oversize_errors_are_not_bisected(

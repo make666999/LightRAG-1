@@ -56,9 +56,7 @@ pytestmark = pytest.mark.offline
 
 def _get_endpoint(router, name: str):
     return [
-        route.endpoint
-        for route in router.routes
-        if getattr(route, "name", "") == name
+        route.endpoint for route in router.routes if getattr(route, "name", "") == name
     ][-1]
 
 

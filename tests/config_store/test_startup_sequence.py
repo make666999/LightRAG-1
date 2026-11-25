@@ -1533,4 +1533,3 @@ async def test_a_relative_working_dir_keeps_its_anchor_across_a_cwd_change(
     )
     assert ca.read_anchor(str(elsewhere / "deploy")) is None
     assert not al.holds_anchor_lock(str(deployment))
-

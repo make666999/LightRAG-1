@@ -183,9 +183,9 @@ def test_markdown_warns_and_ignores_params(
         result.parse_warnings
         and result.parse_warnings.get("engine_params_ignored") == 1
     )
-    assert any("only apply to .docx" in msg for msg in _log_messages(lightrag_caplog)), (
-        "expected a warn-and-ignore log line"
-    )
+    assert any(
+        "only apply to .docx" in msg for msg in _log_messages(lightrag_caplog)
+    ), "expected a warn-and-ignore log line"
     # Parsing succeeded and the directive is still persisted verbatim.
     assert rag.full_docs.data["doc-md"]["parse_engine"] == "native(smart_heading=true)"
     assert "Title" in rag.full_docs.data["doc-md"]["content"]
@@ -793,7 +793,9 @@ def test_startup_dependency_check_error_cases(
         monkeypatch.setenv("DOCX_SMART_HEADING_MAX_CHARS", max_chars)
     monkeypatch.setattr(nlp, "missing_spacy_models", lambda: list(missing_models))
 
-    exc_type = nlp.SmartHeadingNLPError if exc_kind == "nlp" else ParserRoutingConfigError
+    exc_type = (
+        nlp.SmartHeadingNLPError if exc_kind == "nlp" else ParserRoutingConfigError
+    )
     with pytest.raises(exc_type, match=match):
         validate_smart_heading_dependencies(parser_rules=rules)
 

@@ -155,9 +155,9 @@ def _assert_early_and_stable(records, *, expected_format, expected_engine):
     assert with_engine, "parse_engine never written to any doc_status transition"
     assert with_engine[0][0] == DocStatus.PARSING.value
     assert {md["parse_engine"] for _, md in with_engine} == {expected_engine}
-    assert {
-        md["parse_format"] for _, md in with_engine if "parse_format" in md
-    } == {expected_format}
+    assert {md["parse_format"] for _, md in with_engine if "parse_format" in md} == {
+        expected_format
+    }
 
 
 async def test_raw_doc_records_legacy_engine_at_parsing(tmp_path):

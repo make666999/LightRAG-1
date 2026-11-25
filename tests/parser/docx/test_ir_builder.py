@@ -9,7 +9,9 @@ from lightrag.parser.docx.ir_builder import NativeDocxIRBuilder
 pytestmark = pytest.mark.offline
 
 
-def _normalize(content: str = "正文一句。", *, heading: str = "前言", parse_metadata=None):
+def _normalize(
+    content: str = "正文一句。", *, heading: str = "前言", parse_metadata=None
+):
     return NativeDocxIRBuilder().normalize(
         [
             {

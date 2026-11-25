@@ -1159,7 +1159,9 @@ class TestUnpopulatedBundleDirectory:
             pytest.param(
                 lambda root: (
                     (root / "locales" / "en").mkdir(parents=True),
-                    (root / "locales" / "en" / "welcome.md").write_text("# hi", "utf-8"),
+                    (root / "locales" / "en" / "welcome.md").write_text(
+                        "# hi", "utf-8"
+                    ),
                 ),
                 id="partial-without-manifest",
             ),

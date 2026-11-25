@@ -1495,4 +1495,3 @@ async def test_a_restart_reads_back_both_tenants(tmp_path):
     finally:
         await restarted_a.finalize()
         await restarted_b.finalize()
-

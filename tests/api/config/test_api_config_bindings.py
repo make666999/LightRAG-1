@@ -411,7 +411,13 @@ class TestLollmsHostKwargs:
         ],
     )
     def test_custom_host_uses_the_binding_specific_key(
-        self, monkeypatch, create_llm_model_kwargs, binding, expected_key, other_key, host
+        self,
+        monkeypatch,
+        create_llm_model_kwargs,
+        binding,
+        expected_key,
+        other_key,
+        host,
     ):
         monkeypatch.setenv("LLM_BINDING", binding)
         monkeypatch.setenv("LLM_BINDING_HOST", host)
@@ -613,9 +619,7 @@ class TestEmbeddingDimensionGuard:
     )
     def test_custom_model_requires_explicit_dim(self, binding, model):
         with pytest.raises(ValueError, match=rf"EMBEDDING_DIM.*{re.escape(model)}"):
-            _create_embedding_function(
-                binding=binding, model=model, embedding_dim=None
-            )
+            _create_embedding_function(binding=binding, model=model, embedding_dim=None)
 
     @pytest.mark.parametrize(
         ("binding", "model", "provider_dim"),
@@ -630,9 +634,7 @@ class TestEmbeddingDimensionGuard:
             ("voyageai", None, 1024),
         ],
     )
-    def test_default_model_keeps_provider_dimension(
-        self, binding, model, provider_dim
-    ):
+    def test_default_model_keeps_provider_dimension(self, binding, model, provider_dim):
         func = _create_embedding_function(
             binding=binding, model=model, embedding_dim=None
         )
@@ -687,7 +689,11 @@ class TestEmbeddingDimensionGuard:
     @pytest.mark.parametrize(
         ("binding", "model", "match"),
         [
-            ("openai", "text-embedding-3-large", r"EMBEDDING_DIM.*text-embedding-3-large"),
+            (
+                "openai",
+                "text-embedding-3-large",
+                r"EMBEDDING_DIM.*text-embedding-3-large",
+            ),
             (
                 "azure_openai",
                 "my-custom-embedding-deployment",

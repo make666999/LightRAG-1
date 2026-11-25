@@ -801,11 +801,13 @@ class TestResolvedWorkspace:
         "requested, src_ws, tgt_ws, match",
         [
             pytest.param(
-                "staging", "production", "production", "was not named", id="env_override"
+                "staging",
+                "production",
+                "production",
+                "was not named",
+                id="env_override",
             ),
-            pytest.param(
-                "", "a", "b", "different workspaces", id="divergent_backends"
-            ),
+            pytest.param("", "a", "b", "different workspaces", id="divergent_backends"),
         ],
     )
     def test_check_resolved_workspace_refuses_mismatch(
@@ -1538,4 +1540,3 @@ class TestRealCompensation:
         assert report.compensation_error is None
         assert await target.get_all_nodes() == []
         assert await target.get_all_edges() == []
-

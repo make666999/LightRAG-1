@@ -118,8 +118,8 @@ def test_no_raw_history_append_survives_in_the_package():
             if raw_append.search(line) and not line.lstrip().startswith("#"):
                 offenders.append(f"{path.relative_to(package)}:{lineno}")
 
-    assert offenders == [], (
-        "route these through append_pipeline_history: " + ", ".join(offenders)
+    assert offenders == [], "route these through append_pipeline_history: " + ", ".join(
+        offenders
     )
 
 

@@ -1459,4 +1459,3 @@ def test_v_strategy_embedding_request_bounds(
     kwargs = captured["kwargs"]
     assert kwargs.get("embedding_batch_num") == 7
     assert kwargs.get("embedding_max_async") == 5
-

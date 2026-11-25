@@ -1144,10 +1144,14 @@ class TestChunkSizeMinimum:
 
         chunker = rag.addon_params["chunker"]
         assert chunker["chunk_token_size"] == MIN_CHUNK_TOKEN_SIZE
-        assert chunker["recursive_character"]["chunk_token_size"] == MIN_CHUNK_TOKEN_SIZE
+        assert (
+            chunker["recursive_character"]["chunk_token_size"] == MIN_CHUNK_TOKEN_SIZE
+        )
 
     def test_setter_rejection_keeps_the_previous_configuration(self, tmp_path):
-        rag = _minsize_new_rag(tmp_path, chunk_token_size=500, chunk_overlap_token_size=50)
+        rag = _minsize_new_rag(
+            tmp_path, chunk_token_size=500, chunk_overlap_token_size=50
+        )
         before_params = rag.addon_params
         before_chunker = dict(before_params["chunker"])
 
@@ -1176,4 +1180,3 @@ class TestChunkSizeMinimum:
 
         assert "chunker.recursive_character.chunk_token_size" in str(error)
         assert row is None
-

@@ -524,9 +524,7 @@ async def test_edit_relation_truncation(fail_truncation: bool):
         "file_path": "f",
     }
     graph = MemGraph(
-        nodes={
-            name: {"entity_id": name, "description": name} for name in ("A", "B")
-        },
+        nodes={name: {"entity_id": name, "description": name} for name in ("A", "B")},
         edges={("A", "B"): dict(original_edge)},
     )
     cfg = _cfg(fail=fail_truncation)
@@ -561,9 +559,7 @@ async def test_edit_relation_vdb_delete_failure_still_leaves_graph_updated():
     """A transient VDB delete failure happens after the graph write and surfaces
     as ``VectorStorageConsistencyError`` while leaving the graph updated."""
     graph = MemGraph(
-        nodes={
-            name: {"entity_id": name, "description": name} for name in ("A", "B")
-        },
+        nodes={name: {"entity_id": name, "description": name} for name in ("A", "B")},
         edges={
             ("A", "B"): {
                 "description": "short",

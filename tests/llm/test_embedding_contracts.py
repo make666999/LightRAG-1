@@ -450,8 +450,8 @@ class TestQdrantMigrationSafety:
         legacy_collection_info.config.params.vectors.size = 1536
         legacy_collection_info.payload_schema = {}
 
-        client.collection_exists.side_effect = (
-            lambda name: name == "lightrag_vdb_chunks"
+        client.collection_exists.side_effect = lambda name: (
+            name == "lightrag_vdb_chunks"
         )
         client.get_collection.return_value = legacy_collection_info
         client.count.return_value.count = 100
@@ -553,9 +553,12 @@ class TestQdrantMigrationSafety:
 
         client = MagicMock()
         legacy_collection = "lightrag_vdb_chunks"
-        client.collection_exists.side_effect = lambda name: name in (
-            collection_name,
-            legacy_collection,
+        client.collection_exists.side_effect = lambda name: (
+            name
+            in (
+                collection_name,
+                legacy_collection,
+            )
         )
         client.count.return_value.count = 0
 
@@ -565,7 +568,9 @@ class TestQdrantMigrationSafety:
                 return_value=legacy_collection,
             )
             if not model_suffix
-            else patch.object(client, "delete_collection", wraps=client.delete_collection)
+            else patch.object(
+                client, "delete_collection", wraps=client.delete_collection
+            )
         )
         with ctx:
             QdrantVectorDBStorage.setup_collection(

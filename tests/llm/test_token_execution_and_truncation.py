@@ -264,7 +264,9 @@ async def test_budget_that_drops_every_chunk_is_logged(
 
 @pytest.mark.parametrize("limit", [-5, 0])
 async def test_non_positive_budget_is_logged(lightrag_log_records, limit):
-    assert await _run_unified([{"content": "x", "file_path": "a.md"}], limit, _tok()) == []
+    assert (
+        await _run_unified([{"content": "x", "file_path": "a.md"}], limit, _tok()) == []
+    )
     assert len(_budget_warnings(lightrag_log_records)) == 1
 
 

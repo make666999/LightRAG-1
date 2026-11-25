@@ -459,7 +459,10 @@ def test_flatten_heading_line_unicode_breaks() -> None:
         pytest.param(
             # Scattered single chars cannot be assembled into a title.
             {"is_title_block": True, "main_title": "中共某国某人管某某某和办"},
-            [_para("中某人办法某某共和国管理", size=22.0), _para("正文开始。", size=12.0)],
+            [
+                _para("中某人办法某某共和国管理", size=22.0),
+                _para("正文开始。", size=12.0),
+            ],
             TitleBlockCandidate(start=0, end=1, single=False, trigger="t"),
             "cannot be located",
             id="stitched-from-stray-chars",
@@ -485,7 +488,9 @@ def test_flatten_heading_line_unicode_breaks() -> None:
         ),
     ],
 )
-def test_title_verdict_invalid_hard_fails(payload, records, candidate, match: str) -> None:
+def test_title_verdict_invalid_hard_fails(
+    payload, records, candidate, match: str
+) -> None:
     with pytest.raises(TitleBlockLLMError, match=match):
         _judge_with(payload, records=records, candidate=candidate)
 
@@ -782,7 +787,10 @@ def test_single_candidate_false_verdict_leaves_context_untouched() -> None:
             [
                 _para("产品技术白皮书", size=14.0),
                 _para("研发中心", size=12.0),
-                _para("这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。", size=12.0),
+                _para(
+                    "这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。",
+                    size=12.0,
+                ),
             ],
             (0, 2),
             id="two-pt-over-body-clears-bar",
@@ -852,9 +860,7 @@ def test_single_candidate_false_verdict_leaves_context_untouched() -> None:
         ),
     ],
 )
-def test_multi_window_admitted_cases(
-    records, expected_span: tuple[int, int]
-) -> None:
+def test_multi_window_admitted_cases(records, expected_span: tuple[int, int]) -> None:
     cands = _find(records)
     assert len(cands) == 1
     c = cands[0]
@@ -879,7 +885,10 @@ def test_multi_window_admitted_cases(
             [
                 _para("产品技术白皮书", size=13.0),
                 _para("研发中心", size=12.0),
-                _para("这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。", size=12.0),
+                _para(
+                    "这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。",
+                    size=12.0,
+                ),
             ],
             False,
             id="plus-one-pt-below-two-pt-bar",
@@ -889,7 +898,10 @@ def test_multi_window_admitted_cases(
             [
                 _para("产品技术白皮书", size=12.0),
                 _para("研发中心", size=12.0),
-                _para("这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。", size=12.0),
+                _para(
+                    "这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。",
+                    size=12.0,
+                ),
             ],
             False,
             id="flat-base-size-no-title-line",
@@ -902,7 +914,10 @@ def test_multi_window_admitted_cases(
                 _para("《M1212(ML001) 模块技术协议书》", size=12.0),
                 _para("1.4   产品简介", size=14.0, outline_level_raw=1),
                 _para("1.4.1   产品组成", size=14.0, outline_level_raw=2),
-                _para("这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。", size=12.0),
+                _para(
+                    "这一段是以句号结尾的正式正文内容，用来终止候选窗口的生长。",
+                    size=12.0,
+                ),
             ],
             False,
             id="excludes-numbered-outline-headings",
@@ -1052,7 +1067,9 @@ def _cover_tables() -> list[ParagraphRecord]:
     [
         pytest.param(
             # Adjacent qualifying tables (blank lines between ok) merge into one.
-            lambda: _cover_tables() + [_para("正文从这里开始，以句号结尾。", size=12.0)],
+            lambda: (
+                _cover_tables() + [_para("正文从这里开始，以句号结尾。", size=12.0)]
+            ),
             (0, 4),
             id="merges-adjacent-qualifying-tables",
         ),
@@ -1125,7 +1142,9 @@ def test_table_window_discovery_cases(
         pytest.param(("超" * 40, 10.5, False), id="over-90-weighted-cap"),
         pytest.param(("带物理大纲的格", 10.5, True), id="physical-outline"),
         pytest.param(("抄送：市委各部门", 10.5, False), id="imprint-marker"),
-        pytest.param(("某某办公室 2026年6月30日 印发", 10.5, False), id="imprint-closer"),
+        pytest.param(
+            ("某某办公室 2026年6月30日 印发", 10.5, False), id="imprint-closer"
+        ),
     ],
 )
 def test_table_member_gate_rejects_bad_cells(bad_cell) -> None:
@@ -1232,9 +1251,7 @@ def test_table_verdict_locates_against_cell_texts() -> None:
 def test_table_non_title_verdict_always_ignored(payload: dict) -> None:
     """A non-title verdict for a table window short-circuits before partition
     parsing: cells can never be named headings or vetoed."""
-    decision = _judge_with(
-        payload, records=_TABLE_RECORDS, candidate=_TABLE_CANDIDATE
-    )
+    decision = _judge_with(payload, records=_TABLE_RECORDS, candidate=_TABLE_CANDIDATE)
     assert not decision.is_title_block
     assert decision.heading_indices == () and decision.body_indices == ()
 
@@ -1270,7 +1287,9 @@ def _prompt_for(records, candidate, *, fs_base_pt=None, payload=None):
                         [("版 本 号", 10.5, False), ("1V1.0.0", 10.5, False)],
                     ]
                 ),
-                _table([[("产品标准化大纲", 22.0, False)], [("某某模块", 22.0, False)]]),
+                _table(
+                    [[("产品标准化大纲", 22.0, False)], [("某某模块", 22.0, False)]]
+                ),
                 _table([[("某某电子股份有限公司", 16.0, False)]]),
                 _para("更 改 记 录", size=16.0),
             ],

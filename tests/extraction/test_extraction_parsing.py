@@ -84,7 +84,9 @@ def test_glued_missing_core_delimiter_still_repaired() -> None:
 _ALICE = f"entity{_DELIM}Alice{_DELIM}person{_DELIM}Alice is an engineer."
 _BOB = f"entity{_DELIM}Bob{_DELIM}person{_DELIM}Bob is a manager."
 _CAROL = f"entity{_DELIM}Carol{_DELIM}person{_DELIM}Carol is a designer."
-_REL = f"relation{_DELIM}Alice{_DELIM}Bob{_DELIM}reports to{_DELIM}Alice reports to Bob."
+_REL = (
+    f"relation{_DELIM}Alice{_DELIM}Bob{_DELIM}reports to{_DELIM}Alice reports to Bob."
+)
 
 
 async def _parse_text(text: str):
@@ -111,7 +113,9 @@ async def test_entities_on_one_line_are_all_kept() -> None:
 
 @pytest.mark.asyncio
 async def test_entity_named_like_a_record_keyword_on_one_line() -> None:
-    relational = f"entity{_DELIM}relational database{_DELIM}concept{_DELIM}A kind of database."
+    relational = (
+        f"entity{_DELIM}relational database{_DELIM}concept{_DELIM}A kind of database."
+    )
     nodes, _ = await _parse_text(_DELIM.join([_ALICE, relational]) + "\n<|COMPLETE|>")
     assert set(nodes) == {"Alice", "relational database"}
 

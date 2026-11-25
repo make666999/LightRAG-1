@@ -1283,9 +1283,7 @@ class TestAdoptionProbe:
         "kwargs",
         [
             pytest.param({"adopt_result": False}, id="denied"),
-            pytest.param(
-                {"adopt_error": RuntimeError("disk full")}, id="raising"
-            ),
+            pytest.param({"adopt_error": RuntimeError("disk full")}, id="raising"),
         ],
     )
     async def test_adopt_failure_does_not_fail_startup(self, kwargs):

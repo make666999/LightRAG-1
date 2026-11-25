@@ -198,7 +198,9 @@ _SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}}
 @pytest.mark.parametrize(
     ("response_format", "expected_format"),
     [
-        pytest.param({"type": "json_object"}, {"type": "json_object"}, id="json-object"),
+        pytest.param(
+            {"type": "json_object"}, {"type": "json_object"}, id="json-object"
+        ),
         pytest.param(
             {
                 "type": "json_schema",

@@ -765,7 +765,9 @@ async def test_scheduling_sweep_skips_journaled_rows(tmp_path, page_size):
     rag = await _build_rag(tmp_path, workspace_prefix="mdp")
     try:
         rag.pipeline_scheduling_page_size = page_size
-        journaled = await _seed_journaled_row(rag, "journaled.txt", DocStatus.PROCESSING)
+        journaled = await _seed_journaled_row(
+            rag, "journaled.txt", DocStatus.PROCESSING
+        )
         plain = await _seed_journaled_row(rag, "plain.txt", DocStatus.PENDING)
         row = await rag.doc_status.get_by_id(plain)
         row["metadata"] = {}
@@ -793,7 +795,9 @@ async def test_journaled_active_row_fences_instead_of_resetting(tmp_path):
     reset must fence with ``manual_drain_blocked`` instead of resetting or spinning."""
     rag = await _build_rag(tmp_path, workspace_prefix="mdp")
     try:
-        journaled = await _seed_journaled_row(rag, "journaled.txt", DocStatus.PROCESSING)
+        journaled = await _seed_journaled_row(
+            rag, "journaled.txt", DocStatus.PROCESSING
+        )
         failed = await _seed_failed_with_content(rag, "retry-me.txt")
         journaled_row_before = await rag.doc_status.get_by_id(journaled)
 
